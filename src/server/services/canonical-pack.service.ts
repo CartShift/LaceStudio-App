@@ -1,4 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
+import type { ImageReferenceInput } from "@/server/providers/image/types";
 import type { ImageModelProvider } from "@/server/schemas/creative";
 import { ApiError } from "@/lib/http";
 import { log } from "@/lib/logger";
@@ -9,6 +10,7 @@ import { getEnv } from "@/lib/env";
 import { getImageProvider } from "@/server/providers";
 import { createDefaultCreativeControls } from "@/server/services/creative-controls";
 import { scoreCanonicalCandidate } from "@/server/services/canonical-qa.service";
+import { photoImportSuggestionSchema } from "@/server/schemas/model-workflow";
 import { buildCanonicalShotPlan } from "@/server/services/canonical-shot-plan";
 import { REQUIRED_CANONICAL_SHOT_CODES, buildModelCapabilityFlags, deriveModelStatusForWorkflow } from "@/server/services/model-workflow.service";
 import { createSignedReadUrlForGcsUri, uploadImageFromUriToModelBucket } from "@/server/services/storage/gcs-storage";
@@ -23,12 +25,17 @@ const CANONICAL_UPLOAD_BASE_DELAY_MS = 800;
 const CANONICAL_JOB_STALE_MS = 20 * 60 * 1000;
 const CANONICAL_ERROR_PREVIEW_LIMIT = 6;
 const MAX_CANONICAL_CONDITIONING_REFERENCES = 10;
+const MAX_SHOT_CONDITIONING_REFERENCES = 4;
+const MAX_QA_REFERENCE_IMAGES = 4;
 const CANONICAL_REFERENCE_SIGNED_URL_TTL_SECONDS = 60 * 60;
 const CANONICAL_REFERENCE_RESOLVE_CONCURRENCY = 6;
 const FRONT_CANONICAL_SHOT_CODE = "frontal_closeup";
 
 type CanonicalGenerationMode = "front_only" | "remaining" | "full";
 type CanonicalShotCode = (typeof REQUIRED_CANONICAL_SHOT_CODES)[number];
+type PhotoReferenceViewAngle = "frontal" | "left_45" | "right_45" | "left_profile" | "right_profile" | "unknown";
+type PhotoReferenceFraming = "closeup" | "head_shoulders" | "half_body" | "full_body" | "unknown";
+type PhotoReferenceExpression = "neutral" | "soft_smile" | "serious" | "other";
 
 type CanonicalGenerationState = {
 	job_id?: string;
@@ -46,6 +53,29 @@ type CanonicalGenerationState = {
 	shot_codes?: CanonicalShotCode[];
 };
 
+type PhotoImportImageReview = {
+	reference_id: string;
+	accepted: boolean;
+	reason?: string;
+	solo_subject?: boolean;
+	face_visible?: boolean;
+	view_angle?: PhotoReferenceViewAngle;
+	framing?: PhotoReferenceFraming;
+	expression?: PhotoReferenceExpression;
+	sharpness_score?: number;
+	identity_anchor_score?: number;
+};
+
+type CanonicalConditioningReference = ImageReferenceInput & {
+	source_kind: "selected_front_candidate" | "canonical_reference" | "uploaded_photo";
+	canonical_shot_code?: CanonicalShotCode;
+	view_angle?: PhotoReferenceViewAngle;
+	framing?: PhotoReferenceFraming;
+	expression?: PhotoReferenceExpression;
+	identity_anchor_score?: number;
+	sharpness_score?: number;
+};
+
 export async function uploadCandidateReference(input: { modelId: string; initiatedBy: string; shotCode: string; imageDataUrl: string; candidateIndex?: number; packVersion?: number }) {
 	const model = await prisma.aiModel.findUnique({
 		where: { id: input.modelId },
@@ -53,6 +83,7 @@ export async function uploadCandidateReference(input: { modelId: string; initiat
 			name: true,
 			body_profile: true,
 			face_profile: true,
+			imperfection_fingerprint: true,
 			canonical_pack_status: true,
 			active_canonical_pack_version: true,
 			onboarding_state: true
@@ -120,7 +151,8 @@ export async function uploadCandidateReference(input: { modelId: string; initiat
 	const shotPlan = buildCanonicalShotPlan({
 		modelName: model.name,
 		bodyProfile: asRecord(model.body_profile),
-		faceProfile: asRecord(model.face_profile)
+		faceProfile: asRecord(model.face_profile),
+		imperfectionFingerprint: asRecordArray(model.imperfection_fingerprint)
 	});
 
 	const shotPrompt = shotPlan.find(s => s.shot_code === input.shotCode)?.prompt ?? "Manual upload canonical candidate";
@@ -286,14 +318,35 @@ export async function startCanonicalPackGeneration(input: {
 		selectedFrontCandidateUri = selectedFrontCandidate.image_gcs_uri;
 	}
 
+	const photoImportReviews = readPhotoImportImageReviews(onboardingState);
+	const conditioningReferencePool = buildCanonicalConditioningReferencePool({
+		selectedFrontCandidateUri,
+		canonicalReferences: model.canonical_references.map(item => ({
+			url: item.reference_image_url,
+			shotCode: normalizeCanonicalShotCode(item.shot_code)
+		})),
+		sourceReferences: (model.source_references ?? []).map(item => ({
+			id: item.id,
+			url: item.image_gcs_uri,
+			fileName: item.file_name,
+			sortOrder: item.sort_order
+		})),
+		photoImportReviews
+	});
+	const effectiveProviderSelection = resolveCanonicalGenerationProviderSelection({
+		requestedProvider: input.provider,
+		requestedModelId: input.providerModelId,
+		conditioningReferenceCount: conditioningReferencePool.length
+	});
+
 	const jobId = randomUUID();
 	const nowIso = new Date().toISOString();
 	const generationPayload: CanonicalGenerationState = {
 		...activeGenerationState,
 		job_id: jobId,
 		pack_version: packVersion,
-		provider: input.provider,
-		provider_model_id: input.providerModelId?.trim() || undefined,
+		provider: effectiveProviderSelection.provider,
+		provider_model_id: effectiveProviderSelection.providerModelId,
 		generation_mode: generationMode,
 		status: "GENERATING",
 		started_at: nowIso,
@@ -346,31 +399,28 @@ export async function startCanonicalPackGeneration(input: {
 		user_id: input.initiatedBy,
 		metadata: {
 			pack_version: packVersion,
-			provider: input.provider,
+			provider: effectiveProviderSelection.provider,
+			requested_provider: input.provider,
 			candidates_per_shot: requestedCandidatesPerShot,
 			generation_mode: generationMode,
 			job_id: jobId,
-			stale_takeover: model.canonical_pack_status === "GENERATING" && staleGeneration
+			stale_takeover: model.canonical_pack_status === "GENERATING" && staleGeneration,
+			conditioning_reference_count: conditioningReferencePool.length
 		}
-	});
-
-	const conditioningReferenceUrls = buildCanonicalConditioningReferences({
-		canonicalReferences: selectedFrontCandidateUri
-			? [selectedFrontCandidateUri, ...model.canonical_references.map(item => item.reference_image_url)]
-			: model.canonical_references.map(item => item.reference_image_url),
-		sourceReferences: (model.source_references ?? []).map(item => item.image_gcs_uri)
 	});
 
 	const generationRequest = {
 		...input,
+		provider: effectiveProviderSelection.provider,
 		candidatesPerShot: requestedCandidatesPerShot,
-		providerModelId: input.providerModelId?.trim() || undefined,
+		providerModelId: effectiveProviderSelection.providerModelId,
 		packVersion,
 		jobId,
 		modelName: model.name,
 		bodyProfile: asRecord(model.body_profile),
 		faceProfile: asRecord(model.face_profile),
-		referenceUrls: conditioningReferenceUrls,
+		imperfectionFingerprint: asRecordArray(model.imperfection_fingerprint),
+		referencePool: conditioningReferencePool,
 		shotCodes,
 		generationMode
 	};
@@ -388,6 +438,28 @@ export async function startCanonicalPackGeneration(input: {
 	};
 }
 
+export function resolveCanonicalGenerationProviderSelection(input: {
+	requestedProvider: ImageModelProvider;
+	requestedModelId?: string;
+	conditioningReferenceCount: number;
+}): { provider: ImageModelProvider; providerModelId?: string } {
+	const requestedModelId = input.requestedModelId?.trim();
+
+	// Z.AI GLM generation is text-only in this app, so it cannot preserve identity
+	// from uploaded reference photos. Route canonical jobs with references through
+	// an image-conditioned provider instead.
+	if (input.conditioningReferenceCount > 0 && input.requestedProvider === "zai_glm") {
+		return {
+			provider: "nano_banana_2"
+		};
+	}
+
+	return {
+		provider: input.requestedProvider,
+		providerModelId: requestedModelId && requestedModelId.length > 0 ? requestedModelId : undefined
+	};
+}
+
 async function generateCanonicalPackInternal(input: {
 	modelId: string;
 	initiatedBy: string;
@@ -399,7 +471,8 @@ async function generateCanonicalPackInternal(input: {
 	modelName: string;
 	bodyProfile: Record<string, unknown> | null;
 	faceProfile: Record<string, unknown> | null;
-	referenceUrls: string[];
+	imperfectionFingerprint: Array<Record<string, unknown>> | null;
+	referencePool: CanonicalConditioningReference[];
 	shotCodes: CanonicalShotCode[];
 	generationMode: CanonicalGenerationMode;
 }) {
@@ -425,7 +498,8 @@ async function generateCanonicalPackInternal(input: {
 		const fullShotPlan = buildCanonicalShotPlan({
 			modelName: input.modelName,
 			bodyProfile: input.bodyProfile,
-			faceProfile: input.faceProfile
+			faceProfile: input.faceProfile,
+			imperfectionFingerprint: input.imperfectionFingerprint
 		});
 		const shotPlanByCode = new Map(fullShotPlan.map(shot => [shot.shot_code, shot] as const));
 		const shotPlan = input.shotCodes.flatMap(shotCode => {
@@ -437,8 +511,8 @@ async function generateCanonicalPackInternal(input: {
 			throw new ApiError(400, "VALIDATION_ERROR", "This generation mode has no available reference angles. Choose a different mode and try again.");
 		}
 		const preferredProviderModelId = resolveProviderModelId(input.provider, env, input.providerModelId);
-		const resolvedReferenceUrls = await resolveCanonicalConditioningReferenceUrls(input.referenceUrls);
-		if (input.referenceUrls.length > 0 && resolvedReferenceUrls.length === 0) {
+		const resolvedReferencePool = await resolveCanonicalConditioningReferenceInputs(input.referencePool);
+		if (input.referencePool.length > 0 && resolvedReferencePool.length === 0) {
 			log({
 				level: "warn",
 				service: "api",
@@ -447,8 +521,8 @@ async function generateCanonicalPackInternal(input: {
 				entity_id: input.modelId,
 				user_id: input.initiatedBy,
 				metadata: {
-					provided_reference_count: input.referenceUrls.length,
-					resolved_reference_count: resolvedReferenceUrls.length,
+					provided_reference_count: input.referencePool.length,
+					resolved_reference_count: resolvedReferencePool.length,
 					mode: "text_only_fallback"
 				}
 			});
@@ -497,6 +571,11 @@ async function generateCanonicalPackInternal(input: {
 			}
 
 			try {
+				const shotReferences = buildShotConditioningReferences({
+					shotCode: shot.shot_code,
+					referencePool: resolvedReferencePool,
+					generationMode: input.generationMode
+				});
 				const seedBase = randomInt(10_000, 999_999);
 				const seeds = Array.from({ length: input.candidatesPerShot }, (_, index) => seedBase + index * 37);
 				const response = await withRetry({
@@ -532,7 +611,7 @@ async function generateCanonicalPackInternal(input: {
 								prompt: shot.prompt,
 								seeds,
 								outputPathPrefix: `${input.modelId}/canonical/v${input.packVersion}/${shot.shot_code}/`,
-								references: resolvedReferenceUrls
+								references: shotReferences
 							}),
 							CANONICAL_SHOT_TIMEOUT_MS,
 							`Shot ${shot.shot_code} timed out`
@@ -592,7 +671,8 @@ async function generateCanonicalPackInternal(input: {
 						const score = await safeScoreCanonicalCandidate({
 							imageUrl: asset.uri,
 							shotCode: shot.shot_code,
-							shotPrompt: shot.prompt
+							shotPrompt: shot.prompt,
+							referenceImageUrls: shotReferences.map(reference => reference.url).slice(0, MAX_QA_REFERENCE_IMAGES)
 						});
 
 						await prisma.modelReferenceCandidate.create({
@@ -686,7 +766,7 @@ async function generateCanonicalPackInternal(input: {
 		}
 
 		if (completedShots === 0) {
-			throw new ApiError(502, "INTERNAL_ERROR", "Reference Set creation failed for every angle. Try again or switch Image Engines.");
+			throw new ApiError(502, "INTERNAL_ERROR", buildAllFailedCanonicalErrorMessage({ completedShots, totalShots, shotErrors }));
 		}
 
 		const finalError = buildCanonicalFailureMessage({
@@ -1230,7 +1310,7 @@ async function nextCandidateIndexForShot(modelId: string, packVersion: number, s
 	return (aggregate._max.candidate_index ?? 0) + 1;
 }
 
-async function safeScoreCanonicalCandidate(input: { imageUrl: string; shotCode: string; shotPrompt: string }) {
+async function safeScoreCanonicalCandidate(input: { imageUrl: string; shotCode: string; shotPrompt: string; referenceImageUrls?: string[] }) {
 	try {
 		return await withTimeout(scoreCanonicalCandidate(input), 60_000, `Scoring timed out for ${input.shotCode}`);
 	} catch (error) {
@@ -1270,6 +1350,11 @@ function buildCanonicalFailureMessage(input: { completedShots: number; totalShot
 	const preview = input.shotErrors.slice(0, CANONICAL_ERROR_PREVIEW_LIMIT);
 	const suffix = input.shotErrors.length > preview.length ? `; +${input.shotErrors.length - preview.length} more` : "";
 	return `${input.completedShots}/${input.totalShots} shots completed. Failures: ${preview.join("; ")}${suffix}`;
+}
+
+export function buildAllFailedCanonicalErrorMessage(input: { completedShots: number; totalShots: number; shotErrors: string[] }): string {
+	const detail = buildCanonicalFailureMessage(input);
+	return detail ? `Reference Set creation failed for every angle. ${detail}` : "Reference Set creation failed for every angle. Try again or switch Image Engines.";
 }
 
 async function ensureCanonicalJobStillCurrent(modelId: string, jobId: string): Promise<boolean> {
@@ -1479,7 +1564,7 @@ async function generateShotWithFallback(input: {
 	prompt: string;
 	seeds: number[];
 	outputPathPrefix: string;
-	references: string[];
+	references: ImageReferenceInput[];
 }): Promise<{
 	provider: ImageModelProvider;
 	provider_model_id: string;
@@ -1491,12 +1576,7 @@ async function generateShotWithFallback(input: {
 		generation_time_ms: number;
 	}>;
 }> {
-	const references = input.references.map((url, index) => ({
-		url,
-		source: "external_url" as const,
-		weight: index === 0 ? ("primary" as const) : ("secondary" as const),
-		title: `model_identity_reference_${index + 1}`
-	}));
+	const references = input.references;
 
 	const runGenerate = async (provider: ImageModelProvider) => {
 		const providerModelId = resolveProviderModelId(provider, input.env, provider === input.provider ? input.requestedModelId : undefined);
@@ -1526,14 +1606,10 @@ async function generateShotWithFallback(input: {
 		};
 	};
 
-	const providerOrder =
-		input.provider === "openai"
-			? (["openai", "nano_banana_2"] as const)
-			: input.provider === "zai_glm"
-				? (["zai_glm", "nano_banana_2"] as const)
-				: input.provider === "nano_banana_2"
-					? (["nano_banana_2"] as const)
-					: ([input.provider] as const);
+	const providerOrder = buildCanonicalShotProviderOrder({
+		requestedProvider: input.provider,
+		referenceCount: references.length
+	});
 
 	let lastError: unknown;
 	for (const provider of providerOrder) {
@@ -1557,6 +1633,27 @@ async function generateShotWithFallback(input: {
 		throw lastError;
 	}
 	throw new ApiError(502, "INTERNAL_ERROR", "We couldn't create the Reference Set images. Please try again.");
+}
+
+export function buildCanonicalShotProviderOrder(input: {
+	requestedProvider: ImageModelProvider;
+	referenceCount: number;
+}): ImageModelProvider[] {
+	if (input.requestedProvider === "openai") {
+		return ["openai", "nano_banana_2"];
+	}
+
+	if (input.requestedProvider === "zai_glm") {
+		return ["zai_glm", "nano_banana_2"];
+	}
+
+	// Nano is the default canonical engine, but OpenAI edits are a better recovery
+	// path for identity-conditioned shots when Gemini returns text-only responses.
+	if (input.requestedProvider === "nano_banana_2") {
+		return input.referenceCount > 0 ? ["nano_banana_2", "openai"] : ["nano_banana_2"];
+	}
+
+	return [input.requestedProvider];
 }
 
 function resolveProviderModelId(provider: ImageModelProvider, env: ReturnType<typeof getEnv>, requestedModelId?: string): string {
@@ -1590,6 +1687,28 @@ export function buildCanonicalConditioningReferences(input: { canonicalReference
 	return deduped;
 }
 
+export function buildShotConditioningReferences(input: {
+	shotCode: CanonicalShotCode;
+	referencePool: CanonicalConditioningReference[];
+	generationMode: CanonicalGenerationMode;
+}): ImageReferenceInput[] {
+	const ranked = input.referencePool
+		.map(reference => ({
+			reference,
+			score: scoreConditioningReferenceForShot(reference, input.shotCode, input.generationMode)
+		}))
+		.sort((a, b) => b.score - a.score)
+		.slice(0, MAX_SHOT_CONDITIONING_REFERENCES);
+
+	return ranked.map((entry, index) => ({
+		url: entry.reference.url,
+		source: entry.reference.source,
+		title: buildConditioningReferenceTitle(entry.reference),
+		weight: index < 2 ? "primary" : "secondary",
+		similarity_score: clamp01(entry.score)
+	}));
+}
+
 function resolveShotCodesForGenerationMode(mode: CanonicalGenerationMode): CanonicalShotCode[] {
 	if (mode === "front_only") {
 		return [FRONT_CANONICAL_SHOT_CODE];
@@ -1602,29 +1721,18 @@ function resolveShotCodesForGenerationMode(mode: CanonicalGenerationMode): Canon
 	return [...REQUIRED_CANONICAL_SHOT_CODES];
 }
 
-async function resolveCanonicalConditioningReferenceUrls(referenceUrls: string[]): Promise<string[]> {
-	const resolved = await mapWithConcurrency(referenceUrls, CANONICAL_REFERENCE_RESOLVE_CONCURRENCY, async rawUrl => {
-		const url = rawUrl.trim();
-		if (!url) return null;
-		if (url.startsWith("data:image/")) return url;
-		if (isHttpUrl(url)) return url;
-
-		if (url.startsWith("gs://")) {
-			try {
-				return await createSignedReadUrlForGcsUri(url, CANONICAL_REFERENCE_SIGNED_URL_TTL_SECONDS);
-			} catch {
-				return null;
-			}
-		}
-
-		return null;
+async function resolveCanonicalConditioningReferenceInputs(referenceInputs: CanonicalConditioningReference[]): Promise<CanonicalConditioningReference[]> {
+	const resolved = await mapWithConcurrency(referenceInputs, CANONICAL_REFERENCE_RESOLVE_CONCURRENCY, async reference => {
+		const url = await resolveCanonicalConditioningReferenceUrl(reference.url);
+		return url ? { ...reference, url } : null;
 	});
 
-	const deduped: string[] = [];
+	const deduped: CanonicalConditioningReference[] = [];
 	const seen = new Set<string>();
+
 	for (const value of resolved) {
 		if (!value) continue;
-		const key = value.trim().toLowerCase();
+		const key = value.url.trim().toLowerCase();
 		if (!key || seen.has(key)) continue;
 		seen.add(key);
 		deduped.push(value);
@@ -1633,9 +1741,260 @@ async function resolveCanonicalConditioningReferenceUrls(referenceUrls: string[]
 	return deduped;
 }
 
+async function resolveCanonicalConditioningReferenceUrl(rawUrl: string): Promise<string | null> {
+	const url = rawUrl.trim();
+	if (!url) return null;
+	if (url.startsWith("data:image/")) return url;
+	if (isHttpUrl(url)) return url;
+
+	if (url.startsWith("gs://")) {
+		try {
+			return await createSignedReadUrlForGcsUri(url, CANONICAL_REFERENCE_SIGNED_URL_TTL_SECONDS);
+		} catch {
+			return null;
+		}
+	}
+
+	return null;
+}
+
+function buildCanonicalConditioningReferencePool(input: {
+	selectedFrontCandidateUri?: string;
+	canonicalReferences: Array<{ url: string; shotCode?: CanonicalShotCode }>;
+	sourceReferences: Array<{ id: string; url: string; fileName?: string | null; sortOrder?: number }>;
+	photoImportReviews: PhotoImportImageReview[];
+}): CanonicalConditioningReference[] {
+	const deduped: CanonicalConditioningReference[] = [];
+	const seen = new Set<string>();
+	const reviewById = new Map(input.photoImportReviews.map(review => [review.reference_id, review]));
+
+	const pushReference = (reference: CanonicalConditioningReference) => {
+		const trimmed = reference.url.trim();
+		if (!trimmed) return;
+		const key = trimmed.toLowerCase();
+		if (seen.has(key)) return;
+		seen.add(key);
+		deduped.push(reference);
+	};
+
+	if (input.selectedFrontCandidateUri) {
+		pushReference({
+			url: input.selectedFrontCandidateUri,
+			source: "external_url",
+			title: "Model Identity approved front anchor",
+			weight: "primary",
+			similarity_score: 1,
+			source_kind: "selected_front_candidate",
+			canonical_shot_code: FRONT_CANONICAL_SHOT_CODE,
+			view_angle: "frontal",
+			framing: "closeup",
+			expression: "neutral",
+			identity_anchor_score: 1,
+			sharpness_score: 0.95
+		});
+	}
+
+	for (const sourceReference of input.sourceReferences) {
+		const review = reviewById.get(sourceReference.id);
+		pushReference({
+			url: sourceReference.url,
+			source: "external_url",
+			title: buildUploadedReferenceTitle(sourceReference.fileName, review),
+			weight: "secondary",
+			similarity_score: clamp01(review?.identity_anchor_score ?? 0.65),
+			source_kind: "uploaded_photo",
+			view_angle: review?.view_angle ?? "unknown",
+			framing: review?.framing ?? "unknown",
+			expression: review?.expression ?? "other",
+			identity_anchor_score: clamp01(review?.identity_anchor_score ?? 0.65),
+			sharpness_score: clamp01(review?.sharpness_score ?? 0.6)
+		});
+	}
+
+	for (const canonicalReference of input.canonicalReferences) {
+		pushReference({
+			url: canonicalReference.url,
+			source: "external_url",
+			title: buildCanonicalReferenceTitle(canonicalReference.shotCode),
+			weight: canonicalReference.shotCode === FRONT_CANONICAL_SHOT_CODE ? "primary" : "secondary",
+			similarity_score: 0.92,
+			source_kind: "canonical_reference",
+			canonical_shot_code: canonicalReference.shotCode,
+			view_angle: inferViewAngleFromShotCode(canonicalReference.shotCode),
+			framing: inferFramingFromShotCode(canonicalReference.shotCode),
+			expression: inferExpressionFromShotCode(canonicalReference.shotCode),
+			identity_anchor_score: 0.92,
+			sharpness_score: 0.9
+		});
+	}
+
+	return deduped.slice(0, MAX_CANONICAL_CONDITIONING_REFERENCES);
+}
+
+function scoreConditioningReferenceForShot(reference: CanonicalConditioningReference, shotCode: CanonicalShotCode, generationMode: CanonicalGenerationMode): number {
+	let score = reference.identity_anchor_score ?? (reference.source_kind === "uploaded_photo" ? 0.65 : 0.85);
+	score += (reference.sharpness_score ?? 0.6) * 0.12;
+
+	if (reference.source_kind === "selected_front_candidate") {
+		score += generationMode === "remaining" ? 0.35 : 0.28;
+	}
+	if (reference.source_kind === "canonical_reference") {
+		score += 0.12;
+	}
+
+	score += viewAngleAffinity(reference.view_angle ?? inferViewAngleFromShotCode(reference.canonical_shot_code), shotCode);
+	score += framingAffinity(reference.framing ?? inferFramingFromShotCode(reference.canonical_shot_code), shotCode);
+	score += expressionAffinity(reference.expression ?? inferExpressionFromShotCode(reference.canonical_shot_code), shotCode);
+
+	return Number(score.toFixed(4));
+}
+
+function viewAngleAffinity(viewAngle: PhotoReferenceViewAngle | undefined, shotCode: CanonicalShotCode): number {
+	if (!viewAngle || viewAngle === "unknown") return 0;
+	if (shotCode === "frontal_closeup" || shotCode === "neutral_head_shoulders" || shotCode === "half_body_front" || shotCode === "full_body_front" || shotCode === "soft_smile_closeup" || shotCode === "serious_closeup") {
+		if (viewAngle === "frontal") return 0.24;
+		if (viewAngle === "left_45" || viewAngle === "right_45") return 0.08;
+		return -0.02;
+	}
+	if (shotCode === "left45_closeup") {
+		if (viewAngle === "left_45") return 0.24;
+		if (viewAngle === "frontal") return 0.09;
+		if (viewAngle === "left_profile") return 0.05;
+		return -0.03;
+	}
+	if (shotCode === "right45_closeup") {
+		if (viewAngle === "right_45") return 0.24;
+		if (viewAngle === "frontal") return 0.09;
+		if (viewAngle === "right_profile") return 0.05;
+		return -0.03;
+	}
+	return 0;
+}
+
+function framingAffinity(framing: PhotoReferenceFraming | undefined, shotCode: CanonicalShotCode): number {
+	if (!framing || framing === "unknown") return 0;
+	if (shotCode === "full_body_front") {
+		if (framing === "full_body") return 0.22;
+		if (framing === "half_body") return 0.09;
+		return -0.05;
+	}
+	if (shotCode === "half_body_front") {
+		if (framing === "half_body") return 0.22;
+		if (framing === "full_body") return 0.1;
+		if (framing === "head_shoulders") return -0.02;
+		return -0.05;
+	}
+	if (shotCode === "neutral_head_shoulders") {
+		if (framing === "head_shoulders") return 0.18;
+		if (framing === "closeup") return 0.08;
+		return -0.03;
+	}
+	if (framing === "closeup") return 0.16;
+	if (framing === "head_shoulders") return 0.1;
+	return -0.04;
+}
+
+function expressionAffinity(expression: PhotoReferenceExpression | undefined, shotCode: CanonicalShotCode): number {
+	if (!expression) return 0;
+	if (shotCode === "soft_smile_closeup") {
+		if (expression === "soft_smile") return 0.08;
+		if (expression === "neutral") return 0.03;
+		return 0;
+	}
+	if (shotCode === "serious_closeup") {
+		if (expression === "serious") return 0.08;
+		if (expression === "neutral") return 0.03;
+		return 0;
+	}
+	if (expression === "neutral") return 0.02;
+	return 0;
+}
+
+function buildConditioningReferenceTitle(reference: CanonicalConditioningReference): string {
+	const parts = ["Model Identity"];
+
+	if (reference.source_kind === "selected_front_candidate") {
+		parts.push("approved front anchor");
+	} else if (reference.source_kind === "canonical_reference") {
+		parts.push("canonical");
+		if (reference.canonical_shot_code) {
+			parts.push(reference.canonical_shot_code);
+		}
+	} else {
+		parts.push("uploaded");
+	}
+
+	if (reference.view_angle && reference.view_angle !== "unknown") {
+		parts.push(reference.view_angle);
+	}
+	if (reference.framing && reference.framing !== "unknown") {
+		parts.push(reference.framing);
+	}
+	if (reference.expression && reference.expression !== "other") {
+		parts.push(reference.expression);
+	}
+
+	return parts.join(" ");
+}
+
+function buildUploadedReferenceTitle(fileName: string | null | undefined, review?: PhotoImportImageReview): string {
+	const parts = ["Model Identity uploaded"];
+	if (review?.view_angle && review.view_angle !== "unknown") parts.push(review.view_angle);
+	if (review?.framing && review.framing !== "unknown") parts.push(review.framing);
+	if (review?.expression && review.expression !== "other") parts.push(review.expression);
+	if (fileName && fileName.trim().length > 0) parts.push(fileName.trim());
+	return parts.join(" ");
+}
+
+function buildCanonicalReferenceTitle(shotCode?: CanonicalShotCode): string {
+	return `Model Identity canonical ${shotCode ?? "reference"}`;
+}
+
+function inferViewAngleFromShotCode(shotCode?: CanonicalShotCode): PhotoReferenceViewAngle {
+	if (!shotCode) return "unknown";
+	if (shotCode === "left45_closeup") return "left_45";
+	if (shotCode === "right45_closeup") return "right_45";
+	return "frontal";
+}
+
+function inferFramingFromShotCode(shotCode?: CanonicalShotCode): PhotoReferenceFraming {
+	if (!shotCode) return "unknown";
+	if (shotCode === "full_body_front") return "full_body";
+	if (shotCode === "half_body_front") return "half_body";
+	if (shotCode === "neutral_head_shoulders") return "head_shoulders";
+	return "closeup";
+}
+
+function inferExpressionFromShotCode(shotCode?: CanonicalShotCode): PhotoReferenceExpression {
+	if (!shotCode) return "other";
+	if (shotCode === "soft_smile_closeup") return "soft_smile";
+	if (shotCode === "serious_closeup") return "serious";
+	return "neutral";
+}
+
+function normalizeCanonicalShotCode(value: string): CanonicalShotCode | undefined {
+	return REQUIRED_CANONICAL_SHOT_CODES.includes(value as CanonicalShotCode) ? (value as CanonicalShotCode) : undefined;
+}
+
+function readPhotoImportImageReviews(onboardingState: Record<string, unknown>): PhotoImportImageReview[] {
+	const photoImport = asRecord(onboardingState.photo_import);
+	const latestSuggestion = asRecord(photoImport?.latest_suggestion);
+	const parsed = photoImportSuggestionSchema.safeParse(latestSuggestion);
+	return parsed.success ? parsed.data.image_reviews : [];
+}
+
 function asRecord(input: unknown): Record<string, unknown> | null {
 	if (!input || typeof input !== "object" || Array.isArray(input)) return null;
 	return input as Record<string, unknown>;
+}
+
+function asRecordArray(input: unknown): Array<Record<string, unknown>> | null {
+	if (!Array.isArray(input)) return null;
+	return input.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+}
+
+function clamp01(value: number): number {
+	return Math.max(0, Math.min(1, Number(value.toFixed(4))));
 }
 
 function isHttpUrl(value: string): boolean {

@@ -34,6 +34,8 @@ export function GenerationProgress({ batchSize, isGenerating, onPollComplete }: 
 	const progress = batchSize > 0 ? Math.min(95, (completedCount / batchSize) * 100) : 0;
 	const estimatedTotal = batchSize * estimatedPerImage;
 	const remaining = Math.max(0, estimatedTotal - elapsed);
+	const passLabel = batchSize <= 1 ? "Anchor pass" : "Campaign batch";
+	const guidance = batchSize <= 1 ? "Creating the reference shot that will stabilize the rest of the set." : "Rendering the expanded campaign set from the saved anchor and references.";
 
 	return (
 		<div className="rounded-xl border border-primary/20 bg-gradient-to-br from-primary/5 via-card to-card p-4 space-y-3">
@@ -43,7 +45,10 @@ export function GenerationProgress({ batchSize, isGenerating, onPollComplete }: 
 						<div className="absolute inset-0 rounded-full bg-primary/40 animate-ping" />
 						<div className="relative h-4 w-4 rounded-full bg-primary" />
 					</div>
-					<p className="text-sm font-semibold">Generating Images</p>
+					<div>
+						<p className="text-sm font-semibold">Generating Images</p>
+						<p className="text-[11px] text-muted-foreground">{passLabel}</p>
+					</div>
 				</div>
 				<p className="text-xs text-muted-foreground tabular-nums">
 					{formatTime(elapsed)} elapsed · ~{formatTime(remaining)} remaining
@@ -80,6 +85,7 @@ export function GenerationProgress({ batchSize, isGenerating, onPollComplete }: 
 			<p className="text-xs text-muted-foreground text-center">
 				{completedCount} of {batchSize} images · Thinking level auto-selected · Parallel processing
 			</p>
+			<p className="text-[11px] text-center text-muted-foreground/80">{guidance}</p>
 		</div>
 	);
 }

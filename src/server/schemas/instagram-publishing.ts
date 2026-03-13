@@ -17,7 +17,16 @@ export const postingPlanStatusSchema = z.enum([
 ]);
 
 export const postTypeSchema = z.enum(["feed", "story", "reel"]);
-export const variantTypeSchema = z.enum(["feed_1x1", "feed_4x5", "story_9x16", "master"]);
+export const variantTypeSchema = z.enum(["feed_1x1", "feed_4x5", "story_9x16", "reel_9x16", "master"]);
+export const strategyPrimaryGoalSchema = z.enum(["balanced_growth", "top_of_funnel", "business_conversion"]);
+
+export const strategyBestTimeWindowSchema = z.object({
+  weekday: z.number().int().min(0).max(6),
+  local_time: z.string().regex(/^\d{2}:\d{2}$/),
+  daypart: z.string().trim().min(2).max(40),
+  score: z.number().min(0).max(1),
+  source: z.enum(["default", "learned"]),
+});
 
 export const strategyPillarInputSchema = z.object({
   id: z.uuid().optional(),
@@ -56,11 +65,18 @@ export const strategySlotTemplateInputSchema = z.object({
 
 export const postingStrategyInputSchema = z
   .object({
+    primary_goal: strategyPrimaryGoalSchema.default("balanced_growth"),
     timezone: z.string().trim().min(2).max(64),
     weekly_post_target: z.number().int().min(1).max(30),
+    weekly_feed_target: z.number().int().min(0).max(21).default(2),
+    weekly_reel_target: z.number().int().min(0).max(21).default(2),
+    weekly_story_target: z.number().int().min(0).max(30).default(3),
     cooldown_hours: z.number().int().min(0).max(168),
     min_ready_assets: z.number().int().min(0).max(50),
     auto_queue_enabled: z.boolean().default(false),
+    experimentation_rate_percent: z.number().int().min(0).max(100).default(20),
+    auto_queue_min_confidence: z.number().min(0).max(1).default(0.72),
+    best_time_windows: z.array(strategyBestTimeWindowSchema).max(12).default([]),
     notes: z.string().trim().max(2000).optional(),
     pillars: z.array(strategyPillarInputSchema).min(1).max(12),
     slot_templates: z.array(strategySlotTemplateInputSchema).min(1).max(42),
@@ -89,6 +105,15 @@ export const postingStrategyInputSchema = z
         });
       }
     }
+
+    const totalCadence = value.weekly_feed_target + value.weekly_reel_target + value.weekly_story_target;
+    if (totalCadence <= 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "At least one weekly format target must be greater than zero.",
+        path: ["weekly_post_target"],
+      });
+    }
   });
 
 export const instagramProfileCreateSchema = z.object({
@@ -106,6 +131,15 @@ export const recommendationAcceptSchema = z.object({
   scheduled_at: z.iso.datetime().optional(),
   post_type: postTypeSchema.optional(),
   variant_type: variantTypeSchema.optional(),
+});
+
+export const generatePublishingCopySchema = z.object({
+  profile_id: z.uuid(),
+  plan_item_id: z.uuid().optional(),
+  asset_id: z.uuid().optional(),
+  post_type: postTypeSchema.optional(),
+  variant_type: variantTypeSchema.optional(),
+  scheduled_at: z.iso.datetime().optional(),
 });
 
 export const recommendationSkipSchema = z.object({

@@ -13,6 +13,7 @@ import {
 } from "@/server/schemas/model-workflow";
 import {
   instagramProfileCreateSchema,
+  generatePublishingCopySchema,
   recommendationAcceptSchema,
   recommendationSkipSchema,
   postingStrategyInputSchema,
@@ -135,6 +136,12 @@ export const schedulePostSchema = z.object({
   scheduled_at: z.iso.datetime(),
 });
 
+export const createReelVariantSchema = z.object({
+  prompt_text: z.string().trim().min(8).max(1200).optional(),
+  duration_seconds: z.number().int().min(6).max(8).default(8),
+  variant_id: uuidSchema.optional(),
+});
+
 export const rejectPublishingSchema = z.object({
   reason: z.string().min(3),
 });
@@ -188,6 +195,7 @@ export const revenueEntryCreateSchema = z.object({
 
 export {
   instagramProfileCreateSchema,
+  generatePublishingCopySchema,
   postingStrategyInputSchema,
   recommendationAcceptSchema,
   recommendationSkipSchema,

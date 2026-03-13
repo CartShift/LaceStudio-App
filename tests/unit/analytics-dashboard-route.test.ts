@@ -38,35 +38,47 @@ describe("analytics dashboard route", () => {
   it("delegates analytics aggregation to the reporting service", async () => {
     mocks.getAnalyticsDashboardDataMock.mockResolvedValue({
       kpis: {
+        total_views: 840,
         total_reach: 370,
         avg_engagement_rate: 15.95,
+        avg_share_rate: 2.8,
+        avg_save_rate: 2.1,
         total_posts: 2,
         top_post: {
           publishing_queue_id: "queue-2",
+          views: 520,
           engagement_rate: 20,
         },
       },
       model_breakdown: [
         {
           model_id: "model-2",
+          views: 520,
           reach: 220,
           engagement_rate: 20,
+          share_rate: 3.2,
+          save_rate: 2.5,
           post_count: 1,
         },
         {
           model_id: "model-1",
+          views: 320,
           reach: 150,
           engagement_rate: 10,
+          share_rate: 2.1,
+          save_rate: 1.7,
           post_count: 1,
         },
       ],
       trend_data: [
         {
           date: "2026-03-10",
+          views: 320,
           engagement_rate: 10,
         },
         {
           date: "2026-03-11",
+          views: 520,
           engagement_rate: 15.95,
         },
       ],
@@ -86,35 +98,47 @@ describe("analytics dashboard route", () => {
     });
     await expect(response.json()).resolves.toEqual({
       kpis: {
+        total_views: 840,
         total_reach: 370,
         avg_engagement_rate: 15.95,
+        avg_share_rate: 2.8,
+        avg_save_rate: 2.1,
         total_posts: 2,
         top_post: {
           publishing_queue_id: "queue-2",
+          views: 520,
           engagement_rate: 20,
         },
       },
       model_breakdown: [
         {
           model_id: "model-2",
+          views: 520,
           reach: 220,
           engagement_rate: 20,
+          share_rate: 3.2,
+          save_rate: 2.5,
           post_count: 1,
         },
         {
           model_id: "model-1",
+          views: 320,
           reach: 150,
           engagement_rate: 10,
+          share_rate: 2.1,
+          save_rate: 1.7,
           post_count: 1,
         },
       ],
       trend_data: [
         {
           date: "2026-03-10",
+          views: 320,
           engagement_rate: 10,
         },
         {
           date: "2026-03-11",
+          views: 520,
           engagement_rate: 15.95,
         },
       ],

@@ -43,11 +43,18 @@ export async function GET(request: Request) {
             token_expires_at: null,
             last_analytics_sync_at: new Date().toISOString(),
             strategy: {
+              primary_goal: "balanced_growth",
               weekly_post_target: 5,
+              weekly_feed_target: 2,
+              weekly_reel_target: 1,
+              weekly_story_target: 2,
               cooldown_hours: 18,
               min_ready_assets: 3,
               active_pillars: 2,
               slot_count: 5,
+              experimentation_rate_percent: 20,
+              auto_queue_enabled: true,
+              auto_queue_min_confidence: 0.72,
             },
             health: {
               cadence_score: 84,
@@ -59,7 +66,14 @@ export async function GET(request: Request) {
               stale_analytics: false,
               warnings: [],
             },
-            last_post: null,
+            last_post: {
+              publishing_queue_id: `demo-last-post-${model.id}`,
+              published_at: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+              views: 22800,
+              reach: 14600,
+              engagement_rate: 5.3,
+              pillar_key: "discoverability_reels",
+            },
             next_posts: [],
           };
         });

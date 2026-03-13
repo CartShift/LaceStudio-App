@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -38,23 +38,33 @@ import { FormShell } from "@/components/workspace/form-shell";
 import { apiRequest } from "@/lib/client-api";
 import { cn } from "@/lib/cn";
 import type {
+  CaptionCopySource,
+  CaptionSeoPackage,
   InstagramProfileConnectionStatus,
   InstagramProfileSummary,
   PostingPlanItem,
   PostingStrategy,
   PublishingStatus,
+  ReelVariantSummary,
   StrategyPillar,
   StrategySlotTemplate,
+  VariantType,
+  VideoGenerationJob,
 } from "@/types/domain";
 
 type ProfilesResponse = { data: InstagramProfileSummary[] };
 type RecommendationsResponse = { data: PostingPlanItem[] };
+type GeneratedCopyResponse = {
+  caption: string;
+  caption_package: CaptionSeoPackage;
+  source: CaptionCopySource;
+};
 type QueueItem = {
   id: string;
   status: PublishingStatus;
   caption: string;
   post_type: "feed" | "story" | "reel";
-  variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+  variant_type: VariantType;
   scheduled_at: string;
   published_at?: string | null;
   slot_start?: string | null;
@@ -72,6 +82,7 @@ type ApprovedAsset = {
   sequence_number: number;
   preview_url?: string | null;
   is_available?: boolean;
+  reel_variant_ready?: boolean;
   active_queue_item?: {
     id: string;
     status: PublishingStatus;
@@ -82,22 +93,47 @@ type ApprovedAsset = {
   campaign?: { id: string; name: string } | null;
 };
 type ApprovedAssetsResponse = { data: ApprovedAsset[] };
+type ReelVariantsResponse = {
+  data: {
+    variants: ReelVariantSummary[];
+    jobs: VideoGenerationJob[];
+  };
+};
 type AnalyticsDashboardPayload = {
-  kpis: { total_reach: number; avg_engagement_rate: number; total_posts: number; top_post: { publishing_queue_id: string; engagement_rate: number } | null };
-  trend_data: Array<{ date: string; engagement_rate: number }>;
-  model_breakdown: Array<{ model_id: string; reach: number; engagement_rate: number; post_count: number }>;
+  kpis: {
+    total_views: number;
+    total_reach: number;
+    avg_engagement_rate: number;
+    avg_share_rate: number;
+    avg_save_rate: number;
+    total_posts: number;
+    top_post: { publishing_queue_id: string; views: number; engagement_rate: number } | null;
+  };
+  trend_data: Array<{ date: string; views: number; engagement_rate: number }>;
+  model_breakdown: Array<{ model_id: string; views: number; reach: number; engagement_rate: number; share_rate: number; save_rate: number; post_count: number }>;
 };
 type AnalyticsStrategyPayload = {
-  pillar_breakdown: Array<{ pillar_key: string; total_reach: number; avg_engagement_rate: number; published_posts: number }>;
-  daypart_breakdown: Array<{ daypart: string; avg_engagement_rate: number; published_posts: number }>;
+  profile_breakdown: Array<{ profile_id: string; profile_handle: string | null; total_views: number; total_reach: number; avg_engagement_rate: number; published_posts: number }>;
+  pillar_breakdown: Array<{ pillar_key: string; total_views: number; total_reach: number; avg_engagement_rate: number; share_rate: number; save_rate: number; published_posts: number }>;
+  daypart_breakdown: Array<{ daypart: string; avg_views: number; avg_engagement_rate: number; share_rate: number; save_rate: number; published_posts: number }>;
+  best_time_windows: Array<{ label: string; avg_views: number; share_rate: number; published_posts: number }>;
   schedule_adherence: { on_slot_percent: number; avg_publish_delay_minutes: number };
-  best_patterns: Array<{ label: string; engagement_rate: number; published_posts: number }>;
+  best_patterns: Array<{ label: string; views: number; engagement_rate: number; share_rate: number; published_posts: number }>;
+  experiment_win_rate: number;
+  reel_readiness: {
+    ready_variants: number;
+    pending_jobs: number;
+    scheduled_reels: number;
+    published_reels: number;
+  };
 };
 
 type SignalTone = "neutral" | "success" | "warning" | "danger";
 
 const MIN_SCHEDULE_LEAD_MINUTES = 15;
+const DEFAULT_REEL_DURATION_SECONDS = 8;
 const ACTIVE_QUEUE_STATUSES = new Set<PublishingStatus>(["PENDING_APPROVAL", "SCHEDULED", "PUBLISHING", "RETRY"]);
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 
 function toLocalInputValue(date: Date) {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
@@ -116,7 +152,8 @@ function humanizePillar(value: string | null | undefined) {
   return value ? value.replaceAll("_", " ") : "Open slot";
 }
 
-function humanizeStatus(value: string) {
+function humanizeStatus(value: string | null | undefined) {
+  if (!value) return "unknown";
   return value.replaceAll("_", " ").toLowerCase();
 }
 
@@ -181,6 +218,24 @@ function blankSlot(index: number, pillarKey?: string): StrategySlotTemplate {
   };
 }
 
+function defaultVariantForPostType(postType: QueueItem["post_type"]): VariantType {
+  if (postType === "story") return "story_9x16";
+  if (postType === "reel") return "reel_9x16";
+  return "feed_4x5";
+}
+
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat([], { notation: "compact", maximumFractionDigits: value >= 1000 ? 1 : 0 }).format(value);
+}
+
+function formatPercent(value: number, maximumFractionDigits = 1) {
+  return `${value.toFixed(maximumFractionDigits)}%`;
+}
+
+function formatBestTimeWindowLabel(weekday: number, localTime: string) {
+  return `${WEEKDAY_LABELS[weekday] ?? "Day"} ${localTime}`;
+}
+
 export default function PublishProfilePage() {
   const params = useParams<{ id: string }>();
   const profileId = Array.isArray(params.id) ? params.id[0] : params.id;
@@ -191,12 +246,21 @@ export default function PublishProfilePage() {
   const [savingStrategy, setSavingStrategy] = useState(false);
   const [workingId, setWorkingId] = useState<string | null>(null);
   const [scheduling, setScheduling] = useState(false);
+  const [reelActionPending, setReelActionPending] = useState(false);
+  const [localReelDataByAsset, setLocalReelDataByAsset] = useState<Record<string, ReelVariantsResponse["data"]>>({});
   const [selectedRecommendationId, setSelectedRecommendationId] = useState("");
   const [assetId, setAssetId] = useState("");
   const [caption, setCaption] = useState("");
   const [postType, setPostType] = useState<QueueItem["post_type"]>("feed");
   const [variantType, setVariantType] = useState<QueueItem["variant_type"]>("feed_4x5");
   const [scheduledAt, setScheduledAt] = useState(toLocalInputValue(new Date(Date.now() + 2 * 60 * 60 * 1000)));
+  const [smartCopy, setSmartCopy] = useState<GeneratedCopyResponse | null>(null);
+  const [smartCopyPending, setSmartCopyPending] = useState(false);
+  const [smartCopyReadyToApply, setSmartCopyReadyToApply] = useState(false);
+  const [lastGeneratedCaption, setLastGeneratedCaption] = useState("");
+  const smartCopyRequestIdRef = useRef(0);
+  const captionRef = useRef(caption);
+  const lastGeneratedCaptionRef = useRef(lastGeneratedCaption);
 
   const profileQuery = useQuery({
     queryKey: ["instagram-profile", profileId],
@@ -226,6 +290,11 @@ export default function PublishProfilePage() {
     queryKey: ["publishing-assets", profileId],
     queryFn: () => apiRequest<ApprovedAssetsResponse>(`/api/publishing/assets?profile_id=${profileId}`),
   });
+  const reelVariantsQuery = useQuery({
+    queryKey: ["reel-variants", assetId],
+    enabled: Boolean(assetId),
+    queryFn: () => apiRequest<ReelVariantsResponse>(`/api/assets/${assetId}/reel-variants`),
+  });
   const analyticsQuery = useQuery({
     queryKey: ["analytics-dashboard", profileId],
     queryFn: () => apiRequest<AnalyticsDashboardPayload>(`/api/analytics/dashboard?profile_id=${profileId}`),
@@ -239,10 +308,28 @@ export default function PublishProfilePage() {
   const recommendations = recommendationsQuery.data?.data ?? [];
   const queue = queueQuery.data?.data ?? [];
   const assets = assetsQuery.data?.data ?? [];
+  const reelData = useMemo(() => {
+    const serverData = reelVariantsQuery.data?.data ?? { variants: [], jobs: [] };
+    const localData = assetId ? localReelDataByAsset[assetId] : undefined;
+    return {
+      variants: [...(localData?.variants ?? []), ...serverData.variants].filter(
+        (variant, index, rows) => rows.findIndex((row) => row.id === variant.id) === index,
+      ),
+      jobs: [...(localData?.jobs ?? []), ...serverData.jobs].filter((job, index, rows) => rows.findIndex((row) => row.id === job.id) === index),
+    };
+  }, [assetId, localReelDataByAsset, reelVariantsQuery.data]);
 
   useEffect(() => {
     if (strategyQuery.data) setStrategyDraft(strategyQuery.data);
   }, [strategyQuery.data]);
+
+  useEffect(() => {
+    captionRef.current = caption;
+  }, [caption]);
+
+  useEffect(() => {
+    lastGeneratedCaptionRef.current = lastGeneratedCaption;
+  }, [lastGeneratedCaption]);
 
   useEffect(() => {
     const preferredAsset = assets.find((asset) => asset.is_available !== false) ?? assets[0];
@@ -257,10 +344,24 @@ export default function PublishProfilePage() {
   }, [assetId, assets]);
 
   useEffect(() => {
+    if (postType !== "reel") return;
+    if (!assets.length) return;
+    const currentAsset = assets.find((asset) => asset.id === assetId);
+    if (currentAsset?.reel_variant_ready) return;
+
+    const preferredReelAsset = assets.find((asset) => asset.is_available !== false && asset.reel_variant_ready);
+    if (preferredReelAsset) {
+      setAssetId(preferredReelAsset.id);
+    }
+  }, [assetId, assets, postType]);
+
+  useEffect(() => {
     if (!selectedRecommendationId) return;
     const match = recommendations.find((item) => item.id === selectedRecommendationId);
     if (!match) return;
 
+    setSmartCopy(null);
+    setSmartCopyReadyToApply(false);
     setScheduledAt(toLocalInputValue(new Date(match.slot_start)));
     setPostType(match.post_type);
     setVariantType(match.variant_type);
@@ -273,12 +374,51 @@ export default function PublishProfilePage() {
     [recommendations, selectedRecommendationId],
   );
   const selectedAsset = useMemo(() => assets.find((asset) => asset.id === assetId) ?? null, [assetId, assets]);
+  const reelVariants = reelData.variants;
+  const reelJobs = reelData.jobs;
+  const latestReelVariant = useMemo(
+    () =>
+      [...reelVariants].sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())[0] ?? null,
+    [reelVariants],
+  );
+  const latestReelJob = useMemo(
+    () =>
+      [...reelJobs].sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())[0] ?? null,
+    [reelJobs],
+  );
+  const selectedAssetReelReady = useMemo(
+    () => Boolean(selectedAsset?.reel_variant_ready || reelVariants.some((variant) => variant.format_type === "reel_9x16" && variant.media_kind === "video")),
+    [reelVariants, selectedAsset],
+  );
   const availableAssets = useMemo(() => assets.filter((asset) => asset.is_available !== false), [assets]);
+  const availableReelAssets = useMemo(
+    () => availableAssets.filter((asset) => asset.reel_variant_ready || asset.id === assetId && selectedAssetReelReady),
+    [assetId, availableAssets, selectedAssetReelReady],
+  );
   const reservedAssets = useMemo(() => assets.filter((asset) => asset.is_available === false), [assets]);
+  const reelReadyAssetCount = useMemo(
+    () => availableAssets.filter((asset) => asset.reel_variant_ready || asset.id === assetId && selectedAssetReelReady).length,
+    [assetId, availableAssets, selectedAssetReelReady],
+  );
+  const recommendationQueueable = useMemo(() => {
+    if (!selectedRecommendation) return true;
+    if (selectedRecommendation.post_type !== "reel") return availableAssets.length > 0;
+    return availableReelAssets.length > 0;
+  }, [availableAssets.length, availableReelAssets.length, selectedRecommendation]);
   const activeShareTotal = useMemo(
     () => strategyDraft?.pillars.filter((pillar) => pillar.active).reduce((sum, pillar) => sum + pillar.target_share_percent, 0) ?? 0,
     [strategyDraft],
   );
+  const formatMixTotal = useMemo(
+    () =>
+      (strategyDraft?.weekly_feed_target ?? 0) +
+      (strategyDraft?.weekly_reel_target ?? 0) +
+      (strategyDraft?.weekly_story_target ?? 0),
+    [strategyDraft],
+  );
+  const selectedCaptionPackage = smartCopy?.caption_package ?? selectedRecommendation?.caption_package ?? null;
+  const smartCopySource = smartCopy?.source ?? selectedRecommendation?.caption_package?.source ?? null;
+  const selectedAutopilotMetadata = selectedRecommendation?.autopilot_metadata ?? null;
 
   const scheduleDate = useMemo(() => safeDate(scheduledAt), [scheduledAt]);
   const captionStats = useMemo(
@@ -288,6 +428,10 @@ export default function PublishProfilePage() {
       lineCount: caption.split(/\n+/).filter(Boolean).length,
     }),
     [caption],
+  );
+  const maxTrendViews = useMemo(
+    () => Math.max(1, ...(analyticsQuery.data?.trend_data ?? []).map((point) => point.views)),
+    [analyticsQuery.data?.trend_data],
   );
 
   const queueSummary = useMemo(() => {
@@ -334,6 +478,14 @@ export default function PublishProfilePage() {
         tone: "danger",
         title: "No free approved assets",
         description: "Every approved asset is already committed to another active queue item. Approve more assets or manage the existing queue.",
+      });
+    }
+
+    if (postType === "reel" && !selectedAssetReelReady) {
+      signals.push({
+        tone: "warning",
+        title: "Reel variant still missing",
+        description: "This slot is set to reel delivery, but the selected asset does not have a generated reel_9x16 video variant yet.",
       });
     }
 
@@ -388,6 +540,14 @@ export default function PublishProfilePage() {
       });
     }
 
+    if (selectedRecommendation && selectedRecommendation.post_type === "reel" && !availableReelAssets.length) {
+      signals.push({
+        tone: "warning",
+        title: "No reel-ready assets available",
+        description: "Generate a reel_9x16 variant from an approved asset before trying to queue this recommendation instantly.",
+      });
+    }
+
     if (!signals.length) {
       signals.push({
         tone: "success",
@@ -397,7 +557,82 @@ export default function PublishProfilePage() {
     }
 
     return signals;
-  }, [availableAssets.length, profile, scheduleDate, selectedAsset, selectedRecommendation, strategyDraft?.cooldown_hours, upcomingQueue]);
+  }, [availableAssets.length, availableReelAssets.length, postType, profile, scheduleDate, selectedAsset, selectedAssetReelReady, selectedRecommendation, strategyDraft?.cooldown_hours, upcomingQueue]);
+
+  async function requestSmartCopy(mode: "auto" | "manual") {
+    const effectiveAssetId = assetId || selectedRecommendation?.asset_id || undefined;
+    const effectivePostType =
+      mode === "auto" && selectedRecommendation ? selectedRecommendation.post_type : postType;
+    const effectiveVariantType =
+      mode === "auto" && selectedRecommendation ? selectedRecommendation.variant_type : variantType;
+    const effectiveScheduledAt =
+      mode === "auto" && selectedRecommendation ? new Date(selectedRecommendation.slot_start) : new Date(scheduledAt);
+    if (!selectedRecommendationId && !effectiveAssetId) return;
+
+    const requestId = smartCopyRequestIdRef.current + 1;
+    smartCopyRequestIdRef.current = requestId;
+    setSmartCopyPending(true);
+
+    try {
+      const payload = await apiRequest<GeneratedCopyResponse>("/api/publishing/copy/generate", {
+        method: "POST",
+        body: JSON.stringify({
+          profile_id: profileId,
+          plan_item_id: selectedRecommendationId || undefined,
+          asset_id: effectiveAssetId,
+          post_type: effectivePostType,
+          variant_type: effectiveVariantType,
+          scheduled_at: effectiveScheduledAt.toISOString(),
+        }),
+      });
+
+      if (smartCopyRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      setSmartCopy(payload);
+      setLastGeneratedCaption(payload.caption);
+
+      const currentCaption = captionRef.current.trim();
+      const safeOverwrite =
+        mode === "manual" ||
+        currentCaption.length === 0 ||
+        [
+          lastGeneratedCaptionRef.current,
+          selectedRecommendation?.caption_suggestion ?? "",
+          selectedRecommendation?.caption_package?.caption ?? "",
+          smartCopy?.caption ?? "",
+        ].some((candidate) => candidate.trim() && candidate.trim() === currentCaption);
+
+      if (safeOverwrite) {
+        setCaption(payload.caption);
+        setSmartCopyReadyToApply(false);
+      } else {
+        setSmartCopyReadyToApply(true);
+      }
+    } catch (error) {
+      if (smartCopyRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      if (mode === "manual") {
+        notify({
+          tone: "error",
+          title: "Smart copy failed",
+          description: error instanceof Error ? error.message : "We couldn't generate smart copy right now.",
+        });
+      }
+    } finally {
+      if (smartCopyRequestIdRef.current === requestId) {
+        setSmartCopyPending(false);
+      }
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedRecommendationId && !assetId) return;
+    void requestSmartCopy("auto");
+  }, [assetId, selectedRecommendationId]);
 
   async function refreshAll() {
     await Promise.all([
@@ -406,6 +641,7 @@ export default function PublishProfilePage() {
       recommendationsQuery.refetch(),
       queueQuery.refetch(),
       assetsQuery.refetch(),
+      reelVariantsQuery.refetch(),
       analyticsQuery.refetch(),
       analyticsStrategyQuery.refetch(),
     ]);
@@ -435,6 +671,10 @@ export default function PublishProfilePage() {
     setScheduling(true);
 
     try {
+      if (postType === "reel" && !selectedAssetReelReady) {
+        throw new Error("Generate a reel_9x16 video variant for this asset before queueing a Reel.");
+      }
+
       await apiRequest("/api/publishing/schedule", {
         method: "POST",
         body: JSON.stringify({
@@ -451,9 +691,14 @@ export default function PublishProfilePage() {
       setSelectedRecommendationId("");
       setCaption("");
       setScheduledAt(toLocalInputValue(new Date(Date.now() + 2 * 60 * 60 * 1000)));
+      setPostType("feed");
+      setVariantType("feed_4x5");
+      setSmartCopy(null);
+      setSmartCopyReadyToApply(false);
+      setLastGeneratedCaption("");
       setActiveTab("queue");
 
-      await Promise.all([queueQuery.refetch(), recommendationsQuery.refetch(), profileQuery.refetch(), assetsQuery.refetch()]);
+      await Promise.all([queueQuery.refetch(), recommendationsQuery.refetch(), profileQuery.refetch(), assetsQuery.refetch(), reelVariantsQuery.refetch()]);
       notify({ tone: "success", title: "Post queued", description: `Scheduled in ${timezone}. Review the queue rail for confirmation.` });
     } catch (error) {
       notify({ tone: "error", title: "Scheduling failed", description: error instanceof Error ? error.message : "We couldn't schedule this post." });
@@ -466,13 +711,17 @@ export default function PublishProfilePage() {
     setWorkingId(item.id);
 
     try {
+      const preferredAssetId =
+        item.asset_id ??
+        (item.post_type === "reel" ? availableReelAssets[0]?.id : availableAssets[0]?.id);
+
       await apiRequest(`/api/publishing/recommendations/${item.id}/${action}`, {
         method: "POST",
         body: JSON.stringify(
           action === "accept"
             ? {
                 profile_id: profileId,
-                asset_id: item.asset_id ?? availableAssets[0]?.id,
+                asset_id: preferredAssetId,
                 caption: item.caption_suggestion ?? undefined,
               }
             : { reason: "Skipped from the publishing workspace." },
@@ -494,6 +743,50 @@ export default function PublishProfilePage() {
       });
     } finally {
       setWorkingId(null);
+    }
+  }
+
+  async function generateReelVariant() {
+    if (!assetId) return;
+
+    setReelActionPending(true);
+    try {
+      const payload = await apiRequest<VideoGenerationJob>(`/api/assets/${assetId}/reel-variant`, {
+        method: "POST",
+        body: JSON.stringify({
+          duration_seconds: DEFAULT_REEL_DURATION_SECONDS,
+          prompt_text:
+            selectedCaptionPackage?.hook ??
+            selectedRecommendation?.caption_suggestion ??
+            `Turn asset #${selectedAsset?.sequence_number ?? ""} into an original vertical Reel with subtle camera motion and clean original-audio pacing.`,
+        }),
+      });
+
+      setLocalReelDataByAsset((current) => ({
+        ...current,
+        [assetId]: {
+          variants: payload.output_variant ? [payload.output_variant, ...(current[assetId]?.variants ?? [])] : current[assetId]?.variants ?? [],
+          jobs: [payload, ...(current[assetId]?.jobs ?? [])],
+        },
+      }));
+
+      await Promise.all([assetsQuery.refetch(), reelVariantsQuery.refetch(), recommendationsQuery.refetch()]);
+      notify({
+        tone: payload.status === "FAILED" ? "error" : "success",
+        title: payload.status === "COMPLETED" ? "Reel variant ready" : "Reel generation started",
+        description:
+          payload.status === "COMPLETED"
+            ? "A reel_9x16 video variant is now available for this asset."
+            : "The reel generation job was created. Refresh or reopen this asset to check completion.",
+      });
+    } catch (error) {
+      notify({
+        tone: "error",
+        title: "Reel generation failed",
+        description: error instanceof Error ? error.message : "We couldn't start the reel generation job.",
+      });
+    } finally {
+      setReelActionPending(false);
     }
   }
 
@@ -552,18 +845,18 @@ export default function PublishProfilePage() {
                 Queue the next post with the right asset, the right slot, and fewer avoidable mistakes.
               </h2>
               <p className="max-w-2xl text-sm leading-7 text-muted-foreground">
-                Strategy is operator-controlled, recommendations stay editable, and the queue is now easier to reason about before anything reaches approval or publish execution.
+                Strategy is operator-controlled, recommendations stay editable, reels can be generated from approved assets, and the queue now optimizes around views, share intent, and timing quality before anything publishes.
               </p>
             </div>
 
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <WorkspaceMetric label="Cadence score" value={`${profile.health.cadence_score}%`} hint={`${profile.health.recommendation_count} live recommendations`} />
-              <WorkspaceMetric label="Ready assets" value={String(profile.health.approved_assets_ready)} hint={`${profile.strategy?.min_ready_assets ?? 0} minimum target`} />
+              <WorkspaceMetric label="Ready assets" value={String(profile.health.approved_assets_ready)} hint={`${reelReadyAssetCount} reel-ready · ${profile.strategy?.min_ready_assets ?? 0} minimum target`} />
               <WorkspaceMetric label="Upcoming queue" value={String(queueSummary.upcoming)} hint={`${queueSummary.approvals} pending approval`} />
               <WorkspaceMetric
                 label="Last post"
-                value={profile.last_post ? `${profile.last_post.engagement_rate.toFixed(2)}%` : "No sync"}
-                hint={profile.last_post ? `${profile.last_post.reach.toLocaleString()} reach` : "Waiting for analytics"}
+                value={profile.last_post ? formatCompactNumber(profile.last_post.views) : "No sync"}
+                hint={profile.last_post ? `${profile.last_post.reach.toLocaleString()} reach · ${formatPercent(profile.last_post.engagement_rate, 2)} engagement` : "Waiting for analytics"}
                 tone={profile.last_post ? "success" : "neutral"}
               />
             </div>
@@ -621,7 +914,7 @@ export default function PublishProfilePage() {
               icon={<CheckCircle2 className="h-5 w-5" />}
               label="Strategy coverage"
               value={`${profile.strategy?.slot_count ?? 0} active slots`}
-              description={`${profile.strategy?.active_pillars ?? 0} pillars across ${profile.strategy?.weekly_post_target ?? 0} target posts each week.`}
+              description={`${profile.strategy?.active_pillars ?? 0} pillars · ${profile.strategy?.weekly_feed_target ?? 0}/${profile.strategy?.weekly_reel_target ?? 0}/${profile.strategy?.weekly_story_target ?? 0} feed-reel-story weekly mix.`}
             />
           </div>
         </div>
@@ -655,7 +948,7 @@ export default function PublishProfilePage() {
               <div className="space-y-4">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <WorkspaceMetric label="Recommendation count" value={String(recommendations.length)} hint="Fresh slots from strategy and readiness checks" />
-                  <WorkspaceMetric label="Unclaimed assets" value={String(availableAssets.length)} hint={`${reservedAssets.length} already committed elsewhere`} />
+                  <WorkspaceMetric label="Reel-ready assets" value={String(reelReadyAssetCount)} hint={`${reservedAssets.length} already committed elsewhere`} />
                 </div>
 
                 {recommendations.length ? (
@@ -665,7 +958,7 @@ export default function PublishProfilePage() {
                       item={item}
                       selected={item.id === selectedRecommendationId}
                       working={workingId === item.id}
-                      canQueue={Boolean(item.asset_id || availableAssets[0]?.id)}
+                      canQueue={Boolean(item.asset_id || (item.post_type === "reel" ? availableReelAssets[0]?.id : availableAssets[0]?.id))}
                       onLoad={() => {
                         setSelectedRecommendationId(item.id);
                         setActiveTab("compose");
@@ -689,7 +982,7 @@ export default function PublishProfilePage() {
                   <SectionCallout
                     tone="success"
                     title="Composer loaded from a strategy slot"
-                    description={`${humanizePillar(selectedRecommendation.pillar_key)} · ${formatSlot(selectedRecommendation.slot_start)} · ${selectedRecommendation.post_type} / ${selectedRecommendation.variant_type}`}
+                    description={`${humanizePillar(selectedRecommendation.pillar_key)} · ${formatSlot(selectedRecommendation.slot_start)} · ${selectedRecommendation.post_type} / ${selectedRecommendation.variant_type} · ${selectedRecommendation.confidence ? `${Math.round(selectedRecommendation.confidence * 100)}% confidence` : "Unscored"}`}
                     action={
                       <Button size="sm" variant="ghost" onClick={() => setSelectedRecommendationId("")}>
                         Clear slot
@@ -707,8 +1000,8 @@ export default function PublishProfilePage() {
                           {selectedAsset ? `${selectedAsset.campaign?.name ?? "Campaign"} · Asset #${selectedAsset.sequence_number}` : "Select an approved asset"}
                         </p>
                       </div>
-                      <Badge tone={selectedAsset?.is_available === false ? "warning" : "success"}>
-                        {selectedAsset?.is_available === false ? "Reserved" : "Ready to queue"}
+                      <Badge tone={selectedAsset?.is_available === false ? "warning" : selectedAssetReelReady ? "success" : "neutral"}>
+                        {selectedAsset?.is_available === false ? "Reserved" : selectedAssetReelReady ? "Reel-ready" : "Image-only"}
                       </Badge>
                     </div>
 
@@ -757,18 +1050,131 @@ export default function PublishProfilePage() {
                     <div className="grid gap-3 sm:grid-cols-3">
                       <WorkspaceMetric label="Caption" value={`${captionStats.length}`} hint={`${captionStats.hashtagCount} hashtags`} compact />
                       <WorkspaceMetric label="Queue now" value={String(queueSummary.upcoming)} hint="Active scheduled volume" compact />
-                      <WorkspaceMetric label="Ready assets" value={String(availableAssets.length)} hint="Free approved picks" compact />
+                      <WorkspaceMetric label="Reels ready" value={String(reelReadyAssetCount)} hint="Vertical video variants available" compact />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 xl:grid-cols-2">
+                  <div className="rounded-[1.6rem] border border-border/70 bg-background/70 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Optimization package</p>
+                        <p className="mt-1 text-sm text-muted-foreground">Caption SEO, score breakdown, and experiment context for the selected slot.</p>
+                      </div>
+                      <Badge tone={recommendationQueueable ? "success" : "warning"}>
+                        {recommendationQueueable ? "Queue-ready" : "Needs reel prep"}
+                      </Badge>
+                    </div>
+
+                    <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                      {selectedRecommendation ? (
+                        getRecommendationScoreRows(selectedRecommendation).map((row) => (
+                          <WorkspaceMetric key={row.label} label={row.label} value={row.value} hint="Strategy engine score" compact />
+                        ))
+                      ) : (
+                        <>
+                          <WorkspaceMetric label="Goal" value={strategyDraft?.primary_goal?.replaceAll("_", " ") ?? "balanced"} hint="Current optimization goal" compact />
+                          <WorkspaceMetric label="Experiment" value={`${strategyDraft?.experimentation_rate_percent ?? 0}%`} hint="Reserved discovery rate" compact />
+                          <WorkspaceMetric label="Threshold" value={formatPercent((strategyDraft?.auto_queue_min_confidence ?? 0) * 100, 0)} hint="Auto-queue confidence floor" compact />
+                        </>
+                      )}
+                    </div>
+
+                    {selectedCaptionPackage ? (
+                      <div className="mt-4 space-y-3 rounded-[1.25rem] border border-border/70 bg-muted/20 p-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge tone="neutral">{selectedCaptionPackage.primary_keyword}</Badge>
+                          {selectedRecommendation && getExperimentTag(selectedRecommendation) ? <Badge tone="warning">{getExperimentTag(selectedRecommendation)}</Badge> : null}
+                          {smartCopySource ? <Badge tone={smartCopySource === "vision_refined" ? "success" : "neutral"}>{formatCopySource(smartCopySource)}</Badge> : null}
+                          {smartCopyPending ? <Badge tone="warning">Generating…</Badge> : null}
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Hook</p>
+                          <p className="text-sm">{selectedCaptionPackage.hook}</p>
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Body</p>
+                          <p className="text-sm text-muted-foreground">{selectedCaptionPackage.body}</p>
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Call to action</p>
+                          <p className="text-sm">{selectedCaptionPackage.call_to_action}</p>
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Suggested hashtags</p>
+                          <p className="text-sm text-muted-foreground">{selectedCaptionPackage.hashtags.join(" ") || "No hashtags suggested."}</p>
+                        </div>
+                        <p className="text-xs leading-relaxed text-muted-foreground">{selectedCaptionPackage.strategy_alignment}</p>
+                        <p className="text-xs leading-relaxed text-muted-foreground">{selectedCaptionPackage.compliance_summary}</p>
+                        <p className="text-xs leading-relaxed text-muted-foreground">{selectedCaptionPackage.rationale}</p>
+                      </div>
+                    ) : (
+                      <div className="mt-4 rounded-[1.25rem] border border-dashed border-border/70 bg-muted/10 px-4 py-5 text-sm text-muted-foreground">
+                        Load a recommendation to surface the generated hook, keyword, CTA, and rationale for this slot.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-[1.6rem] border border-border/70 bg-background/70 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Reel lab</p>
+                        <p className="mt-1 text-sm text-muted-foreground">Generate or refresh a vertical reel_9x16 variant from the selected approved asset.</p>
+                      </div>
+                      <Badge tone={selectedAssetReelReady ? "success" : "warning"}>
+                        {selectedAssetReelReady ? "Variant ready" : "Generate needed"}
+                      </Badge>
+                    </div>
+
+                    <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                      <WorkspaceMetric label="Selected" value={selectedAsset ? `#${selectedAsset.sequence_number}` : "None"} hint="Approved asset in composer" compact />
+                      <WorkspaceMetric label="Variants" value={String(reelVariants.length)} hint="Stored reel outputs" compact />
+                      <WorkspaceMetric label="Jobs" value={String(reelJobs.length)} hint="Generation attempts tracked" compact />
+                    </div>
+
+                    <div className="mt-4 space-y-3 rounded-[1.25rem] border border-border/70 bg-muted/20 p-3">
+                      <p className="text-sm text-muted-foreground">
+                        Keep auto-published reels on original audio. Trending-sound versions should stay operator-assisted.
+                      </p>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="rounded-[1rem] border border-border/70 bg-background/75 p-3">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Latest job</p>
+                          <p className="mt-2 font-medium">{latestReelJob?.status ?? "No job yet"}</p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {latestReelJob?.updated_at ? formatSlot(latestReelJob.updated_at) : "Generate a reel to create the first job."}
+                          </p>
+                        </div>
+                        <div className="rounded-[1rem] border border-border/70 bg-background/75 p-3">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Latest output</p>
+                          <p className="mt-2 font-medium">
+                            {latestReelVariant ? `${latestReelVariant.width}×${latestReelVariant.height}` : "No video variant"}
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {latestReelVariant?.duration_ms ? `${Math.round(latestReelVariant.duration_ms / 1000)}s vertical MP4 ready for reels.` : "Generate once to unlock reel scheduling."}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      <Button type="button" size="sm" onClick={() => void generateReelVariant()} disabled={!assetId || reelActionPending}>
+                        {reelActionPending ? "Generating…" : selectedAssetReelReady ? "Regenerate reel variant" : "Generate reel variant"}
+                      </Button>
+                      <Button type="button" size="sm" variant="secondary" onClick={() => void reelVariantsQuery.refetch()} disabled={!assetId}>
+                        Refresh reel status
+                      </Button>
                     </div>
                   </div>
                 </div>
 
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-3">
-                    <div>
+                  <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Quick picks</p>
-                      <p className="mt-1 text-sm text-muted-foreground">Tap a free approved asset to move faster.</p>
+                      <p className="mt-1 text-sm text-muted-foreground">Tap a free approved asset to move faster. Reel-ready assets are marked so you can fill vertical video slots immediately.</p>
                     </div>
-                    <Badge tone="neutral">{availableAssets.length} available</Badge>
+                    <Badge tone="neutral">{availableAssets.length} available · {reelReadyAssetCount} reel-ready</Badge>
                   </div>
 
                   <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-3">
@@ -816,7 +1222,7 @@ export default function PublishProfilePage() {
                       </option>
                       {availableAssets.map((asset) => (
                         <option key={asset.id} value={asset.id}>
-                          {asset.campaign?.name ?? "Campaign"} · Asset #{asset.sequence_number}
+                          {asset.campaign?.name ?? "Campaign"} · Asset #{asset.sequence_number}{asset.reel_variant_ready ? " · Reel-ready" : ""}
                         </option>
                       ))}
                     </SelectField>
@@ -834,17 +1240,19 @@ export default function PublishProfilePage() {
                       onChange={(event) => {
                         const nextType = event.target.value as QueueItem["post_type"];
                         setPostType(nextType);
-                        setVariantType(nextType === "story" ? "story_9x16" : "feed_4x5");
+                        setVariantType(defaultVariantForPostType(nextType));
                       }}
                     >
                       <option value="feed">Feed</option>
                       <option value="story">Story</option>
+                      <option value="reel">Reel</option>
                     </SelectField>
                   </FormField>
 
                   <FormField label="Variant">
                     <SelectField value={variantType} onChange={(event) => setVariantType(event.target.value as QueueItem["variant_type"])}>
                       {postType === "story" ? <option value="story_9x16">story_9x16</option> : null}
+                      {postType === "reel" ? <option value="reel_9x16">reel_9x16</option> : null}
                       {postType === "feed" ? (
                         <>
                           <option value="feed_4x5">feed_4x5</option>
@@ -857,7 +1265,7 @@ export default function PublishProfilePage() {
 
                 <FormField
                   label="Caption"
-                  description="Keep this tight and publish-ready. You can load the recommendation caption as a starting point, then make final operator edits."
+                  description="Keep this tight and publish-ready. Smart copy stays editable, and automatic refreshes will not overwrite manual edits."
                 >
                   <Textarea rows={5} value={caption} maxLength={2200} onChange={(event) => setCaption(event.target.value)} required />
                 </FormField>
@@ -867,12 +1275,38 @@ export default function PublishProfilePage() {
                     <span>{captionStats.length}/2,200 characters</span>
                     <span>{captionStats.lineCount} blocks</span>
                     <span>{captionStats.hashtagCount} hashtags</span>
+                    {smartCopySource ? <span>{formatCopySource(smartCopySource)}</span> : null}
+                    {smartCopyReadyToApply ? <span>smart copy ready to apply</span> : null}
                   </div>
-                  {selectedRecommendation?.caption_suggestion ? (
-                    <Button size="sm" variant="ghost" onClick={() => setCaption(selectedRecommendation.caption_suggestion ?? "")}>
-                      Load suggested caption
+                  <div className="flex flex-wrap gap-2">
+                    {selectedRecommendation?.caption_suggestion ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          setCaption(selectedRecommendation.caption_suggestion ?? "");
+                          setSmartCopyReadyToApply(false);
+                        }}
+                      >
+                        Load recommendation draft
+                      </Button>
+                    ) : null}
+                    {selectedCaptionPackage ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          setCaption(formatCaptionPackage(selectedCaptionPackage));
+                          setSmartCopyReadyToApply(false);
+                        }}
+                      >
+                        {smartCopyReadyToApply ? "Apply smart copy" : "Load smart copy"}
+                      </Button>
+                    ) : null}
+                    <Button size="sm" variant="ghost" onClick={() => void requestSmartCopy("manual")} disabled={smartCopyPending || (!selectedRecommendationId && !assetId)}>
+                      {smartCopyPending ? "Generating…" : "Regenerate smart copy"}
                     </Button>
-                  ) : null}
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -883,7 +1317,7 @@ export default function PublishProfilePage() {
                     <Button size="sm" variant="secondary" asChild>
                       <Link href="/publish/approvals">Open approvals</Link>
                     </Button>
-                    <Button type="submit" disabled={scheduling || availableAssets.length === 0}>
+                    <Button type="submit" disabled={scheduling || availableAssets.length === 0 || postType === "reel" && !selectedAssetReelReady}>
                       {scheduling ? "Queueing…" : "Queue post"}
                     </Button>
                   </div>
@@ -927,24 +1361,45 @@ export default function PublishProfilePage() {
         <TabsContent value="strategy" className="space-y-4">
           {strategyDraft ? (
             <form onSubmit={saveStrategy} className="space-y-4">
-              <div className="grid gap-4 lg:grid-cols-4">
+              <div className="grid gap-4 lg:grid-cols-5">
                 <WorkspaceMetric label="Weekly target" value={String(strategyDraft.weekly_post_target)} hint="Desired post count per week" />
-                <WorkspaceMetric label="Cooldown" value={`${strategyDraft.cooldown_hours}h`} hint="Minimum spacing between posts" />
-                <WorkspaceMetric label="Ready asset floor" value={String(strategyDraft.min_ready_assets)} hint="Minimum assets before cadence feels safe" />
+                <WorkspaceMetric
+                  label="Format mix"
+                  value={`${strategyDraft.weekly_feed_target}/${strategyDraft.weekly_reel_target}/${strategyDraft.weekly_story_target}`}
+                  hint={`${formatMixTotal} total feed-reel-story slots`}
+                />
+                <WorkspaceMetric label="Experiment rate" value={`${strategyDraft.experimentation_rate_percent}%`} hint="Reserved slots for learning" />
+                <WorkspaceMetric label="Auto-queue threshold" value={formatPercent(strategyDraft.auto_queue_min_confidence * 100, 0)} hint="Confidence floor before queue materialization" />
                 <WorkspaceMetric label="Active share total" value={`${activeShareTotal}%`} hint={activeShareTotal === 100 ? "Perfectly balanced" : "Active pillars should total 100%"} tone={activeShareTotal === 100 ? "success" : "warning"} />
               </div>
 
               <FormShell
                 title="Strategy core"
-                description="Profile-level cadence, timezone, and notes that shape the recommendation engine."
+                description="Profile-level goals, per-format cadence, thresholds, and notes that shape the recommendation engine."
                 footer={<Button type="submit" disabled={savingStrategy}>{savingStrategy ? "Saving…" : "Save strategy"}</Button>}
               >
                 <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+                  <FormField label="Primary goal">
+                    <SelectField value={strategyDraft.primary_goal} onChange={(event) => setStrategyDraft({ ...strategyDraft, primary_goal: event.target.value as PostingStrategy["primary_goal"] })}>
+                      <option value="balanced_growth">Balanced growth</option>
+                      <option value="top_of_funnel">Top of funnel</option>
+                      <option value="business_conversion">Business conversion</option>
+                    </SelectField>
+                  </FormField>
                   <FormField label="Timezone">
                     <Input value={strategyDraft.timezone} onChange={(event) => setStrategyDraft({ ...strategyDraft, timezone: event.target.value })} />
                   </FormField>
                   <FormField label="Weekly target">
                     <Input type="number" min={1} max={30} value={strategyDraft.weekly_post_target} onChange={(event) => setStrategyDraft({ ...strategyDraft, weekly_post_target: Number(event.target.value) || 1 })} />
+                  </FormField>
+                  <FormField label="Feed target">
+                    <Input type="number" min={0} max={14} value={strategyDraft.weekly_feed_target} onChange={(event) => setStrategyDraft({ ...strategyDraft, weekly_feed_target: Number(event.target.value) || 0 })} />
+                  </FormField>
+                  <FormField label="Reel target">
+                    <Input type="number" min={0} max={14} value={strategyDraft.weekly_reel_target} onChange={(event) => setStrategyDraft({ ...strategyDraft, weekly_reel_target: Number(event.target.value) || 0 })} />
+                  </FormField>
+                  <FormField label="Story target">
+                    <Input type="number" min={0} max={21} value={strategyDraft.weekly_story_target} onChange={(event) => setStrategyDraft({ ...strategyDraft, weekly_story_target: Number(event.target.value) || 0 })} />
                   </FormField>
                   <FormField label="Cooldown hours">
                     <Input type="number" min={0} max={168} value={strategyDraft.cooldown_hours} onChange={(event) => setStrategyDraft({ ...strategyDraft, cooldown_hours: Number(event.target.value) || 0 })} />
@@ -952,13 +1407,36 @@ export default function PublishProfilePage() {
                   <FormField label="Minimum ready assets">
                     <Input type="number" min={0} max={50} value={strategyDraft.min_ready_assets} onChange={(event) => setStrategyDraft({ ...strategyDraft, min_ready_assets: Number(event.target.value) || 0 })} />
                   </FormField>
-                  <FormField label="Autopilot mode">
+                  <FormField label="Experiment rate %">
+                    <Input type="number" min={0} max={50} value={strategyDraft.experimentation_rate_percent} onChange={(event) => setStrategyDraft({ ...strategyDraft, experimentation_rate_percent: Number(event.target.value) || 0 })} />
+                  </FormField>
+                  <FormField label="Auto-queue">
                     <SelectField value={strategyDraft.auto_queue_enabled ? "enabled" : "disabled"} onChange={(event) => setStrategyDraft({ ...strategyDraft, auto_queue_enabled: event.target.value === "enabled" })}>
-                      <option value="disabled">Operator confirmed</option>
-                      <option value="enabled">Future autopilot</option>
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled</option>
                     </SelectField>
                   </FormField>
+                  <FormField label="Confidence floor">
+                    <Input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={strategyDraft.auto_queue_min_confidence}
+                      onChange={(event) => setStrategyDraft({ ...strategyDraft, auto_queue_min_confidence: Number(event.target.value) || 0 })}
+                    />
+                  </FormField>
                 </div>
+
+                {formatMixTotal !== strategyDraft.weekly_post_target ? (
+                  <div className="mt-4">
+                    <SectionCallout
+                      tone="warning"
+                      title="Format mix is out of sync"
+                      description={`Feed + reel + story targets currently total ${formatMixTotal}, while the weekly post target is ${strategyDraft.weekly_post_target}. Keep them aligned unless you intentionally want extra optional slots.`}
+                    />
+                  </div>
+                ) : null}
 
                 <div className="mt-4">
                   <FormField label="Notes">
@@ -992,8 +1470,12 @@ export default function PublishProfilePage() {
                       <FormField label="Post types">
                         <SelectField value={pillar.supported_post_types.join(",")} onChange={(event) => setStrategyDraft({ ...strategyDraft, pillars: strategyDraft.pillars.map((entry, itemIndex) => itemIndex === index ? { ...entry, supported_post_types: event.target.value.split(",") as StrategyPillar["supported_post_types"] } : entry) })}>
                           <option value="feed">Feed</option>
-                          <option value="feed,story">Feed + Story</option>
                           <option value="story">Story</option>
+                          <option value="reel">Reel</option>
+                          <option value="feed,story">Feed + Story</option>
+                          <option value="feed,reel">Feed + Reel</option>
+                          <option value="story,reel">Story + Reel</option>
+                          <option value="feed,story,reel">Feed + Story + Reel</option>
                         </SelectField>
                       </FormField>
                       <div className="flex items-end justify-end">
@@ -1032,7 +1514,7 @@ export default function PublishProfilePage() {
               >
                 <div className="space-y-3">
                   {strategyDraft.slot_templates.map((slot, index) => (
-                    <div key={`${slot.label}-${index}`} className="grid gap-3 rounded-[1.2rem] border border-border/70 bg-muted/20 p-3 xl:grid-cols-[180px_180px_110px_110px_130px_auto]">
+                    <div key={`${slot.label}-${index}`} className="grid gap-3 rounded-[1.2rem] border border-border/70 bg-muted/20 p-3 xl:grid-cols-[170px_170px_100px_110px_120px_120px_auto]">
                       <FormField label="Label">
                         <Input value={slot.label} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, label: event.target.value } : entry) })} />
                       </FormField>
@@ -1048,7 +1530,7 @@ export default function PublishProfilePage() {
                       </FormField>
                       <FormField label="Weekday">
                         <SelectField value={String(slot.weekday)} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, weekday: Number(event.target.value) } : entry) })}>
-                          {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day, dayIndex) => (
+                          {WEEKDAY_LABELS.map((day, dayIndex) => (
                             <option key={day} value={dayIndex}>
                               {day}
                             </option>
@@ -1059,13 +1541,91 @@ export default function PublishProfilePage() {
                         <Input value={slot.local_time} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, local_time: event.target.value } : entry) })} />
                       </FormField>
                       <FormField label="Post type">
-                        <SelectField value={slot.post_type} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, post_type: event.target.value as StrategySlotTemplate["post_type"], variant_type: event.target.value === "story" ? "story_9x16" : "feed_4x5" } : entry) })}>
+                        <SelectField value={slot.post_type} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, post_type: event.target.value as StrategySlotTemplate["post_type"], variant_type: defaultVariantForPostType(event.target.value as StrategySlotTemplate["post_type"]) } : entry) })}>
                           <option value="feed">Feed</option>
                           <option value="story">Story</option>
+                          <option value="reel">Reel</option>
+                        </SelectField>
+                      </FormField>
+                      <FormField label="Variant">
+                        <SelectField value={slot.variant_type} onChange={(event) => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.map((entry, itemIndex) => itemIndex === index ? { ...entry, variant_type: event.target.value as StrategySlotTemplate["variant_type"] } : entry) })}>
+                          {slot.post_type === "feed" ? (
+                            <>
+                              <option value="feed_4x5">feed_4x5</option>
+                              <option value="feed_1x1">feed_1x1</option>
+                            </>
+                          ) : null}
+                          {slot.post_type === "story" ? <option value="story_9x16">story_9x16</option> : null}
+                          {slot.post_type === "reel" ? <option value="reel_9x16">reel_9x16</option> : null}
                         </SelectField>
                       </FormField>
                       <div className="flex items-end justify-end">
                         <Button type="button" variant="ghost" onClick={() => setStrategyDraft({ ...strategyDraft, slot_templates: strategyDraft.slot_templates.filter((_, itemIndex) => itemIndex !== index) })}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </FormShell>
+
+              <FormShell
+                title="Best time windows"
+                description="Learned or seeded local-time windows that influence slot scoring and cold-start scheduling."
+                footer={
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() =>
+                      setStrategyDraft({
+                        ...strategyDraft,
+                        best_time_windows: [
+                          ...strategyDraft.best_time_windows,
+                          {
+                            weekday: strategyDraft.best_time_windows.length % 7,
+                            local_time: "12:00",
+                            daypart: "midday",
+                            score: 0.8,
+                            source: "default",
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add window
+                  </Button>
+                }
+              >
+                <div className="space-y-3">
+                  {strategyDraft.best_time_windows.map((window, index) => (
+                    <div key={`${window.weekday}-${window.local_time}-${index}`} className="grid gap-3 rounded-[1.2rem] border border-border/70 bg-muted/20 p-3 xl:grid-cols-[110px_120px_120px_120px_130px_auto]">
+                      <FormField label="Weekday">
+                        <SelectField value={String(window.weekday)} onChange={(event) => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.map((entry, itemIndex) => itemIndex === index ? { ...entry, weekday: Number(event.target.value) } : entry) })}>
+                          {WEEKDAY_LABELS.map((day, dayIndex) => (
+                            <option key={day} value={dayIndex}>
+                              {day}
+                            </option>
+                          ))}
+                        </SelectField>
+                      </FormField>
+                      <FormField label="Local time">
+                        <Input value={window.local_time} onChange={(event) => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.map((entry, itemIndex) => itemIndex === index ? { ...entry, local_time: event.target.value } : entry) })} />
+                      </FormField>
+                      <FormField label="Daypart">
+                        <Input value={window.daypart} onChange={(event) => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.map((entry, itemIndex) => itemIndex === index ? { ...entry, daypart: event.target.value } : entry) })} />
+                      </FormField>
+                      <FormField label="Score">
+                        <Input type="number" min={0} max={1} step={0.01} value={window.score} onChange={(event) => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.map((entry, itemIndex) => itemIndex === index ? { ...entry, score: Number(event.target.value) || 0 } : entry) })} />
+                      </FormField>
+                      <FormField label="Source">
+                        <SelectField value={window.source} onChange={(event) => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.map((entry, itemIndex) => itemIndex === index ? { ...entry, source: event.target.value as typeof window.source } : entry) })}>
+                          <option value="default">Default</option>
+                          <option value="learned">Learned</option>
+                        </SelectField>
+                      </FormField>
+                      <div className="flex items-end justify-end">
+                        <Button type="button" variant="ghost" onClick={() => setStrategyDraft({ ...strategyDraft, best_time_windows: strategyDraft.best_time_windows.filter((_, itemIndex) => itemIndex !== index) })} disabled={strategyDraft.best_time_windows.length === 1}>
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
@@ -1078,28 +1638,29 @@ export default function PublishProfilePage() {
         </TabsContent>
 
         <TabsContent value="performance" className="space-y-4">
-          <div className="grid gap-4 lg:grid-cols-4">
-            <WorkspaceMetric label="Total reach" value={(analyticsQuery.data?.kpis.total_reach ?? 0).toLocaleString()} hint="Profile analytics rollup" />
-            <WorkspaceMetric label="Average engagement" value={`${(analyticsQuery.data?.kpis.avg_engagement_rate ?? 0).toFixed(2)}%`} hint={`${analyticsQuery.data?.kpis.total_posts ?? 0} published posts`} />
-            <WorkspaceMetric label="On-slot rate" value={`${analyticsStrategyQuery.data?.schedule_adherence.on_slot_percent ?? 0}%`} hint={`${analyticsStrategyQuery.data?.schedule_adherence.avg_publish_delay_minutes ?? 0} min average delay`} />
+          <div className="grid gap-4 lg:grid-cols-5">
+            <WorkspaceMetric label="Total views" value={formatCompactNumber(analyticsQuery.data?.kpis.total_views ?? 0)} hint={`${analyticsQuery.data?.kpis.total_posts ?? 0} published posts`} />
+            <WorkspaceMetric label="Average share rate" value={formatPercent(analyticsQuery.data?.kpis.avg_share_rate ?? 0, 2)} hint={`${formatCompactNumber(analyticsQuery.data?.kpis.total_reach ?? 0)} reach`} />
+            <WorkspaceMetric label="Average save rate" value={formatPercent(analyticsQuery.data?.kpis.avg_save_rate ?? 0, 2)} hint={formatPercent(analyticsQuery.data?.kpis.avg_engagement_rate ?? 0, 2)} />
+            <WorkspaceMetric label="On-slot rate" value={formatPercent(analyticsStrategyQuery.data?.schedule_adherence.on_slot_percent ?? 0, 0)} hint={`${analyticsStrategyQuery.data?.schedule_adherence.avg_publish_delay_minutes ?? 0} min average delay`} />
             <WorkspaceMetric
               label="Top post"
-              value={analyticsQuery.data?.kpis.top_post ? `${analyticsQuery.data.kpis.top_post.engagement_rate.toFixed(2)}%` : "No top post"}
-              hint={analyticsQuery.data?.kpis.top_post ? analyticsQuery.data.kpis.top_post.publishing_queue_id.slice(0, 8) : "Waiting for more published history"}
+              value={analyticsQuery.data?.kpis.top_post ? formatCompactNumber(analyticsQuery.data.kpis.top_post.views) : "No top post"}
+              hint={analyticsQuery.data?.kpis.top_post ? `${formatPercent(analyticsQuery.data.kpis.top_post.engagement_rate, 2)} engagement` : "Waiting for more published history"}
             />
           </div>
 
           <div className="grid gap-4 xl:grid-cols-2">
-            <FormShell title="Trend" description="Daily engagement history for this profile.">
+            <FormShell title="Trend" description="Daily views history with engagement context.">
               <div className="space-y-3">
                 {analyticsQuery.data?.trend_data.length ? (
                   analyticsQuery.data.trend_data.map((point) => (
                     <div key={point.date} className="space-y-1">
                       <div className="flex items-center justify-between text-xs text-muted-foreground">
                         <span>{point.date}</span>
-                        <span>{point.engagement_rate.toFixed(2)}%</span>
+                        <span>{formatCompactNumber(point.views)} views · {formatPercent(point.engagement_rate, 2)}</span>
                       </div>
-                      <Progress value={Math.min(100, point.engagement_rate * 10)} />
+                      <Progress value={Math.max(6, (point.views / maxTrendViews) * 100)} />
                     </div>
                   ))
                 ) : (
@@ -1108,7 +1669,7 @@ export default function PublishProfilePage() {
               </div>
             </FormShell>
 
-            <FormShell title="Best patterns" description="Top strategy-aware combinations for this profile.">
+            <FormShell title="Best patterns" description="Winning format and pillar combinations for this profile.">
               <div className="space-y-3">
                 {analyticsStrategyQuery.data?.best_patterns.length ? (
                   analyticsStrategyQuery.data.best_patterns.map((pattern) => (
@@ -1116,9 +1677,11 @@ export default function PublishProfilePage() {
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <p className="font-medium">{pattern.label}</p>
-                          <p className="text-xs text-muted-foreground">{pattern.published_posts} published posts</p>
+                          <p className="text-xs text-muted-foreground">
+                            {pattern.published_posts} published · {formatPercent(pattern.share_rate, 2)} share rate
+                          </p>
                         </div>
-                        <Badge tone="success">{pattern.engagement_rate.toFixed(2)}%</Badge>
+                        <Badge tone="success">{formatCompactNumber(pattern.views)} views</Badge>
                       </div>
                     </div>
                   ))
@@ -1132,12 +1695,12 @@ export default function PublishProfilePage() {
           <div className="grid gap-4 xl:grid-cols-2">
             <BreakdownCard
               title="Pillar breakdown"
-              description="Which content lanes are carrying reach and engagement."
+              description="Which content lanes are driving views, shares, and saves."
               items={
                 analyticsStrategyQuery.data?.pillar_breakdown.map((pillar) => ({
                   label: humanizePillar(pillar.pillar_key),
-                  value: `${pillar.avg_engagement_rate.toFixed(2)}%`,
-                  detail: `${pillar.published_posts} published · ${pillar.total_reach.toLocaleString()} reach`,
+                  value: `${formatCompactNumber(pillar.total_views)} views`,
+                  detail: `${pillar.published_posts} published · ${formatPercent(pillar.share_rate, 2)} share · ${formatPercent(pillar.save_rate, 2)} save`,
                 })) ?? []
               }
             />
@@ -1147,11 +1710,33 @@ export default function PublishProfilePage() {
               items={
                 analyticsStrategyQuery.data?.daypart_breakdown.map((daypart) => ({
                   label: daypart.daypart,
-                  value: `${daypart.avg_engagement_rate.toFixed(2)}%`,
-                  detail: `${daypart.published_posts} published posts`,
+                  value: `${formatCompactNumber(daypart.avg_views)} avg views`,
+                  detail: `${daypart.published_posts} published · ${formatPercent(daypart.share_rate, 2)} share · ${formatPercent(daypart.save_rate, 2)} save`,
                 })) ?? []
               }
             />
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <BreakdownCard
+              title="Best time windows"
+              description="Top local publish windows by views and send/share intent."
+              items={
+                analyticsStrategyQuery.data?.best_time_windows.map((window) => ({
+                  label: window.label,
+                  value: `${formatCompactNumber(window.avg_views)} avg views`,
+                  detail: `${window.published_posts} published · ${formatPercent(window.share_rate, 2)} share`,
+                })) ?? []
+              }
+            />
+            <FormShell title="Reel readiness" description="Video capacity and experiment health for this profile.">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <WorkspaceMetric label="Ready variants" value={String(analyticsStrategyQuery.data?.reel_readiness.ready_variants ?? 0)} hint="Assets ready for reel slots" compact />
+                <WorkspaceMetric label="Pending jobs" value={String(analyticsStrategyQuery.data?.reel_readiness.pending_jobs ?? 0)} hint="Video generation still processing" compact />
+                <WorkspaceMetric label="Scheduled reels" value={String(analyticsStrategyQuery.data?.reel_readiness.scheduled_reels ?? 0)} hint="Upcoming reel items in queue" compact />
+                <WorkspaceMetric label="Experiment win rate" value={formatPercent(analyticsStrategyQuery.data?.experiment_win_rate ?? 0, 0)} hint={`${analyticsStrategyQuery.data?.reel_readiness.published_reels ?? 0} reels published`} compact />
+              </div>
+            </FormShell>
           </div>
         </TabsContent>
       </Tabs>
@@ -1240,6 +1825,66 @@ function ShieldPill({ tone, label }: { tone: SignalTone; label: string }) {
   return <Badge tone={tone === "neutral" ? "neutral" : tone}>{label}</Badge>;
 }
 
+function formatCopySource(source: CaptionCopySource) {
+  if (source === "vision_refined") return "Vision refined";
+  if (source === "metadata_fallback") return "Metadata fallback";
+  return "Metadata draft";
+}
+
+function formatCaptionPackage(captionPackage: CaptionSeoPackage) {
+  if (captionPackage.caption?.trim()) {
+    return captionPackage.caption.trim();
+  }
+
+  return [captionPackage.hook ?? captionPackage.opening_hook, captionPackage.body, captionPackage.call_to_action, captionPackage.hashtags.join(" ")]
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function getRecommendationMeta(item: PostingPlanItem) {
+  return asRecord(item.autopilot_metadata);
+}
+
+function getExperimentTag(item: PostingPlanItem) {
+  const metadata = getRecommendationMeta(item);
+  return typeof metadata?.experiment_tag === "string" ? metadata.experiment_tag : null;
+}
+
+function getQueueEligible(item: PostingPlanItem) {
+  const metadata = getRecommendationMeta(item);
+  return typeof metadata?.queue_eligible === "boolean" ? metadata.queue_eligible : null;
+}
+
+function getReelVariantReady(item: PostingPlanItem) {
+  const metadata = getRecommendationMeta(item);
+  return typeof metadata?.reel_variant_ready === "boolean" ? metadata.reel_variant_ready : null;
+}
+
+function getRecommendationScoreRows(item: PostingPlanItem) {
+  const metadata = getRecommendationMeta(item);
+  const scoreBreakdown = asRecord(metadata?.score_breakdown);
+
+  return [
+    {
+      label: "Performance",
+      value: typeof scoreBreakdown?.performance_index === "number" ? scoreBreakdown.performance_index.toFixed(2) : "n/a",
+    },
+    {
+      label: "Timing",
+      value: typeof scoreBreakdown?.time_window_score === "number" ? `${Math.round(scoreBreakdown.time_window_score * 100)}%` : "n/a",
+    },
+    {
+      label: "Queue",
+      value: getQueueEligible(item) === false ? "manual" : "ready",
+    },
+  ];
+}
+
 function RecommendationCard({
   item,
   selected,
@@ -1257,6 +1902,10 @@ function RecommendationCard({
   onAccept: () => void;
   onSkip: () => void;
 }) {
+  const experimentTag = getExperimentTag(item);
+  const queueEligible = getQueueEligible(item);
+  const reelVariantReady = getReelVariantReady(item);
+
   return (
     <div
       className={cn(
@@ -1278,7 +1927,35 @@ function RecommendationCard({
         <span>{item.asset ? `Asset #${item.asset.sequence_number}` : "Waiting for asset attachment"}</span>
         <span>•</span>
         <span>{item.confidence ? `${Math.round(item.confidence * 100)}% confidence` : "No confidence score"}</span>
+        {experimentTag ? (
+          <>
+            <span>•</span>
+            <span>{experimentTag}</span>
+          </>
+        ) : null}
       </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        {getRecommendationScoreRows(item).map((row) => (
+          <div key={row.label} className="rounded-[1rem] border border-border/65 bg-background/70 p-2.5">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">{row.label}</p>
+            <p className="mt-1 text-sm font-medium">{row.value}</p>
+          </div>
+        ))}
+      </div>
+
+      {item.caption_package ? (
+        <div className="mt-3 rounded-[1rem] border border-border/65 bg-background/70 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="neutral">{item.caption_package.primary_keyword}</Badge>
+            {queueEligible === false ? <Badge tone="warning">Manual queue</Badge> : null}
+            {item.post_type === "reel" ? <Badge tone={reelVariantReady ? "success" : "warning"}>{reelVariantReady ? "Reel-ready" : "Variant missing"}</Badge> : null}
+            <Badge tone={item.caption_package.source === "vision_refined" ? "success" : "neutral"}>{formatCopySource(item.caption_package.source)}</Badge>
+          </div>
+          <p className="mt-2 text-sm">{item.caption_package.hook}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{item.caption_package.rationale}</p>
+        </div>
+      ) : null}
 
       <div className="mt-4 flex flex-wrap gap-2">
         <Button size="sm" onClick={onAccept} disabled={working || !canQueue}>
@@ -1325,9 +2002,9 @@ function AssetChoiceCard({
       <div className="space-y-1 p-3">
         <div className="flex items-center justify-between gap-2">
           <p className="text-sm font-medium">{asset.campaign?.name ?? "Campaign"}</p>
-          <Badge tone="success">Asset #{asset.sequence_number}</Badge>
+          <Badge tone={asset.reel_variant_ready ? "success" : "neutral"}>Asset #{asset.sequence_number}</Badge>
         </div>
-        <p className="text-xs text-muted-foreground">Approved and free to queue.</p>
+        <p className="text-xs text-muted-foreground">{asset.reel_variant_ready ? "Approved, free to queue, and reel-ready." : "Approved and free to queue."}</p>
       </div>
     </button>
   );

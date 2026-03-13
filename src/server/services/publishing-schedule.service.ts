@@ -8,7 +8,7 @@ const MAX_CAPTION_LENGTH = 2200;
 
 export function validatePostTypeVariant(
   postType: "feed" | "story" | "reel",
-  variantType: "feed_1x1" | "feed_4x5" | "story_9x16" | "master",
+  variantType: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master",
 ) {
   if (postType === "feed" && !["feed_1x1", "feed_4x5"].includes(variantType)) {
     throw new ApiError(400, "VALIDATION_ERROR", "Feed posts support only feed_1x1 or feed_4x5. Choose one of those formats and try again.");
@@ -16,6 +16,10 @@ export function validatePostTypeVariant(
 
   if (postType === "story" && variantType !== "story_9x16") {
     throw new ApiError(400, "VALIDATION_ERROR", "Story posts require the story_9x16 format. Switch to that format and try again.");
+  }
+
+  if (postType === "reel" && variantType !== "reel_9x16") {
+    throw new ApiError(400, "VALIDATION_ERROR", "Reel posts require the reel_9x16 format.");
   }
 }
 
@@ -35,8 +39,14 @@ export function appendHashtags(caption: string, hashtags: string[]): string {
 
   if (normalized.length === 0) return caption;
 
-  const deduped = Array.from(new Set(normalized));
-  return `${caption} ${deduped.join(" ")}`.trim();
+  const existing = new Set(
+    (caption.match(/#[A-Za-z0-9_]+/g) ?? []).map((tag) => tag.toLowerCase()),
+  );
+  const deduped = Array.from(new Set(normalized.map((tag) => tag.toLowerCase())))
+    .map((lower) => normalized.find((tag) => tag.toLowerCase() === lower) as string)
+    .filter((tag) => !existing.has(tag.toLowerCase()));
+
+  return deduped.length > 0 ? `${caption} ${deduped.join(" ")}`.trim() : caption.trim();
 }
 
 export async function schedulePublishingItem(input: {
@@ -45,7 +55,7 @@ export async function schedulePublishingItem(input: {
   profileId: string;
   planItemId?: string;
   postType: "feed" | "story" | "reel";
-  variantType: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+  variantType: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
   caption: string;
   hashtagPresetId?: string;
   scheduledAt: Date;
@@ -54,10 +64,6 @@ export async function schedulePublishingItem(input: {
   validateScheduledAt(input.scheduledAt);
 
   let caption = input.caption.trim();
-
-  if (input.postType === "reel") {
-    throw new ApiError(400, "VALIDATION_ERROR", "Reel scheduling is not available yet. Schedule a feed or story post instead.");
-  }
 
   const [profile, asset, activeQueueItem, hashtagPreset, approvalSetting, planItem, strategy] = await Promise.all([
     prisma.instagramProfile.findUnique({
@@ -77,6 +83,13 @@ export async function schedulePublishingItem(input: {
         id: true,
         status: true,
         sequence_number: true,
+        variants: {
+          select: {
+            id: true,
+            format_type: true,
+            media_kind: true,
+          },
+        },
         campaign: {
           select: {
             model_id: true,
@@ -121,6 +134,7 @@ export async function schedulePublishingItem(input: {
             profile_id: true,
             pillar_key: true,
             strategy_snapshot: true,
+            autopilot_metadata: true,
             slot_start: true,
           },
         })
@@ -141,7 +155,7 @@ export async function schedulePublishingItem(input: {
     throw new ApiError(400, "VALIDATION_ERROR", "Only approved assets can be scheduled. Please approve the asset first.");
   }
 
-  if (asset.campaign.model_id !== profile.model_id) {
+  if (!asset.campaign || asset.campaign.model_id !== profile.model_id) {
     throw new ApiError(400, "VALIDATION_ERROR", "The selected asset does not belong to this Instagram profile's model.");
   }
 
@@ -159,6 +173,10 @@ export async function schedulePublishingItem(input: {
 
   if (planItem && planItem.profile_id !== input.profileId) {
     throw new ApiError(400, "VALIDATION_ERROR", "The selected recommendation belongs to a different Instagram profile.");
+  }
+
+  if (input.postType === "reel" && !asset.variants.some((variant) => variant.format_type === "reel_9x16" && variant.media_kind === "video")) {
+    throw new ApiError(400, "VALIDATION_ERROR", "This asset does not have a generated reel_9x16 video variant yet.");
   }
 
   if (hashtagPreset) {

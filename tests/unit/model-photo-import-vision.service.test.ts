@@ -62,6 +62,8 @@ describe("model-photo-import-vision.service", () => {
 
 		expect(result.provider).toBe("zai_vision");
 		expect(result.suggestion.image_reviews[0]?.accepted).toBe(true);
+		expect(result.suggestion.image_reviews[0]?.view_angle).toBe("frontal");
+		expect(result.suggestion.image_reviews[0]?.identity_anchor_score).toBe(0.95);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -358,6 +360,11 @@ function buildSuggestionJson(overrides?: Partial<Record<string, unknown>>) {
 				accepted: true,
 				solo_subject: true,
 				face_visible: true,
+				view_angle: "frontal",
+				framing: "closeup",
+				expression: "neutral",
+				sharpness_score: 0.92,
+				identity_anchor_score: 0.95,
 			},
 		],
 	};

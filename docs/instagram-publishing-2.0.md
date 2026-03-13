@@ -1,5 +1,20 @@
 # Instagram Publishing 2.0
 
+## Update
+
+This document describes the profile-centric publishing foundation.
+
+The March 13, 2026 optimization pass that adds:
+
+- Reel publishing
+- async reel-variant generation
+- views-first analytics
+- experiment tagging
+- auto-queue materialization
+- per-format strategy tuning
+
+is documented in [`instagram-optimization-2026.md`](./instagram-optimization-2026.md).
+
 ## Summary
 
 Instagram publishing has been rebuilt around explicit profile ownership instead of a single global account.

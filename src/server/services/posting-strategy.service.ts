@@ -2,7 +2,14 @@ import { ApiError } from "@/lib/http";
 import { addZonedDays, getZonedWeekday, zonedDateTimeToUtc } from "@/lib/timezone";
 import { prisma } from "@/lib/prisma";
 import { toInputJson } from "@/lib/prisma-json";
-import type { PostingPlanItem, PostingStrategy, StrategySlotTemplate } from "@/types/domain";
+import { buildPublishingCopyFromContext, formatCaptionFromPackage } from "@/server/services/publishing-copy.service";
+import type {
+  CaptionSeoPackage,
+  PostingPlanItem,
+  PostingStrategy,
+  StrategyBestTimeWindow,
+  StrategySlotTemplate,
+} from "@/types/domain";
 
 type LegacyTrack = {
   enabled: boolean;
@@ -10,6 +17,32 @@ type LegacyTrack = {
   prompt_bias?: string;
   target_ratio_percent: number;
   weekly_post_goal: number;
+};
+
+type PerformanceSample = {
+  postType: "feed" | "story" | "reel";
+  pillarKey: string | null;
+  daypart: string;
+  fetchedAt: Date;
+  views: number;
+  reach: number;
+  shares: number;
+  saves: number;
+  comments: number;
+  replies: number;
+  avgWatchTimeMs: number;
+};
+
+type PerformanceBucket = {
+  posts: number;
+  weightedPosts: number;
+  weightedViews: number;
+  weightedReach: number;
+  weightedShares: number;
+  weightedSaves: number;
+  weightedComments: number;
+  weightedReplies: number;
+  weightedWatchMs: number;
 };
 
 const DEFAULT_LEGACY_TRACKS = {
@@ -27,9 +60,24 @@ const DEFAULT_LEGACY_TRACKS = {
     target_ratio_percent: 40,
     weekly_post_goal: 2,
   },
-};
+} satisfies Record<string, LegacyTrack>;
 
 const ACTIVE_QUEUE_STATUSES = ["PENDING_APPROVAL", "SCHEDULED", "PUBLISHING", "RETRY"] as const;
+const DEFAULT_BEST_TIME_WINDOWS: StrategyBestTimeWindow[] = [
+  { weekday: 2, local_time: "11:30", daypart: "midday", score: 0.92, source: "default" },
+  { weekday: 3, local_time: "13:00", daypart: "midday", score: 0.9, source: "default" },
+  { weekday: 4, local_time: "15:00", daypart: "afternoon", score: 0.88, source: "default" },
+  { weekday: 5, local_time: "12:00", daypart: "midday", score: 0.82, source: "default" },
+];
+const DEFAULT_SLOT_BLUEPRINTS = [
+  { pillar_key: "discoverability_reels", label: "Discovery Reel", weekday: 2, local_time: "11:30", post_type: "reel", variant_type: "reel_9x16", priority: 0 },
+  { pillar_key: "relationship_stories", label: "Community Story", weekday: 2, local_time: "18:00", post_type: "story", variant_type: "story_9x16", priority: 1 },
+  { pillar_key: "saveable_feed", label: "Saveable Feed", weekday: 3, local_time: "13:00", post_type: "feed", variant_type: "feed_4x5", priority: 2 },
+  { pillar_key: "relationship_stories", label: "Midweek Story", weekday: 3, local_time: "19:00", post_type: "story", variant_type: "story_9x16", priority: 3 },
+  { pillar_key: "discoverability_reels", label: "Trend Reel", weekday: 4, local_time: "15:00", post_type: "reel", variant_type: "reel_9x16", priority: 4 },
+  { pillar_key: "editorial_identity", label: "Editorial Feed", weekday: 5, local_time: "12:30", post_type: "feed", variant_type: "feed_4x5", priority: 5 },
+  { pillar_key: "relationship_stories", label: "Weekend Story", weekday: 6, local_time: "10:30", post_type: "story", variant_type: "story_9x16", priority: 6 },
+] as const;
 
 function toTrack(raw: unknown, fallback: LegacyTrack): LegacyTrack {
   const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
@@ -52,78 +100,74 @@ function toTrack(raw: unknown, fallback: LegacyTrack): LegacyTrack {
 function normalizeLegacyTracks(raw: unknown): {
   reality_like_daily: LegacyTrack;
   fashion_editorial: LegacyTrack;
-  instagram_setup?: { handle?: string; connected_at?: string };
 } {
   const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const instagramSetup =
-    source.instagram_setup && typeof source.instagram_setup === "object"
-      ? (source.instagram_setup as Record<string, unknown>)
-      : null;
 
   return {
     reality_like_daily: toTrack(source.reality_like_daily, DEFAULT_LEGACY_TRACKS.reality_like_daily),
     fashion_editorial: toTrack(source.fashion_editorial, DEFAULT_LEGACY_TRACKS.fashion_editorial),
-    instagram_setup: instagramSetup
-      ? {
-          handle: typeof instagramSetup.handle === "string" ? instagramSetup.handle : undefined,
-          connected_at: typeof instagramSetup.connected_at === "string" ? instagramSetup.connected_at : undefined,
-        }
-      : undefined,
   };
-}
-
-function distributedWeekdays(count: number): number[] {
-  if (count <= 0) return [];
-
-  const values = new Set<number>();
-  for (let index = 0; index < count; index += 1) {
-    values.add(Math.floor((index * 7) / count) % 7);
-  }
-
-  return Array.from(values).sort((a, b) => a - b);
 }
 
 function inferDaypart(localTime: string): string {
   const hour = Number(localTime.split(":")[0] ?? 0);
   if (hour < 11) return "morning";
-  if (hour < 16) return "midday";
-  if (hour < 20) return "evening";
-  return "night";
+  if (hour < 15) return "midday";
+  if (hour < 18) return "afternoon";
+  return "evening";
 }
 
-function buildTemplatesForTrack(input: {
-  pillarKey: string;
-  weeklyPostGoal: number;
-  preferStories: boolean;
-  priorityBase: number;
-}): StrategySlotTemplate[] {
-  const weekdays = distributedWeekdays(input.weeklyPostGoal);
-  const feedTimes = input.pillarKey === "fashion_editorial" ? (["18:30", "20:00", "12:30"] as const) : (["11:30", "17:30", "19:30"] as const);
-  const storyTimes = ["09:00", "14:30", "20:30"] as const;
+function toNumber(value: unknown, fallback = 0): number {
+  const normalized = Number(value ?? fallback);
+  return Number.isFinite(normalized) ? normalized : fallback;
+}
 
-  return weekdays.map((weekday, index) => {
-    const useStory = input.preferStories && index % 3 === 1;
-    const localTime = (useStory ? storyTimes[index % storyTimes.length] : feedTimes[index % feedTimes.length]) ?? (useStory ? "09:00" : "11:30");
-    const postType = useStory ? "story" : "feed";
+function normalizeBestTimeWindows(raw: unknown): StrategyBestTimeWindow[] {
+  if (!Array.isArray(raw)) {
+    return DEFAULT_BEST_TIME_WINDOWS.map((window) => ({ ...window }));
+  }
 
+  const windows = raw
+    .map((value) => {
+      if (!value || typeof value !== "object") return null;
+      const row = value as Record<string, unknown>;
+      const weekday = toNumber(row.weekday, -1);
+      const localTime = typeof row.local_time === "string" ? row.local_time : "";
+      const daypart = typeof row.daypart === "string" ? row.daypart : inferDaypart(localTime || "12:00");
+      const score = Math.max(0, Math.min(1, toNumber(row.score, 0.75)));
+      const source = row.source === "learned" ? "learned" : "default";
+
+      if (weekday < 0 || weekday > 6 || !/^\d{2}:\d{2}$/.test(localTime)) return null;
+      return {
+        weekday,
+        local_time: localTime,
+        daypart,
+        score,
+        source,
+      } satisfies StrategyBestTimeWindow;
+    })
+    .filter((value): value is StrategyBestTimeWindow => Boolean(value));
+
+  return windows.length > 0 ? windows : DEFAULT_BEST_TIME_WINDOWS.map((window) => ({ ...window }));
+}
+
+function buildDefaultSlotTemplates(bestTimeWindows: StrategyBestTimeWindow[]): StrategySlotTemplate[] {
+  const bestByKey = new Map(bestTimeWindows.map((window) => [`${window.weekday}-${window.local_time}`, window]));
+
+  return DEFAULT_SLOT_BLUEPRINTS.map((slot) => {
+    const matchedWindow = bestByKey.get(`${slot.weekday}-${slot.local_time}`);
     return {
-      pillar_key: input.pillarKey,
-      label: `${input.pillarKey.replaceAll("_", " ")} ${index + 1}`,
-      weekday,
-      local_time: localTime,
-      daypart: inferDaypart(localTime),
-      post_type: postType as "feed" | "story" | "reel",
-      variant_type: (useStory ? "story_9x16" : "feed_4x5") as "feed_1x1" | "feed_4x5" | "story_9x16" | "master",
-      priority: input.priorityBase + index,
+      pillar_key: slot.pillar_key,
+      label: slot.label,
+      weekday: slot.weekday,
+      local_time: slot.local_time,
+      daypart: matchedWindow?.daypart ?? inferDaypart(slot.local_time),
+      post_type: slot.post_type,
+      variant_type: slot.variant_type,
+      priority: slot.priority,
       active: true,
     };
   });
-}
-
-function toNumber(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  const normalized = Number(value);
-  return Number.isFinite(normalized) ? normalized : null;
 }
 
 export function buildDefaultStrategyFromLegacy(input: {
@@ -132,67 +176,81 @@ export function buildDefaultStrategyFromLegacy(input: {
   socialTracksProfile: unknown;
 }): PostingStrategy {
   const legacy = normalizeLegacyTracks(input.socialTracksProfile);
-  const activeTracks = [
-    {
-      key: "reality_like_daily",
-      name: "Reality-like Daily",
-      description: legacy.reality_like_daily.style_brief,
-      target_share_percent: legacy.reality_like_daily.target_ratio_percent,
-      active: legacy.reality_like_daily.enabled,
-      priority: 0,
-      supported_post_types: ["feed", "story"] as Array<"feed" | "story" | "reel">,
-      weekly_post_goal: legacy.reality_like_daily.weekly_post_goal,
-    },
-    {
-      key: "fashion_editorial",
-      name: "Fashion Editorial",
-      description: legacy.fashion_editorial.style_brief,
-      target_share_percent: legacy.fashion_editorial.target_ratio_percent,
-      active: legacy.fashion_editorial.enabled,
-      priority: 1,
-      supported_post_types: ["feed"] as Array<"feed" | "story" | "reel">,
-      weekly_post_goal: legacy.fashion_editorial.weekly_post_goal,
-    },
-  ].filter((track) => track.active && track.weekly_post_goal > 0);
-
-  const totalWeeklyTarget = activeTracks.reduce((sum, track) => sum + track.weekly_post_goal, 0);
-  const pillars = activeTracks.map(({ weekly_post_goal: _weeklyPostGoal, ...pillar }) => pillar);
-  const slotTemplates = [
-    ...buildTemplatesForTrack({
-      pillarKey: "reality_like_daily",
-      weeklyPostGoal: legacy.reality_like_daily.enabled ? legacy.reality_like_daily.weekly_post_goal : 0,
-      preferStories: true,
-      priorityBase: 0,
-    }),
-    ...buildTemplatesForTrack({
-      pillarKey: "fashion_editorial",
-      weeklyPostGoal: legacy.fashion_editorial.enabled ? legacy.fashion_editorial.weekly_post_goal : 0,
-      preferStories: false,
-      priorityBase: 20,
-    }),
-  ] satisfies StrategySlotTemplate[];
+  const bestTimeWindows = DEFAULT_BEST_TIME_WINDOWS.map((window) => ({ ...window }));
 
   return {
     profile_id: input.profileId,
+    primary_goal: "balanced_growth",
     timezone: input.timezone,
-    weekly_post_target: Math.max(1, totalWeeklyTarget),
-    cooldown_hours: 18,
-    min_ready_assets: Math.max(2, Math.ceil(totalWeeklyTarget / 2)),
-    auto_queue_enabled: false,
-    notes: "Autogenerated from the legacy social strategy fields. Update pillars and slots to refine cadence.",
-    pillars,
-    slot_templates: slotTemplates,
+    weekly_post_target: 7,
+    weekly_feed_target: 2,
+    weekly_reel_target: 2,
+    weekly_story_target: 3,
+    cooldown_hours: 16,
+    min_ready_assets: 4,
+    auto_queue_enabled: true,
+    experimentation_rate_percent: 20,
+    auto_queue_min_confidence: 0.72,
+    best_time_windows: bestTimeWindows,
+    notes:
+      `Balanced-growth optimization seeded from the legacy social strategy. Relationship stories inherit "${legacy.reality_like_daily.style_brief}" and editorial identity inherits "${legacy.fashion_editorial.style_brief}".`,
+    pillars: [
+      {
+        key: "discoverability_reels",
+        name: "Discoverability Reels",
+        description: "Original short-form video built for views, sends, and non-follower reach.",
+        target_share_percent: 35,
+        active: true,
+        priority: 0,
+        supported_post_types: ["reel"],
+      },
+      {
+        key: "saveable_feed",
+        name: "Saveable Feed",
+        description: "Feed posts engineered for saves, shares, and repeat visits.",
+        target_share_percent: 25,
+        active: true,
+        priority: 1,
+        supported_post_types: ["feed"],
+      },
+      {
+        key: "editorial_identity",
+        name: "Editorial Identity",
+        description: legacy.fashion_editorial.style_brief,
+        target_share_percent: 20,
+        active: true,
+        priority: 2,
+        supported_post_types: ["feed", "reel"],
+      },
+      {
+        key: "relationship_stories",
+        name: "Relationship Stories",
+        description: legacy.reality_like_daily.style_brief,
+        target_share_percent: 20,
+        active: true,
+        priority: 3,
+        supported_post_types: ["story"],
+      },
+    ],
+    slot_templates: buildDefaultSlotTemplates(bestTimeWindows),
   };
 }
 
 function serializeStrategy(strategy: {
   id: string;
   profile_id: string;
+  primary_goal: "balanced_growth" | "top_of_funnel" | "business_conversion";
   timezone: string;
   weekly_post_target: number;
+  weekly_feed_target: number;
+  weekly_reel_target: number;
+  weekly_story_target: number;
   cooldown_hours: number;
   min_ready_assets: number;
   auto_queue_enabled: boolean;
+  experimentation_rate_percent: number;
+  auto_queue_min_confidence: unknown;
+  best_time_windows: unknown;
   notes: string | null;
   pillars: Array<{
     id: string;
@@ -212,7 +270,7 @@ function serializeStrategy(strategy: {
     local_time: string;
     daypart: string;
     post_type: "feed" | "story" | "reel";
-    variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+    variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
     priority: number;
     active: boolean;
   }>;
@@ -220,11 +278,18 @@ function serializeStrategy(strategy: {
   return {
     id: strategy.id,
     profile_id: strategy.profile_id,
+    primary_goal: strategy.primary_goal,
     timezone: strategy.timezone,
     weekly_post_target: strategy.weekly_post_target,
+    weekly_feed_target: strategy.weekly_feed_target,
+    weekly_reel_target: strategy.weekly_reel_target,
+    weekly_story_target: strategy.weekly_story_target,
     cooldown_hours: strategy.cooldown_hours,
     min_ready_assets: strategy.min_ready_assets,
     auto_queue_enabled: strategy.auto_queue_enabled,
+    experimentation_rate_percent: strategy.experimentation_rate_percent,
+    auto_queue_min_confidence: toNumber(strategy.auto_queue_min_confidence, 0.72),
+    best_time_windows: normalizeBestTimeWindows(strategy.best_time_windows),
     notes: strategy.notes,
     pillars: strategy.pillars
       .slice()
@@ -305,20 +370,34 @@ export async function savePostingStrategy(profileId: string, userId: string, inp
     const saved = await tx.postingStrategy.upsert({
       where: { profile_id: profileId },
       update: {
+        primary_goal: input.primary_goal,
         timezone: input.timezone,
         weekly_post_target: input.weekly_post_target,
+        weekly_feed_target: input.weekly_feed_target,
+        weekly_reel_target: input.weekly_reel_target,
+        weekly_story_target: input.weekly_story_target,
         cooldown_hours: input.cooldown_hours,
         min_ready_assets: input.min_ready_assets,
         auto_queue_enabled: input.auto_queue_enabled,
+        experimentation_rate_percent: input.experimentation_rate_percent,
+        auto_queue_min_confidence: input.auto_queue_min_confidence,
+        best_time_windows: toInputJson(input.best_time_windows),
         notes: input.notes?.trim() || null,
       },
       create: {
         profile_id: profileId,
+        primary_goal: input.primary_goal,
         timezone: input.timezone,
         weekly_post_target: input.weekly_post_target,
+        weekly_feed_target: input.weekly_feed_target,
+        weekly_reel_target: input.weekly_reel_target,
+        weekly_story_target: input.weekly_story_target,
         cooldown_hours: input.cooldown_hours,
         min_ready_assets: input.min_ready_assets,
         auto_queue_enabled: input.auto_queue_enabled,
+        experimentation_rate_percent: input.experimentation_rate_percent,
+        auto_queue_min_confidence: input.auto_queue_min_confidence,
+        best_time_windows: toInputJson(input.best_time_windows),
         notes: input.notes?.trim() || null,
         created_by: userId,
       },
@@ -393,10 +472,11 @@ function serializePlanItem(item: {
   slot_start: Date;
   slot_end: Date | null;
   post_type: "feed" | "story" | "reel";
-  variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+  variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
   rationale: string | null;
   confidence: unknown;
   caption_suggestion: string | null;
+  autopilot_metadata: unknown;
   decided_at: Date | null;
   asset?: {
     id: string;
@@ -404,6 +484,66 @@ function serializePlanItem(item: {
     campaign?: { id: string; name: string } | null;
   } | null;
 }): PostingPlanItem {
+  const autopilotMetadata = item.autopilot_metadata && typeof item.autopilot_metadata === "object" && !Array.isArray(item.autopilot_metadata)
+    ? (item.autopilot_metadata as Record<string, unknown>)
+    : null;
+  const rawCaptionPackage =
+    autopilotMetadata?.caption_package && typeof autopilotMetadata.caption_package === "object" && !Array.isArray(autopilotMetadata.caption_package)
+      ? (autopilotMetadata.caption_package as Record<string, unknown>)
+      : null;
+  const captionPackage = rawCaptionPackage
+    ? ({
+        caption:
+          typeof rawCaptionPackage.caption === "string" && rawCaptionPackage.caption.trim()
+            ? rawCaptionPackage.caption
+            : formatCaptionFromPackage({
+                caption: "",
+                hook:
+                  typeof rawCaptionPackage.hook === "string"
+                    ? rawCaptionPackage.hook
+                    : typeof rawCaptionPackage.opening_hook === "string"
+                      ? rawCaptionPackage.opening_hook
+                      : "",
+                body: typeof rawCaptionPackage.body === "string" ? rawCaptionPackage.body : "",
+                call_to_action: typeof rawCaptionPackage.call_to_action === "string" ? rawCaptionPackage.call_to_action : "",
+                hashtags: Array.isArray(rawCaptionPackage.hashtags)
+                  ? rawCaptionPackage.hashtags.filter((entry): entry is string => typeof entry === "string")
+                  : [],
+              }),
+        primary_keyword: typeof rawCaptionPackage.primary_keyword === "string" ? rawCaptionPackage.primary_keyword : "instagram strategy",
+        hook:
+          typeof rawCaptionPackage.hook === "string"
+            ? rawCaptionPackage.hook
+            : typeof rawCaptionPackage.opening_hook === "string"
+              ? rawCaptionPackage.opening_hook
+              : "",
+        opening_hook:
+          typeof rawCaptionPackage.opening_hook === "string"
+            ? rawCaptionPackage.opening_hook
+            : typeof rawCaptionPackage.hook === "string"
+              ? rawCaptionPackage.hook
+              : "",
+        body: typeof rawCaptionPackage.body === "string" ? rawCaptionPackage.body : "",
+        call_to_action: typeof rawCaptionPackage.call_to_action === "string" ? rawCaptionPackage.call_to_action : "",
+        hashtags: Array.isArray(rawCaptionPackage.hashtags)
+          ? rawCaptionPackage.hashtags.filter((entry): entry is string => typeof entry === "string")
+          : [],
+        rationale: typeof rawCaptionPackage.rationale === "string" ? rawCaptionPackage.rationale : "Strategy-aligned caption guidance.",
+        strategy_alignment:
+          typeof rawCaptionPackage.strategy_alignment === "string"
+            ? rawCaptionPackage.strategy_alignment
+            : "Aligned to the active strategy slot.",
+        compliance_summary:
+          typeof rawCaptionPackage.compliance_summary === "string"
+            ? rawCaptionPackage.compliance_summary
+            : "Keep claims grounded to the approved asset and respect profile boundaries.",
+        source:
+          rawCaptionPackage.source === "vision_refined" || rawCaptionPackage.source === "metadata_fallback"
+            ? rawCaptionPackage.source
+            : "metadata_draft",
+      } satisfies CaptionSeoPackage)
+    : null;
+
   return {
     id: item.id,
     profile_id: item.profile_id,
@@ -417,8 +557,10 @@ function serializePlanItem(item: {
     post_type: item.post_type,
     variant_type: item.variant_type,
     rationale: item.rationale,
-    confidence: toNumber(item.confidence),
+    confidence: toNumber(item.confidence, 0),
     caption_suggestion: item.caption_suggestion,
+    caption_package: captionPackage,
+    autopilot_metadata: autopilotMetadata,
     decided_at: item.decided_at?.toISOString() ?? null,
     asset: item.asset
       ? {
@@ -432,31 +574,34 @@ function serializePlanItem(item: {
 
 function pickPillarForSlot(input: {
   slotPillarKey: string | null | undefined;
+  slotPostType: "feed" | "story" | "reel";
   pillars: PostingStrategy["pillars"];
   usageByPillar: Map<string, number>;
 }): PostingStrategy["pillars"][number] | null {
+  const activePillars = input.pillars.filter((pillar) => pillar.active && pillar.supported_post_types.includes(input.slotPostType));
+
   if (input.slotPillarKey) {
-    return input.pillars.find((pillar) => pillar.key === input.slotPillarKey) ?? null;
+    return activePillars.find((pillar) => pillar.key === input.slotPillarKey) ?? null;
   }
 
-  const active = input.pillars.filter((pillar) => pillar.active);
-  if (active.length === 0) return null;
+  if (activePillars.length === 0) return null;
 
-  return active
+  return activePillars
     .slice()
     .sort((left, right) => {
-      const leftActual = input.usageByPillar.get(left.key) ?? 0;
-      const rightActual = input.usageByPillar.get(right.key) ?? 0;
-      const leftGap = left.target_share_percent - leftActual;
-      const rightGap = right.target_share_percent - rightActual;
+      const leftUsage = input.usageByPillar.get(left.key) ?? 0;
+      const rightUsage = input.usageByPillar.get(right.key) ?? 0;
+      const leftGap = left.target_share_percent - leftUsage;
+      const rightGap = right.target_share_percent - rightUsage;
       return rightGap - leftGap || left.priority - right.priority;
     })[0]!;
 }
 
 function computeUpcomingSlots(strategy: PostingStrategy, now: Date, horizonDays: number) {
   const horizonEnd = new Date(now.getTime() + horizonDays * 24 * 60 * 60 * 1000);
-  const slots: Array<(PostingStrategy["slot_templates"][number] & { slot_start: Date })> = [];
+  const slots: Array<(PostingStrategy["slot_templates"][number] & { slot_start: Date; window_score: number })> = [];
   const timeZone = strategy.timezone;
+  const windowScores = new Map(strategy.best_time_windows.map((window) => [`${window.weekday}-${window.local_time}`, window.score]));
 
   for (let offset = 0; offset <= horizonDays; offset += 1) {
     const localDate = addZonedDays(now, timeZone, offset);
@@ -488,11 +633,239 @@ function computeUpcomingSlots(strategy: PostingStrategy, now: Date, horizonDays:
       slots.push({
         ...slot,
         slot_start: slotStart,
+        window_score: windowScores.get(`${slot.weekday}-${slot.local_time}`) ?? 0.7,
       });
     }
   }
 
-  return slots.sort((left, right) => left.slot_start.getTime() - right.slot_start.getTime() || left.priority - right.priority);
+  return slots.sort((left, right) => left.slot_start.getTime() - right.slot_start.getTime() || right.window_score - left.window_score || left.priority - right.priority);
+}
+
+function emptyBucket(): PerformanceBucket {
+  return {
+    posts: 0,
+    weightedPosts: 0,
+    weightedViews: 0,
+    weightedReach: 0,
+    weightedShares: 0,
+    weightedSaves: 0,
+    weightedComments: 0,
+    weightedReplies: 0,
+    weightedWatchMs: 0,
+  };
+}
+
+function addSampleToBucket(bucket: PerformanceBucket, sample: PerformanceSample, now: Date) {
+  const daysOld = Math.max(0, (now.getTime() - sample.fetchedAt.getTime()) / (24 * 60 * 60 * 1000));
+  const weight = 1 / (1 + daysOld / 7);
+
+  bucket.posts += 1;
+  bucket.weightedPosts += weight;
+  bucket.weightedViews += sample.views * weight;
+  bucket.weightedReach += sample.reach * weight;
+  bucket.weightedShares += sample.shares * weight;
+  bucket.weightedSaves += sample.saves * weight;
+  bucket.weightedComments += sample.comments * weight;
+  bucket.weightedReplies += sample.replies * weight;
+  bucket.weightedWatchMs += sample.avgWatchTimeMs * weight;
+}
+
+function buildPerformanceBuckets(samples: PerformanceSample[], now: Date) {
+  const overall = emptyBucket();
+  const byPostType = new Map<string, PerformanceBucket>();
+  const byPillar = new Map<string, PerformanceBucket>();
+  const byDaypart = new Map<string, PerformanceBucket>();
+
+  for (const sample of samples) {
+    addSampleToBucket(overall, sample, now);
+
+    const typeBucket = byPostType.get(sample.postType) ?? emptyBucket();
+    addSampleToBucket(typeBucket, sample, now);
+    byPostType.set(sample.postType, typeBucket);
+
+    if (sample.pillarKey) {
+      const pillarBucket = byPillar.get(sample.pillarKey) ?? emptyBucket();
+      addSampleToBucket(pillarBucket, sample, now);
+      byPillar.set(sample.pillarKey, pillarBucket);
+    }
+
+    const daypartBucket = byDaypart.get(sample.daypart) ?? emptyBucket();
+    addSampleToBucket(daypartBucket, sample, now);
+    byDaypart.set(sample.daypart, daypartBucket);
+  }
+
+  return {
+    overall,
+    byPostType,
+    byPillar,
+    byDaypart,
+  };
+}
+
+function metricPerPost(bucket: PerformanceBucket, metric: keyof PerformanceBucket): number {
+  return bucket.weightedPosts > 0 ? toNumber(bucket[metric], 0) / bucket.weightedPosts : 0;
+}
+
+function rate(bucket: PerformanceBucket, numerator: keyof PerformanceBucket): number {
+  return bucket.weightedViews > 0 ? toNumber(bucket[numerator], 0) / bucket.weightedViews : 0;
+}
+
+function relativeMetric(value: number, baseline: number): number {
+  if (baseline <= 0 && value <= 0) return 1;
+  if (baseline <= 0) return 1.15;
+  return Math.max(0.7, Math.min(1.3, value / baseline));
+}
+
+function computePerformanceIndex(input: {
+  postType: "feed" | "story" | "reel";
+  pillarKey: string | null;
+  daypart: string;
+  buckets: ReturnType<typeof buildPerformanceBuckets>;
+}): number {
+  const typeBucket = input.buckets.byPostType.get(input.postType) ?? emptyBucket();
+  const pillarBucket = input.pillarKey ? input.buckets.byPillar.get(input.pillarKey) ?? emptyBucket() : emptyBucket();
+  const daypartBucket = input.buckets.byDaypart.get(input.daypart) ?? emptyBucket();
+  const overall = input.buckets.overall.weightedPosts > 0 ? input.buckets.overall : typeBucket;
+
+  const baselineViews = metricPerPost(overall, "weightedViews");
+  const baselineShareRate = rate(overall, "weightedShares");
+  const baselineSaveRate = rate(overall, "weightedSaves");
+  const baselineCommentRate = rate(overall, "weightedComments");
+  const baselineReplyRate = rate(overall, "weightedReplies");
+  const baselineWatchMs = metricPerPost(overall, "weightedWatchMs");
+
+  const pool = [typeBucket, pillarBucket, daypartBucket].filter((bucket) => bucket.weightedPosts > 0);
+  if (pool.length === 0) return 1;
+
+  const averaged = pool.reduce(
+    (result, bucket) => ({
+      views: result.views + metricPerPost(bucket, "weightedViews"),
+      shareRate: result.shareRate + rate(bucket, "weightedShares"),
+      saveRate: result.saveRate + rate(bucket, "weightedSaves"),
+      commentRate: result.commentRate + rate(bucket, "weightedComments"),
+      replyRate: result.replyRate + rate(bucket, "weightedReplies"),
+      watchMs: result.watchMs + metricPerPost(bucket, "weightedWatchMs"),
+    }),
+    { views: 0, shareRate: 0, saveRate: 0, commentRate: 0, replyRate: 0, watchMs: 0 },
+  );
+
+  const viewMetric = relativeMetric(averaged.views / pool.length, baselineViews);
+  const shareMetric = relativeMetric(averaged.shareRate / pool.length, baselineShareRate);
+  const saveMetric = relativeMetric(averaged.saveRate / pool.length, baselineSaveRate);
+  const commentMetric = relativeMetric(averaged.commentRate / pool.length, baselineCommentRate);
+  const replyMetric = relativeMetric(averaged.replyRate / pool.length, baselineReplyRate);
+  const watchMetric = relativeMetric(averaged.watchMs / pool.length, baselineWatchMs);
+
+  if (input.postType === "reel") {
+    return viewMetric * 0.4 + shareMetric * 0.25 + saveMetric * 0.2 + watchMetric * 0.15;
+  }
+
+  if (input.postType === "story") {
+    return replyMetric * 0.45 + viewMetric * 0.35 + shareMetric * 0.2;
+  }
+
+  return shareMetric * 0.4 + saveMetric * 0.3 + commentMetric * 0.2 + viewMetric * 0.1;
+}
+
+function formatCaptionSuggestion(captionPackage: CaptionSeoPackage): string {
+  return formatCaptionFromPackage(captionPackage);
+}
+
+function assetHasVariant(
+  asset: {
+    variants: Array<{
+      format_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
+      media_kind: "image" | "video";
+    }>;
+  } | null,
+  variantType: "story_9x16" | "reel_9x16",
+): boolean {
+  return Boolean(asset?.variants.some((variant) => variant.format_type === variantType));
+}
+
+function pickAssetForSlot<
+  T extends {
+    id: string;
+    variants: Array<{
+      format_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
+      media_kind: "image" | "video";
+    }>;
+  },
+>(
+  slot: { post_type: "feed" | "story" | "reel" },
+  assets: T[],
+  activeAssetIds: Set<string>,
+) {
+  const available = assets.filter((asset) => !activeAssetIds.has(asset.id));
+  if (available.length === 0) return null;
+
+  if (slot.post_type === "reel") {
+    return available.find((asset) => assetHasVariant(asset, "reel_9x16")) ?? available[0] ?? null;
+  }
+
+  if (slot.post_type === "story") {
+    return available.find((asset) => assetHasVariant(asset, "story_9x16")) ?? available[0] ?? null;
+  }
+
+  return available[0] ?? null;
+}
+
+function shouldReserveExperiment(slotIndex: number, strategy: PostingStrategy): boolean {
+  if (strategy.experimentation_rate_percent <= 0) return false;
+  const stride = Math.max(1, Math.round(100 / strategy.experimentation_rate_percent));
+  return (slotIndex + 1) % stride === 0;
+}
+
+function buildExperimentTag(
+  slot: { post_type: "feed" | "story" | "reel"; daypart: string },
+  slotIndex: number,
+  reserveExperiment: boolean,
+) {
+  if (!reserveExperiment) return null;
+  return `${slot.post_type}_${slot.daypart}_test_${slotIndex + 1}`;
+}
+
+function latestSamplesFromPublishedQueue(rows: Array<{
+  pillar_key: string | null;
+  post_type: "feed" | "story" | "reel";
+  scheduled_at: Date;
+  analytics: Array<{
+    fetched_at: Date;
+    views: number | null;
+    impressions: number;
+    reach: number;
+    shares_count: number;
+    saves_count: number;
+    comments_count: number;
+    replies_count: number;
+    avg_watch_time_ms: number | null;
+  }>;
+}>): PerformanceSample[] {
+  return rows.flatMap((row) => {
+    const latest = row.analytics[0];
+    if (!latest) return [];
+
+    const hour = row.scheduled_at.getUTCHours();
+    const daypart =
+      hour < 11 ? "morning" :
+      hour < 15 ? "midday" :
+      hour < 18 ? "afternoon" :
+      "evening";
+
+    return [{
+      postType: row.post_type,
+      pillarKey: row.pillar_key,
+      daypart,
+      fetchedAt: latest.fetched_at,
+      views: latest.views ?? latest.impressions ?? latest.reach,
+      reach: latest.reach,
+      shares: latest.shares_count,
+      saves: latest.saves_count,
+      comments: latest.comments_count,
+      replies: latest.replies_count,
+      avgWatchTimeMs: latest.avg_watch_time_ms ?? 0,
+    }];
+  });
 }
 
 export async function generatePostingPlanForProfile(input: {
@@ -516,9 +889,9 @@ export async function generatePostingPlanForProfile(input: {
   }
 
   const horizonEnd = new Date(now.getTime() + horizonDays * 24 * 60 * 60 * 1000);
-  const recentWindowStart = new Date(now.getTime() - 21 * 24 * 60 * 60 * 1000);
+  const recentWindowStart = new Date(now.getTime() - 45 * 24 * 60 * 60 * 1000);
 
-  const [existingPlanItems, upcomingQueue, recentQueue, approvedAssets] = await Promise.all([
+  const [existingPlanItems, upcomingQueue, recentPublishedQueue, approvedAssets] = await Promise.all([
     prisma.postingPlanItem.findMany({
       where: {
         profile_id: input.profileId,
@@ -549,25 +922,26 @@ export async function generatePostingPlanForProfile(input: {
           in: [...ACTIVE_QUEUE_STATUSES],
         },
       },
+      select: {
+        asset_id: true,
+        scheduled_at: true,
+        slot_start: true,
+        post_type: true,
+      },
     }),
     prisma.publishingQueue.findMany({
       where: {
         profile_id: input.profileId,
-        OR: [
-          {
-            published_at: {
-              gte: recentWindowStart,
-            },
-          },
-          {
-            scheduled_at: {
-              gte: recentWindowStart,
-            },
-          },
-        ],
+        status: "PUBLISHED",
+        published_at: {
+          gte: recentWindowStart,
+        },
       },
-      select: {
-        pillar_key: true,
+      include: {
+        analytics: {
+          orderBy: { fetched_at: "desc" },
+          take: 1,
+        },
       },
     }),
     prisma.asset.findMany({
@@ -589,8 +963,10 @@ export async function generatePostingPlanForProfile(input: {
           select: {
             id: true,
             name: true,
+            prompt_text: true,
           },
         },
+        variants: true,
       },
       orderBy: [{ reviewed_at: "desc" }, { created_at: "desc" }],
       take: 50,
@@ -600,8 +976,10 @@ export async function generatePostingPlanForProfile(input: {
   const existingByKey = new Map(existingPlanItems.map((item) => [`${item.slot_start.toISOString()}|${item.post_type}`, item]));
   const queueKeys = new Set(upcomingQueue.map((item) => `${(item.slot_start ?? item.scheduled_at).toISOString()}|${item.post_type}`));
   const usageByPillar = new Map<string, number>();
+  const performanceSamples = latestSamplesFromPublishedQueue(recentPublishedQueue);
+  const performanceBuckets = buildPerformanceBuckets(performanceSamples, now);
 
-  for (const row of recentQueue) {
+  for (const row of recentPublishedQueue) {
     if (!row.pillar_key) continue;
     usageByPillar.set(row.pillar_key, (usageByPillar.get(row.pillar_key) ?? 0) + 1);
   }
@@ -610,44 +988,122 @@ export async function generatePostingPlanForProfile(input: {
     ...existingPlanItems.map((item) => item.asset_id).filter((value): value is string => Boolean(value)),
     ...upcomingQueue.map((item) => item.asset_id),
   ]);
-
   const upcomingSlots = computeUpcomingSlots(strategy, now, horizonDays);
 
-  for (const slot of upcomingSlots) {
+  for (const [slotIndex, slot] of upcomingSlots.entries()) {
     const slotKey = `${slot.slot_start.toISOString()}|${slot.post_type}`;
-    const existingQueueItem = queueKeys.has(slotKey);
+    if (queueKeys.has(slotKey)) continue;
+
     const existingPlan = existingByKey.get(slotKey);
-
-    if (existingQueueItem) {
-      continue;
-    }
-
-    if (existingPlan && existingPlan.status !== "RECOMMENDED") {
-      continue;
-    }
+    if (existingPlan && existingPlan.status !== "RECOMMENDED") continue;
 
     const pillar = pickPillarForSlot({
       slotPillarKey: slot.pillar_key,
+      slotPostType: slot.post_type,
       pillars: strategy.pillars,
       usageByPillar,
     });
-    const asset = approvedAssets.find((candidate) => !activeAssetIds.has(candidate.id)) ?? null;
-
+    const asset = pickAssetForSlot(slot, approvedAssets, activeAssetIds);
     if (asset) {
       activeAssetIds.add(asset.id);
     }
 
-    const readyAssetScore = approvedAssets.length >= strategy.min_ready_assets ? 0.18 : 0.04;
-    const assetAssignmentScore = asset ? 0.18 : 0.04;
-    const gapScore = pillar ? Math.max(0.12, pillar.target_share_percent / 100) : 0.1;
-    const confidence = Math.min(0.96, Number((0.44 + readyAssetScore + assetAssignmentScore + gapScore).toFixed(4)));
+    const reelVariantReady = slot.post_type !== "reel" || assetHasVariant(asset, "reel_9x16");
+    const storyVariantReady = slot.post_type !== "story" || assetHasVariant(asset, "story_9x16");
+    const performanceIndex = computePerformanceIndex({
+      postType: slot.post_type,
+      pillarKey: pillar?.key ?? slot.pillar_key ?? null,
+      daypart: slot.daypart,
+      buckets: performanceBuckets,
+    });
+    const reserveExperiment = shouldReserveExperiment(slotIndex, strategy);
+    const experimentTag = buildExperimentTag(slot, slotIndex, reserveExperiment);
+    const copyResult = await buildPublishingCopyFromContext({
+      mode: "metadata_draft",
+      context: {
+        profileId: input.profileId,
+        displayName: profile.display_name ?? profile.model.name,
+        handle: profile.handle,
+        postType: slot.post_type,
+        variantType: slot.variant_type,
+        scheduledAt: slot.slot_start,
+        daypart: slot.daypart,
+        primaryGoal: strategy.primary_goal,
+        strategyNotes: strategy.notes ?? null,
+        pillar: {
+          key: pillar?.key ?? slot.pillar_key ?? null,
+          name: pillar?.name ?? "Open Slot",
+          description: pillar?.description ?? null,
+        },
+        experimentTag,
+        personality: profile.model.personality_profile,
+        socialTracks: profile.model.social_tracks_profile,
+        asset: asset
+          ? {
+              id: asset.id,
+              sequenceNumber: asset.sequence_number,
+              promptText: asset.prompt_text,
+              issueTags: asset.issue_tags,
+              previewUrl: null,
+              campaign: asset.campaign
+                ? {
+                    id: asset.campaign.id,
+                    name: asset.campaign.name,
+                    promptText: asset.campaign.prompt_text,
+                  }
+                : null,
+            }
+          : null,
+      },
+    });
+    const captionPackage = copyResult.captionPackage;
+
+    const readinessScore = approvedAssets.length >= strategy.min_ready_assets ? 0.08 : -0.04;
+    const assetScore = asset ? 0.12 : -0.08;
+    const reelReadinessScore = slot.post_type !== "reel" ? 0.04 : reelVariantReady ? 0.09 : -0.12;
+    const storyReadinessScore = slot.post_type !== "story" ? 0 : storyVariantReady ? 0.04 : -0.04;
+    const windowScore = (slot.window_score - 0.7) * 0.18;
+    const performanceBoost = (performanceIndex - 1) * 0.18;
+    const experimentAdjustment = reserveExperiment ? -0.03 : 0.02;
+    const confidence = Math.max(
+      0.18,
+      Math.min(
+        0.97,
+        Number((0.58 + readinessScore + assetScore + reelReadinessScore + storyReadinessScore + windowScore + performanceBoost + experimentAdjustment).toFixed(4)),
+      ),
+    );
+
     const strategySnapshot = {
       strategy_id: strategy.id ?? null,
       profile_id: input.profileId,
-      timezone: strategy.timezone,
+      profile_handle: profile.handle,
+      primary_goal: strategy.primary_goal,
       weekly_post_target: strategy.weekly_post_target,
+      weekly_feed_target: strategy.weekly_feed_target,
+      weekly_reel_target: strategy.weekly_reel_target,
+      weekly_story_target: strategy.weekly_story_target,
       pillar_key: pillar?.key ?? slot.pillar_key ?? null,
+      experiment_tag: experimentTag,
+      best_time_window_score: slot.window_score,
       generated_at: now.toISOString(),
+    };
+
+    const autopilotMetadata = {
+      mode: "auto_queue_ready",
+      source: "strategy_engine_2026",
+      experiment: reserveExperiment,
+      experiment_tag: experimentTag,
+      caption_package: captionPackage,
+      score_breakdown: {
+        performance_index: Number(performanceIndex.toFixed(4)),
+        time_window_score: Number(slot.window_score.toFixed(4)),
+        asset_ready: Boolean(asset),
+        reel_variant_ready: reelVariantReady,
+        story_variant_ready: storyVariantReady,
+        min_ready_assets_met: approvedAssets.length >= strategy.min_ready_assets,
+      },
+      reel_variant_ready: reelVariantReady,
+      queue_eligible: confidence >= strategy.auto_queue_min_confidence && (slot.post_type !== "reel" || reelVariantReady),
     };
 
     const payload = {
@@ -662,17 +1118,12 @@ export async function generatePostingPlanForProfile(input: {
       post_type: slot.post_type,
       variant_type: slot.variant_type,
       rationale: pillar
-        ? `${pillar.name} is below its target share and this ${slot.daypart} slot matches the current cadence.`
-        : `Recommended from the active slot template for ${slot.daypart}.`,
+        ? `${pillar.name} is due for coverage and this ${slot.daypart} slot aligns with a ${(slot.window_score * 100).toFixed(0)}% timing confidence window.`
+        : `Adaptive ${slot.post_type} recommendation for the ${slot.daypart} window.`,
       confidence,
-      caption_suggestion: asset
-        ? `${profile.display_name ?? profile.model.name}: ${pillar?.name ?? "Next post"} with a ${slot.daypart} publishing window.`
-        : `${pillar?.name ?? "Next post"} slot reserved while waiting for the next approved asset.`,
+      caption_suggestion: copyResult.caption,
       strategy_snapshot: toInputJson(strategySnapshot),
-      autopilot_metadata: toInputJson({
-        mode: "operator_confirmed",
-        source: "strategy_engine_v1",
-      }),
+      autopilot_metadata: toInputJson(autopilotMetadata),
     };
 
     if (existingPlan) {

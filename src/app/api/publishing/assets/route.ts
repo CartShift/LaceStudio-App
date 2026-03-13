@@ -54,6 +54,7 @@ export async function GET(request: Request) {
               ...asset,
               preview_url: await resolvePublishingAssetPreviewUrl(asset.approved_gcs_uri ?? asset.raw_gcs_uri),
               is_available: !activeQueueItem,
+              reel_variant_ready: asset.sequence_number % 2 === 0,
               active_queue_item: activeQueueItem
                 ? {
                     id: activeQueueItem.id,
@@ -89,6 +90,20 @@ export async function GET(request: Request) {
                 name: true,
               },
             },
+          },
+        },
+        variants: {
+          select: {
+            id: true,
+            format_type: true,
+            media_kind: true,
+            gcs_uri: true,
+            preview_image_gcs_uri: true,
+            duration_ms: true,
+            mime_type: true,
+            width: true,
+            height: true,
+            created_at: true,
           },
         },
         publishing_queue: {
@@ -127,6 +142,7 @@ export async function GET(request: Request) {
           ...asset,
           preview_url: await resolvePublishingAssetPreviewUrl(asset.approved_gcs_uri ?? asset.raw_gcs_uri),
           is_available: asset.publishing_queue.length === 0,
+          reel_variant_ready: asset.variants.some((variant) => variant.format_type === "reel_9x16" && variant.media_kind === "video"),
           active_queue_item: asset.publishing_queue[0] ?? null,
         })),
       ),

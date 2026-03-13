@@ -220,6 +220,38 @@ describe("nano-banana-image-provider", () => {
     expect(response.provider_payload?.reference_images_dropped).toBe(2);
     expect(response.provider_payload?.image_size).toBeNull();
   });
+
+  it("surfaces text-only Gemini failures when no image part is returned", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: "The request completed without producing an image asset.",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new NanoBananaImageProvider();
+
+    await expect(provider.generate(createInput())).rejects.toThrow(
+      "The request completed without producing an image asset.",
+    );
+  });
 });
 
 function createInput(overrides?: Partial<ImageGenerationRequest>): ImageGenerationRequest {

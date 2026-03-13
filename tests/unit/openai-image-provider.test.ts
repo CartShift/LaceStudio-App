@@ -45,6 +45,7 @@ describe("openai-image-provider", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(init.body).toBeInstanceOf(FormData);
     expect((init.body as FormData).getAll("image[]")).toHaveLength(1);
+    expect((init.body as FormData).get("response_format")).toBeNull();
 
     expect(response.assets).toHaveLength(1);
     expect(response.provider_payload?.endpoint).toBe("images/edits");
@@ -70,12 +71,13 @@ describe("openai-image-provider", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(init.body));
     expect(body.prompt).toContain("Character consistency lock");
+    expect(body).not.toHaveProperty("response_format");
 
     expect(response.assets).toHaveLength(1);
     expect(response.provider_payload?.endpoint).toBe("images/generations");
   });
 
-  it("falls back to generations when edits request fails", async () => {
+  it("retries edits without fidelity before falling back to generations", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "bad request" } }), { status: 400 }))
@@ -97,11 +99,116 @@ describe("openai-image-provider", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/edits");
-    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://api.openai.com/v1/images/generations");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://api.openai.com/v1/images/edits");
+
+    const firstBody = fetchMock.mock.calls[0]?.[1]?.body as FormData;
+    const secondBody = fetchMock.mock.calls[1]?.[1]?.body as FormData;
+    expect(firstBody.get("input_fidelity")).toBe("high");
+    expect(secondBody.get("input_fidelity")).toBeNull();
+
+    expect(response.assets).toHaveLength(1);
+    expect(response.provider_payload?.endpoint).toBe("images/edits");
+    expect(response.provider_payload?.input_fidelity).toBe("none");
+    expect(response.provider_payload?.edit_fallback_status).toBe(400);
+  });
+
+  it("falls back to generations after both edit attempts fail", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "unsupported high fidelity" } }), { status: 400 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "unsupported edit request" } }), { status: 400 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: [{ b64_json: "EEEE" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new OpenAiImageProvider();
+    const response = await provider.generate(
+      createInput({
+        references: [{ url: sampleDataUrl(), weight: "primary" }],
+      }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/edits");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://api.openai.com/v1/images/edits");
+    expect(fetchMock.mock.calls[2]?.[0]).toBe("https://api.openai.com/v1/images/generations");
 
     expect(response.assets).toHaveLength(1);
     expect(response.provider_payload?.endpoint).toBe("images/generations");
     expect(response.provider_payload?.edit_fallback_status).toBe(400);
+  });
+
+  it("surfaces the OpenAI API error message when every attempt fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "Unsupported parameter: 'response_format'. This parameter is not supported for this model.",
+            },
+          }),
+          { status: 400, headers: { "x-request-id": "req_high" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "Too many reference images were supplied for edits.",
+            },
+          }),
+          { status: 400, headers: { "x-request-id": "req_low" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "This request was blocked by the safety system.",
+            },
+          }),
+          { status: 400, headers: { "x-request-id": "req_gen" } },
+        ),
+      );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new OpenAiImageProvider();
+
+    await expect(
+      provider.generate(
+        createInput({
+          references: [{ url: sampleDataUrl(), weight: "primary" }],
+        }),
+      ),
+    ).rejects.toMatchObject({
+      message: "OpenAI image request failed: Unsupported parameter: 'response_format'. This parameter is not supported for this model.",
+      details: expect.objectContaining({
+        request_id: "req_gen",
+        attempts: expect.arrayContaining([
+          expect.objectContaining({
+            endpoint: "images/edits",
+            input_fidelity: "high",
+            message: "Unsupported parameter: 'response_format'. This parameter is not supported for this model.",
+          }),
+          expect.objectContaining({
+            endpoint: "images/edits",
+            input_fidelity: "none",
+            message: "Too many reference images were supplied for edits.",
+          }),
+          expect.objectContaining({
+            endpoint: "images/generations",
+            message: "This request was blocked by the safety system.",
+          }),
+        ]),
+      }),
+    });
   });
 
   it("ignores blocked private reference URLs", async () => {

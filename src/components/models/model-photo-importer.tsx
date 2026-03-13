@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { ArrowRight, Check, Images, ScanFace, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ import { FormField } from "@/components/workspace/form-field";
 import { DropZone } from "@/components/campaigns/drop-zone";
 import { apiFormRequest, apiRequest } from "@/lib/client-api";
 import { humanizeStatusLabel } from "@/lib/status-labels";
+import { getPhotoImportAnalysisIssue } from "@/components/models/photo-import-analysis";
 import type { CharacterDesignDraft, ModelPhotoImportSnapshot, PersonalityDraft, SocialTracksDraft } from "@/components/models/types";
 import type { ImageModelProvider } from "@/server/schemas/creative";
 
@@ -38,15 +40,20 @@ export type ModelPhotoImportApplyResponse = {
 	canonical_warning?: string;
 };
 
+type PhotoImportImageReview = NonNullable<ModelPhotoImportSnapshot["latest_suggestion"]>["image_reviews"][number];
+type ReviewedReference = ModelPhotoImportSnapshot["references"][number] & Partial<PhotoImportImageReview>;
+
 export function ModelPhotoImporter({
 	modelId,
 	onApplied,
+	onSnapshotChange,
 	className,
 	embedded = false,
 	canonicalSettings
 }: {
 	modelId: string;
 	onApplied?: (payload: ModelPhotoImportApplyResponse) => void | Promise<void>;
+	onSnapshotChange?: (snapshot: ModelPhotoImportSnapshot | null) => void;
 	className?: string;
 	embedded?: boolean;
 	canonicalSettings?: {
@@ -63,11 +70,12 @@ export function ModelPhotoImporter({
 	const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
 	const [uploading, setUploading] = useState(false);
 	const [applying, setApplying] = useState(false);
+	const [reanalyzing, setReanalyzing] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [info, setInfo] = useState<string | null>(null);
 	const [previewIndex, setPreviewIndex] = useState<number | null>(null);
-	const [provider, setProvider] = useState<ImageModelProvider>("zai_glm");
-	const [providerModelId, setProviderModelId] = useState("glm-image");
+	const [provider, setProvider] = useState<ImageModelProvider>("nano_banana_2");
+	const [providerModelId, setProviderModelId] = useState("gemini-3.1-flash-image-preview");
 	const [candidatesPerShot, setCandidatesPerShot] = useState(1);
 
 	const canStartImport = selectedFiles.length >= 3 && selectedFiles.length <= 20 && !uploading;
@@ -77,7 +85,7 @@ export function ModelPhotoImporter({
 	const activeProvider = canonicalSettings?.provider ?? provider;
 	const activeProviderModelId = canonicalSettings?.providerModelId ?? providerModelId;
 	const activeCandidatesPerShot = canonicalSettings?.candidatesPerShot ?? candidatesPerShot;
-	const canUpdateModelInfoWithAi = status === "READY" && Boolean(snapshot?.latest_suggestion) && !applying;
+	const canReanalyze = hasImportedReferences && status !== "UPLOADING" && status !== "ANALYZING" && !reanalyzing;
 	const refreshSnapshot = useCallback(async () => {
 		setLoadingSnapshot(true);
 		try {
@@ -105,21 +113,52 @@ export function ModelPhotoImporter({
 	useEffect(() => {
 		if (!snapshot) return;
 		if (canonicalSettings) return;
-		setProvider(snapshot.options.canonical_provider ?? "zai_glm");
+		setProvider(snapshot.options.canonical_provider ?? "nano_banana_2");
 		setProviderModelId(
 			snapshot.options.canonical_model_id ??
 				(snapshot.options.canonical_provider === "openai"
 					? "gpt-image-1"
+					: snapshot.options.canonical_provider === "nano_banana_2"
+						? "gemini-3.1-flash-image-preview"
 					: snapshot.options.canonical_provider === "zai_glm"
 						? "glm-image"
 						: snapshot.options.canonical_provider === "gpu"
 							? "sdxl-1.0"
-							: "glm-image")
+							: "gemini-3.1-flash-image-preview")
 		);
 		setCandidatesPerShot(snapshot.options.canonical_candidates_per_shot);
 	}, [snapshot, canonicalSettings]);
 
+	useEffect(() => {
+		onSnapshotChange?.(snapshot);
+	}, [onSnapshotChange, snapshot]);
+
 	const previewableReferences = useMemo(() => (snapshot?.references ?? []).filter(reference => Boolean(reference.preview_url)), [snapshot?.references]);
+	const reviewByReferenceId = useMemo(() => new Map((snapshot?.latest_suggestion?.image_reviews ?? []).map(review => [review.reference_id, review])), [snapshot?.latest_suggestion?.image_reviews]);
+	const reviewedReferences = useMemo<ReviewedReference[]>(
+		() =>
+			(snapshot?.references ?? []).map(reference => ({
+				...reference,
+				...(reviewByReferenceId.get(reference.id) ?? {})
+			})),
+		[snapshot?.references, reviewByReferenceId]
+	);
+	const acceptedReviewedReferences = useMemo(
+		() =>
+			reviewedReferences
+				.filter(reference => reference.status === "ACCEPTED")
+				.sort(
+					(a, b) =>
+						Number(b.identity_anchor_score ?? 0) - Number(a.identity_anchor_score ?? 0) ||
+						Number(b.sharpness_score ?? 0) - Number(a.sharpness_score ?? 0) ||
+						a.sort_order - b.sort_order
+				),
+		[reviewedReferences]
+	);
+	const topIdentityAnchors = useMemo(() => acceptedReviewedReferences.slice(0, 3), [acceptedReviewedReferences]);
+	const readiness = useMemo(() => deriveIdentityReadiness(acceptedReviewedReferences), [acceptedReviewedReferences]);
+	const analysisIssue = useMemo(() => getPhotoImportAnalysisIssue(snapshot), [snapshot]);
+	const canUpdateModelInfoWithAi = status === "READY" && Boolean(snapshot?.latest_suggestion) && !applying && !analysisIssue?.blocking;
 	const previewIndexByReferenceId = useMemo(() => {
 		const map = new Map<string, number>();
 		previewableReferences.forEach((reference, index) => {
@@ -228,18 +267,92 @@ export function ModelPhotoImporter({
 		}
 	}
 
+	async function reanalyzePhotos() {
+		if (!canReanalyze) return;
+		setReanalyzing(true);
+		setError(null);
+		setInfo(null);
+		try {
+			await apiRequest(`/api/models/${modelId}/workflow/photo-import/reanalyze`, {
+				method: "POST"
+			});
+			setInfo("Rechecking photo angles and identity anchors with live vision analysis.");
+			await refreshSnapshot();
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "We couldn't reanalyze these photos. Please try again.");
+		} finally {
+			setReanalyzing(false);
+		}
+	}
+
 	const body = (
 		<>
-			<div className="flex flex-wrap items-start justify-between gap-3">
-				<div>
-					<h3 className="font-display text-xl">Photo Setup</h3>
-					<p className="text-sm text-muted-foreground">Upload 3-20 clear photos. We will suggest Character, Personality, and Strategy details.</p>
+			<div className="relative overflow-hidden rounded-[1.75rem] border border-border/70 bg-[linear-gradient(140deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--accent),transparent_76%)_54%,color-mix(in_oklab,var(--primary),transparent_92%))] p-4 shadow-[var(--shadow-soft)] md:p-5">
+				<div className="pointer-events-none absolute inset-y-0 right-0 w-[34%] bg-[radial-gradient(circle_at_100%_0%,color-mix(in_oklab,var(--primary),transparent_82%),transparent_62%)]" />
+				<div className="relative grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(17rem,0.8fr)]">
+					<div className="space-y-4">
+						<div className="flex flex-wrap items-start justify-between gap-3">
+							<div>
+								<p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Identity Intake</p>
+								<h3 className="font-display text-[clamp(1.6rem,3vw,2.15rem)] leading-[0.95]">Build the anchor set before you generate.</h3>
+								<p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+									Upload 3-20 photos, let the system rank likeness anchors, then use the strongest front match to drive the rest of the reference set.
+								</p>
+							</div>
+							<Badge tone={statusTone(status)}>{humanizeStatusLabel(status)}</Badge>
+						</div>
+
+						<div className="grid gap-2.5 md:grid-cols-3">
+							<FlowStep
+								icon={<Images className="size-4" />}
+								label="1. Upload"
+								description={selectedFiles.length > 0 ? `${selectedFiles.length} file(s) queued` : "3-20 solo photos"}
+								tone={selectedFiles.length > 0 || snapshot?.counts.total ? "success" : "neutral"}
+							/>
+							<FlowStep
+								icon={<ScanFace className="size-4" />}
+								label="2. Analyze"
+								description={
+									status === "UPLOADING" || status === "ANALYZING"
+										? "Reviewing angle, sharpness, anchor strength"
+										: analysisIssue?.blocking
+											? "Vision analysis needs another pass before anchors are trustworthy"
+											: "Angle + anchor scoring"
+								}
+								tone={status === "UPLOADING" || status === "ANALYZING" ? "warning" : analysisIssue?.blocking ? "danger" : snapshot?.latest_suggestion ? "success" : "neutral"}
+							/>
+							<FlowStep
+								icon={<Sparkles className="size-4" />}
+								label="3. Generate"
+								description={readiness.nextStep}
+								tone={readiness.tone}
+							/>
+						</div>
+					</div>
+
+					<div className="rounded-[1.5rem] border border-border/70 bg-background/72 p-4 shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_26%)]">
+						<p className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Identity Readiness</p>
+						<div className="mt-3 flex items-center justify-between gap-3">
+							<div>
+								<p className="font-display text-2xl leading-none">{readiness.label}</p>
+								<p className="mt-1 text-xs text-muted-foreground">{readiness.description}</p>
+							</div>
+							<Badge tone={readiness.tone}>{readiness.scoreLabel}</Badge>
+						</div>
+
+						<div className="mt-4 grid gap-2 sm:grid-cols-2">
+							<CoveragePill label="Frontal anchor" ready={readiness.coverage.frontal} />
+							<CoveragePill label="Left 45" ready={readiness.coverage.left45} />
+							<CoveragePill label="Right 45" ready={readiness.coverage.right45} />
+							<CoveragePill label="Body framing" ready={readiness.coverage.body} />
+						</div>
+					</div>
 				</div>
-				<Badge tone={statusTone(status)}>{humanizeStatusLabel(status)}</Badge>
 			</div>
 
 			{error ? <StateBlock tone="error" title="Photo Setup Issue" description={error} /> : null}
 			{info ? <StateBlock tone="success" title="Model Updated" description={info} /> : null}
+			{analysisIssue && !embedded ? <StateBlock tone={analysisIssue.tone === "danger" ? "warning" : "neutral"} title={analysisIssue.title} description={analysisIssue.description} /> : null}
 
 			{embedded && canonicalSettings ? null : (
 				<div className="grid gap-3 md:grid-cols-3">
@@ -316,6 +429,11 @@ export function ModelPhotoImporter({
 					Refresh
 				</Button>
 				{hasImportedReferences ? (
+					<Button type="button" variant="secondary" onClick={() => void reanalyzePhotos()} disabled={!canReanalyze}>
+						{reanalyzing ? "Reanalyzing..." : "Reanalyze Photos"}
+					</Button>
+				) : null}
+				{hasImportedReferences ? (
 					<Button type="button" variant="secondary" onClick={() => void applySuggestion()} disabled={!canUpdateModelInfoWithAi}>
 						{applying ? "Updating..." : "Apply Suggested Details"}
 					</Button>
@@ -323,19 +441,66 @@ export function ModelPhotoImporter({
 			</div>
 
 			{snapshot ? (
-				<div className="grid gap-2 rounded-lg border border-border bg-card p-3 text-xs md:grid-cols-4">
-					<div>Waiting: {snapshot.counts.pending}</div>
-					<div>Ready: {snapshot.counts.accepted}</div>
-					<div>Skipped: {snapshot.counts.rejected}</div>
-					<div>Total: {snapshot.counts.total}</div>
+				<div className="grid gap-2 md:grid-cols-4">
+					<MetricPanel label="Queued" value={snapshot.counts.pending} tone="neutral" />
+					<MetricPanel label="Accepted" value={snapshot.counts.accepted} tone="success" />
+					<MetricPanel label="Rejected" value={snapshot.counts.rejected} tone={snapshot.counts.rejected > 0 ? "warning" : "neutral"} />
+					<MetricPanel label="Top anchor" value={formatPercent(topIdentityAnchors[0]?.identity_anchor_score)} tone={readiness.tone} />
 				</div>
+			) : null}
+
+			{topIdentityAnchors.length > 0 ? (
+				<div className="space-y-2">
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<p className="text-xs font-subheader">Best Identity Anchors</p>
+						<p className="text-[11px] text-muted-foreground">These are the strongest photos to preserve your exact face.</p>
+					</div>
+					<div className="grid gap-3 md:grid-cols-3">
+						{topIdentityAnchors.map((reference, index) => (
+							<div key={`anchor-${reference.id}`} className="rounded-[1.4rem] border border-border/70 bg-card/90 p-3 shadow-[var(--shadow-soft)]">
+								<SquareImageThumbnail
+									src={reference.preview_url}
+									alt={reference.file_name ?? reference.id}
+									placeholder="Preview unavailable"
+									containerClassName="mb-3 rounded-[1.1rem]"
+									onImageClick={() => {
+										const previewPosition = previewIndexByReferenceId.get(reference.id);
+										if (typeof previewPosition === "number") setPreviewIndex(previewPosition);
+									}}
+								/>
+								<div className="flex items-center justify-between gap-2">
+									<p className="text-sm font-semibold">{index === 0 ? "Primary anchor" : `Anchor ${index + 1}`}</p>
+									<Badge tone={index === 0 ? "success" : "neutral"}>{formatPercent(reference.identity_anchor_score)}</Badge>
+								</div>
+								<div className="mt-2 flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
+									<MiniTag label={humanizeAngle(reference.view_angle)} />
+									<MiniTag label={humanizeFraming(reference.framing)} />
+									<MiniTag label={humanizeExpression(reference.expression)} />
+									<MiniTag label={`Sharp ${formatPercent(reference.sharpness_score)}`} />
+								</div>
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
+
+			{snapshot?.latest_suggestion ? (
+				<StateBlock
+					tone={readiness.tone === "danger" ? "warning" : readiness.tone === "success" ? "success" : "neutral"}
+					title={
+						readiness.tone === "success"
+							? "Photo set is strong enough for identity-locked generation."
+							: "Photo set is usable, but the likeness can improve with better anchor coverage."
+					}
+					description={readiness.recommendation}
+				/>
 			) : null}
 
 			{snapshot?.references.length ? (
 				<div className="space-y-2">
 					<p className="text-xs font-subheader">Imported Photos</p>
 					<div className="grid gap-2 md:grid-cols-2 lg:grid-cols-4">
-						{snapshot.references.map(reference => (
+						{reviewedReferences.map(reference => (
 							<div key={reference.id} className="rounded-lg border border-border bg-card p-2">
 								<SquareImageThumbnail
 									src={reference.preview_url}
@@ -352,6 +517,11 @@ export function ModelPhotoImporter({
 									<Badge tone={reference.status === "ACCEPTED" ? "success" : reference.status === "REJECTED" ? "danger" : "neutral"}>
 										{humanizeStatusLabel(reference.status)}
 									</Badge>
+								</div>
+								<div className="mt-2 flex flex-wrap gap-1.5">
+									{reference.view_angle ? <MiniTag label={humanizeAngle(reference.view_angle)} /> : null}
+									{reference.framing ? <MiniTag label={humanizeFraming(reference.framing)} /> : null}
+									{typeof reference.identity_anchor_score === "number" ? <MiniTag label={`Anchor ${formatPercent(reference.identity_anchor_score)}`} /> : null}
 								</div>
 								{reference.rejection_reason ? <p className="mt-1 text-[10px] text-muted-foreground">{reference.rejection_reason}</p> : null}
 							</div>
@@ -425,4 +595,145 @@ function statusTone(status: ModelPhotoImportSnapshot["status"]): "neutral" | "wa
 	if (status === "FAILED") return "danger";
 	if (status === "UPLOADING" || status === "ANALYZING") return "warning";
 	return "neutral";
+}
+
+function FlowStep({
+	icon,
+	label,
+	description,
+	tone
+}: {
+	icon: ReactNode;
+	label: string;
+	description: string;
+	tone: "neutral" | "warning" | "success" | "danger";
+}) {
+	return (
+		<div className="rounded-[1.25rem] border border-border/70 bg-background/70 p-3">
+			<div className="flex items-center gap-2">
+				<span className="inline-flex size-8 items-center justify-center rounded-full border border-border/70 bg-card text-foreground">{icon}</span>
+				<div>
+					<p className="text-xs font-semibold">{label}</p>
+					<Badge className="mt-1 w-fit" tone={tone}>
+						{tone === "success" ? "Ready" : tone === "warning" ? "In progress" : tone === "danger" ? "Needs attention" : "Waiting"}
+					</Badge>
+				</div>
+			</div>
+			<p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{description}</p>
+		</div>
+	);
+}
+
+function CoveragePill({ label, ready }: { label: string; ready: boolean }) {
+	return (
+		<div className={`rounded-full border px-3 py-2 text-[11px] font-medium ${ready ? "border-[var(--status-success-border)] bg-[var(--status-success-bg)] text-[var(--status-success)]" : "border-border/70 bg-muted/45 text-muted-foreground"}`}>
+			<span className="inline-flex items-center gap-1.5">
+				{ready ? <Check className="size-3.5" /> : <ArrowRight className="size-3.5" />}
+				{label}
+			</span>
+		</div>
+	);
+}
+
+function MetricPanel({
+	label,
+	value,
+	tone
+}: {
+	label: string;
+	value: string | number;
+	tone: "neutral" | "warning" | "success" | "danger";
+}) {
+	return (
+		<div className="rounded-[1.2rem] border border-border/70 bg-card/85 p-3">
+			<div className="flex items-center justify-between gap-2">
+				<p className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">{label}</p>
+				<Badge tone={tone}>{tone === "success" ? "Good" : tone === "warning" ? "Watch" : tone === "danger" ? "Low" : "Info"}</Badge>
+			</div>
+			<p className="mt-2 font-display text-2xl leading-none">{value}</p>
+		</div>
+	);
+}
+
+function MiniTag({ label }: { label: string }) {
+	return <span className="rounded-full border border-border/70 bg-muted/45 px-2 py-1 text-[10px] text-muted-foreground">{label}</span>;
+}
+
+function deriveIdentityReadiness(references: ReviewedReference[]) {
+	const frontal = references.some(reference => reference.view_angle === "frontal" && (reference.framing === "closeup" || reference.framing === "head_shoulders"));
+	const left45 = references.some(reference => reference.view_angle === "left_45");
+	const right45 = references.some(reference => reference.view_angle === "right_45");
+	const body = references.some(reference => reference.framing === "half_body" || reference.framing === "full_body");
+	const topAnchorScore = Number(references[0]?.identity_anchor_score ?? 0);
+
+	let signalCount = 0;
+	if (references.length >= 5) signalCount += 1;
+	if (frontal) signalCount += 1;
+	if (left45) signalCount += 1;
+	if (right45) signalCount += 1;
+	if (body) signalCount += 1;
+	if (topAnchorScore >= 0.85) signalCount += 1;
+
+	if (signalCount >= 6) {
+		return {
+			label: "Anchor-ready",
+			tone: "success" as const,
+			scoreLabel: `${signalCount}/6`,
+			description: "Strong angle coverage with a clear front anchor.",
+			nextStep: "Generate the front look now.",
+			recommendation: "Approve the front option with the strongest identity match first, then generate the remaining angles so they inherit that anchor.",
+			coverage: { frontal, left45, right45, body }
+		};
+	}
+
+	if (signalCount >= 4) {
+		return {
+			label: "Usable",
+			tone: "warning" as const,
+			scoreLabel: `${signalCount}/6`,
+			description: "The set can work, but one or two anchor angles are still thin.",
+			nextStep: "You can generate now, but better coverage will improve likeness.",
+			recommendation: "For a closer match, add a sharper frontal close-up plus missing left/right 45 or body shots before the next generation pass.",
+			coverage: { frontal, left45, right45, body }
+		};
+	}
+
+	return {
+		label: "Thin coverage",
+		tone: "danger" as const,
+		scoreLabel: `${signalCount}/6`,
+		description: "The system does not have enough strong identity anchors yet.",
+		nextStep: "Add more solo photos before generating.",
+		recommendation: "Prioritize one sharp frontal close-up, one left 45, one right 45, and at least one half-body or full-body image with the face still clearly visible.",
+		coverage: { frontal, left45, right45, body }
+	};
+}
+
+function formatPercent(value: number | null | undefined): string {
+	if (typeof value !== "number" || Number.isNaN(value)) return "--";
+	return `${Math.round(value * 100)}%`;
+}
+
+function humanizeAngle(value: ReviewedReference["view_angle"]): string {
+	if (!value || value === "unknown") return "Angle unknown";
+	if (value === "left_45") return "Left 45";
+	if (value === "right_45") return "Right 45";
+	if (value === "left_profile") return "Left profile";
+	if (value === "right_profile") return "Right profile";
+	return "Frontal";
+}
+
+function humanizeFraming(value: ReviewedReference["framing"]): string {
+	if (!value || value === "unknown") return "Framing unknown";
+	if (value === "head_shoulders") return "Head + shoulders";
+	if (value === "half_body") return "Half body";
+	if (value === "full_body") return "Full body";
+	return "Close-up";
+}
+
+function humanizeExpression(value: ReviewedReference["expression"]): string {
+	if (!value || value === "other") return "Flexible expression";
+	if (value === "soft_smile") return "Soft smile";
+	if (value === "serious") return "Serious";
+	return "Neutral";
 }

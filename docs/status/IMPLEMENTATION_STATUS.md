@@ -31,6 +31,13 @@
   - strategy pillars, slot templates, and plan/recommendation items
   - profile-aware schedule/publish/analytics services and routes
   - publishing cockpit + per-profile workspace + strategy-aware analytics views
+- Instagram 2026 Optimization Upgrade:
+  - views-first analytics and recommendation scoring
+  - Reel publishing via `media_type=REELS`
+  - async reel-variant generation and stored video variants
+  - auto-queue materialization with confidence/readiness gating
+  - caption SEO packages, experiment tagging, and per-format weekly targets
+  - profile workspace controls for reels, best time windows, and optimization tuning
 
 ## Pending for full production parity
 

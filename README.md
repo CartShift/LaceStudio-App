@@ -75,3 +75,4 @@ Primary documents:
 - Implementation status: [`docs/status/IMPLEMENTATION_STATUS.md`](docs/status/IMPLEMENTATION_STATUS.md)
 - Creative feature delivery: [`docs/status/CREATIVE_FEATURE_IMPLEMENTATION.md`](docs/status/CREATIVE_FEATURE_IMPLEMENTATION.md)
 - Instagram Publishing 2.0: [`docs/instagram-publishing-2.0.md`](docs/instagram-publishing-2.0.md)
+- Instagram 2026 optimization: [`docs/instagram-optimization-2026.md`](docs/instagram-optimization-2026.md)

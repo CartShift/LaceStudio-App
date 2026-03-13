@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 	startModelPhotoImportMock: vi.fn(),
 	getModelPhotoImportSnapshotMock: vi.fn(),
 	applyModelPhotoImportSuggestionMock: vi.fn(),
+	reanalyzeModelPhotoImportMock: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -22,10 +23,12 @@ vi.mock("@/server/services/model-photo-import.service", () => ({
 	startModelPhotoImport: mocks.startModelPhotoImportMock,
 	getModelPhotoImportSnapshot: mocks.getModelPhotoImportSnapshotMock,
 	applyModelPhotoImportSuggestion: mocks.applyModelPhotoImportSuggestionMock,
+	reanalyzeModelPhotoImport: mocks.reanalyzeModelPhotoImportMock,
 }));
 
 import { GET, POST } from "@/app/api/models/[id]/workflow/photo-import/route";
 import { POST as APPLY_POST } from "@/app/api/models/[id]/workflow/photo-import/apply/route";
+import { POST as REANALYZE_POST } from "@/app/api/models/[id]/workflow/photo-import/reanalyze/route";
 
 describe("photo-import routes", () => {
 	beforeEach(() => {
@@ -37,6 +40,7 @@ describe("photo-import routes", () => {
 			started_at: new Date().toISOString(),
 			completed_at: new Date().toISOString(),
 			error: null,
+			analysis_provider: "heuristic",
 			counts: { pending: 0, accepted: 3, rejected: 0, total: 3 },
 			options: {
 				keep_as_references: true,
@@ -50,6 +54,11 @@ describe("photo-import routes", () => {
 			job_id: "job-1",
 			status: "ANALYZING",
 			started_at: new Date().toISOString(),
+			counts: { total: 3 },
+		});
+		mocks.reanalyzeModelPhotoImportMock.mockResolvedValue({
+			job_id: "job-1",
+			status: "ANALYZING",
 			counts: { total: 3 },
 		});
 		mocks.applyModelPhotoImportSuggestionMock.mockResolvedValue({
@@ -135,5 +144,17 @@ describe("photo-import routes", () => {
 
 		expect(response.status).toBe(200);
 		expect(mocks.applyModelPhotoImportSuggestionMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("requeues photo analysis via reanalyze route", async () => {
+		const response = await REANALYZE_POST(
+			new Request("http://localhost/api/models/11111111-1111-4111-8111-111111111111/workflow/photo-import/reanalyze", {
+				method: "POST",
+			}),
+			{ params: Promise.resolve({ id: "11111111-1111-4111-8111-111111111111" }) },
+		);
+
+		expect(response.status).toBe(202);
+		expect(mocks.reanalyzeModelPhotoImportMock).toHaveBeenCalledTimes(1);
 	});
 });

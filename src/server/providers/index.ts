@@ -11,6 +11,9 @@ import type { ImageProvider } from "@/server/providers/image/types";
 import { LiveInstagramProvider } from "@/server/providers/instagram/live-instagram-provider";
 import { MockInstagramProvider } from "@/server/providers/instagram/mock-instagram-provider";
 import type { InstagramProvider } from "@/server/providers/instagram/types";
+import { LiveVideoGenerationProvider } from "@/server/providers/video/live-video-provider";
+import { MockVideoGenerationProvider } from "@/server/providers/video/mock-video-provider";
+import type { VideoGenerationProvider } from "@/server/providers/video/types";
 import type { ImageModelProvider } from "@/server/schemas/creative";
 
 export function getGpuProvider(): GpuProvider {
@@ -45,4 +48,11 @@ export function getInstagramProvider(): InstagramProvider {
   return env.INSTAGRAM_PROVIDER_MODE === "live"
     ? new LiveInstagramProvider()
     : new MockInstagramProvider();
+}
+
+export function getVideoGenerationProvider(): VideoGenerationProvider {
+  const env = getEnv();
+  return env.VIDEO_PROVIDER_MODE === "live"
+    ? new LiveVideoGenerationProvider()
+    : new MockVideoGenerationProvider();
 }

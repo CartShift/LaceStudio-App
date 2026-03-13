@@ -72,24 +72,32 @@ describe("live-instagram-provider", () => {
     expect(body).not.toContain("caption=");
   });
 
-  it("rejects reel publishing in phase 1", async () => {
-    const fetchMock = vi.fn();
+  it("creates reel media with REELS container payload", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "container_reel" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
     vi.stubGlobal("fetch", fetchMock);
 
     const provider = new LiveInstagramProvider();
-
-    await expect(
-      provider.createMedia(account, {
-        imageUrl: "https://cdn.example.com/reel.jpg",
-        caption: "reel",
-        postType: "reel",
-      }),
-    ).rejects.toMatchObject({
-      status: 400,
-      code: "VALIDATION_ERROR",
+    const result = await provider.createMedia(account, {
+      videoUrl: "https://cdn.example.com/reel.mp4",
+      caption: "reel",
+      postType: "reel",
     });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.containerId).toBe("container_reel");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = String(init.body);
+    expect(body).toContain("media_type=REELS");
+    expect(body).toContain("video_url=https%3A%2F%2Fcdn.example.com%2Freel.mp4");
+    expect(body).toContain("share_to_feed=true");
+    expect(body).toContain("caption=reel");
   });
 
   it("maps upstream rate limits to ApiError with retry metadata", async () => {

@@ -130,7 +130,7 @@ export const workflowPatchSchema = z.discriminatedUnion("step", [
 ]);
 
 export const canonicalPackGenerateSchema = z.object({
-	provider: imageModelProviderSchema.default("zai_glm"),
+	provider: imageModelProviderSchema.default("nano_banana_2"),
 	model_id: z.string().min(1).max(120).optional(),
 	pack_template: canonicalPackTemplateSchema.default("balanced_8"),
 	candidates_per_shot: z.int().min(1).max(5).default(3),
@@ -186,6 +186,10 @@ export const canonicalPackFrontApproveSchema = z.object({
 
 export const workflowFinalizeSchema = z.object({});
 
+export const photoReferenceViewAngleSchema = z.enum(["frontal", "left_45", "right_45", "left_profile", "right_profile", "unknown"]);
+export const photoReferenceFramingSchema = z.enum(["closeup", "head_shoulders", "half_body", "full_body", "unknown"]);
+export const photoReferenceExpressionSchema = z.enum(["neutral", "soft_smile", "serious", "other"]);
+
 export const photoImportStartOptionsSchema = z.object({
 	keep_as_references: z.boolean().default(true),
 	auto_generate_on_apply: z.boolean().default(false),
@@ -211,7 +215,12 @@ export const photoImportSuggestionSchema = z.object({
 				accepted: z.boolean(),
 				reason: z.string().max(240).optional(),
 				solo_subject: z.boolean().optional(),
-				face_visible: z.boolean().optional()
+				face_visible: z.boolean().optional(),
+				view_angle: photoReferenceViewAngleSchema.optional(),
+				framing: photoReferenceFramingSchema.optional(),
+				expression: photoReferenceExpressionSchema.optional(),
+				sharpness_score: z.number().min(0).max(1).optional(),
+				identity_anchor_score: z.number().min(0).max(1).optional()
 			})
 		)
 		.default([])

@@ -756,6 +756,7 @@ async function getLastPostPerformance(profileId: string) {
   return {
     publishing_queue_id: queueItem.id,
     published_at: queueItem.published_at.toISOString(),
+    views: latestSnapshot?.views ?? latestSnapshot?.impressions ?? latestSnapshot?.reach ?? 0,
     reach: latestSnapshot?.reach ?? 0,
     engagement_rate: Number(latestSnapshot?.engagement_rate ?? 0),
     pillar_key: queueItem.pillar_key,
@@ -866,11 +867,18 @@ export async function listInstagramProfileSummaries(input?: { profileId?: string
         token_expires_at: profile.token_expires_at?.toISOString() ?? null,
         last_analytics_sync_at: profile.last_analytics_sync_at?.toISOString() ?? null,
         strategy: {
+          primary_goal: strategy.primary_goal,
           weekly_post_target: strategy.weekly_post_target,
+          weekly_feed_target: strategy.weekly_feed_target,
+          weekly_reel_target: strategy.weekly_reel_target,
+          weekly_story_target: strategy.weekly_story_target,
           cooldown_hours: strategy.cooldown_hours,
           min_ready_assets: strategy.min_ready_assets,
           active_pillars: strategy.pillars.filter((pillar) => pillar.active).length,
           slot_count: strategy.slot_templates.filter((slot) => slot.active).length,
+          experimentation_rate_percent: strategy.experimentation_rate_percent,
+          auto_queue_enabled: strategy.auto_queue_enabled,
+          auto_queue_min_confidence: strategy.auto_queue_min_confidence,
         },
         health: {
           cadence_score: cadenceScore,

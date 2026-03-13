@@ -95,11 +95,17 @@ describe("model-photo-import schema", () => {
 					accepted: true,
 					solo_subject: true,
 					face_visible: true,
+					view_angle: "frontal",
+					framing: "closeup",
+					expression: "neutral",
+					sharpness_score: 0.92,
+					identity_anchor_score: 0.95,
 				},
 			],
 		});
 
 		expect(parsed.confidence.character_design).toBe(0.8);
 		expect(parsed.image_reviews).toHaveLength(1);
+		expect(parsed.image_reviews[0]?.identity_anchor_score).toBe(0.95);
 	});
 });

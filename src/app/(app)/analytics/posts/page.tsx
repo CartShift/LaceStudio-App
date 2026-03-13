@@ -19,11 +19,16 @@ type PostMetric = {
 	ig_media_id: string;
 	impressions?: number;
 	reach: number;
+	views: number;
 	engagement_rate: number;
+	share_rate: number;
+	save_rate: number;
 	likes_count?: number;
 	comments_count?: number;
 	saves_count?: number;
 	shares_count?: number;
+	replies_count?: number;
+	avg_watch_time_ms?: number | null;
 	fetched_at: string;
 	profile_handle?: string;
 	pillar_key?: string;
@@ -55,8 +60,16 @@ function toDateInput(date: Date): string {
 	return local.toISOString().slice(0, 10);
 }
 
+function formatCompactNumber(value: number): string {
+	return new Intl.NumberFormat([], { notation: "compact", maximumFractionDigits: value >= 1000 ? 1 : 0 }).format(value);
+}
+
+function formatPercent(value: number, digits = 2): string {
+	return `${value.toFixed(digits)}%`;
+}
+
 export default function AnalyticsPostsPage() {
-	const [sortBy, setSortBy] = useState<"engagement_rate" | "reach" | "fetched_at">("engagement_rate");
+	const [sortBy, setSortBy] = useState<"views" | "engagement_rate" | "reach" | "fetched_at">("views");
 	const [startDate, setStartDate] = useState(() => toDateInput(new Date(Date.now() - 1000 * 60 * 60 * 24 * 30)));
 	const [endDate, setEndDate] = useState(() => toDateInput(new Date()));
 
@@ -108,12 +121,24 @@ export default function AnalyticsPostsPage() {
 			)
 		},
 		{
-			key: "reach",
-			header: "Reach",
+			key: "views",
+			header: "Views",
 			cell: row => (
 				<div>
-					<Badge tone="success">{row.reach.toLocaleString()}</Badge>
-					<p className="mt-1 text-xs text-muted-foreground">{(row.impressions ?? 0).toLocaleString()} impressions</p>
+					<Badge tone="success">{formatCompactNumber(row.views)}</Badge>
+					<p className="mt-1 text-xs text-muted-foreground">{row.reach.toLocaleString()} reach · {(row.impressions ?? 0).toLocaleString()} impressions</p>
+				</div>
+			)
+		},
+		{
+			key: "shares",
+			header: "Share / Save",
+			cell: row => (
+				<div>
+					<Badge tone={row.share_rate >= 1.5 ? "success" : "warning"}>{formatPercent(row.share_rate)} / {formatPercent(row.save_rate)}</Badge>
+					<p className="mt-1 text-xs text-muted-foreground">
+						{row.shares_count ?? 0} shares · {row.saves_count ?? 0} saves · {row.replies_count ?? 0} replies
+					</p>
 				</div>
 			)
 		},
@@ -122,9 +147,9 @@ export default function AnalyticsPostsPage() {
 			header: "Engagement",
 			cell: row => (
 				<div>
-					<Badge tone={row.engagement_rate >= 4 ? "success" : "warning"}>{row.engagement_rate.toFixed(2)}%</Badge>
+					<Badge tone={row.engagement_rate >= 4 ? "success" : "warning"}>{formatPercent(row.engagement_rate)}</Badge>
 					<p className="mt-1 text-xs text-muted-foreground">
-						{row.likes_count ?? 0} likes · {row.comments_count ?? 0} comments · {row.saves_count ?? 0} saves
+						{row.likes_count ?? 0} likes · {row.comments_count ?? 0} comments{row.avg_watch_time_ms ? ` · ${Math.round(row.avg_watch_time_ms / 1000)}s avg watch` : ""}
 					</p>
 				</div>
 			)
@@ -145,7 +170,7 @@ export default function AnalyticsPostsPage() {
 		<div className="space-y-4">
 			<PageHeader
 				title="Post Analytics"
-				description="Latest synced reach and engagement for each published post."
+				description="Latest synced views, share/save rates, and watch quality for each published post."
 				action={
 					<Button asChild variant="secondary">
 						<Link href="/analytics">Back To Dashboard</Link>
@@ -156,7 +181,8 @@ export default function AnalyticsPostsPage() {
 			<FilterShell className="grid gap-3 lg:grid-cols-[1fr_1fr_1fr_auto]">
 				<Input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} />
 				<Input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} />
-				<SelectField value={sortBy} onChange={event => setSortBy(event.target.value as "engagement_rate" | "reach" | "fetched_at")}>
+				<SelectField value={sortBy} onChange={event => setSortBy(event.target.value as "views" | "engagement_rate" | "reach" | "fetched_at")}>
+					<option value="views">Sort: Views</option>
 					<option value="engagement_rate">Sort: Engagement Rate</option>
 					<option value="reach">Sort: Reach</option>
 					<option value="fetched_at">Sort: Latest Sync</option>
@@ -171,7 +197,7 @@ export default function AnalyticsPostsPage() {
 
 			<TableShell
 				title="Post Metrics"
-				description="One row per post, using the most recent synced metrics."
+				description="One row per post, using the most recent synced metrics and views-first ranking."
 				rows={rows}
 				columns={columns}
 				rowKey={row => row.id ?? row.publishing_queue_id}

@@ -10,9 +10,10 @@ type CostEstimateProps = {
 	provider: ImageCostProvider;
 	referenceCount: number;
 	promptLength: number;
+	label?: string;
 };
 
-export function CostEstimate({ batchSize, width, height, provider, referenceCount, promptLength }: CostEstimateProps) {
+export function CostEstimate({ batchSize, width, height, provider, referenceCount, promptLength, label = "Estimated Cost" }: CostEstimateProps) {
 	const estimate = useMemo(() => {
 		return estimateImageGenerationCost({
 			provider,
@@ -27,7 +28,7 @@ export function CostEstimate({ batchSize, width, height, provider, referenceCoun
 	return (
 		<div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 space-y-1.5">
 			<div className="flex items-center justify-between">
-				<p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Estimated Cost</p>
+				<p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</p>
 				<p className="font-mono text-sm font-semibold text-primary">${estimate.totalUsd.toFixed(3)}</p>
 			</div>
 			<div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[11px] text-muted-foreground">

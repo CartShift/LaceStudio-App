@@ -7,9 +7,11 @@ export type InstagramAccountContext = {
 };
 
 export type InstagramMediaInput = {
-  imageUrl: string;
+  imageUrl?: string;
+  videoUrl?: string;
   caption: string;
   postType: "feed" | "story" | "reel";
+  shareToFeed?: boolean;
 };
 
 export type InstagramPublishInput = {
@@ -23,10 +25,17 @@ export type InstagramInsightsInput = {
 export type InstagramInsights = {
   impressions: number;
   reach: number;
+  views: number;
   likes_count: number;
   comments_count: number;
   saves_count: number;
   shares_count: number;
+  replies_count: number;
+  avg_watch_time_ms: number | null;
+  total_watch_time_ms: number | null;
+  profile_visits_count: number;
+  follows_count: number;
+  raw_metrics?: Record<string, number | null>;
 };
 
 export type InstagramProvider = {

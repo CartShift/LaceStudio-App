@@ -23,8 +23,10 @@ import { StepSocialStrategy } from "@/components/models/step-social-strategy";
 import { apiFormRequest, apiRequest } from "@/lib/client-api";
 import { humanizeStatusLabel } from "@/lib/status-labels";
 import { clampInt, sleep } from "@/lib/utils";
+import { getPhotoImportAnalysisIssue } from "@/components/models/photo-import-analysis";
 import {
 	type CharacterDesignDraft,
+	type ModelPhotoImportSnapshot,
 	type PersonalityDraft,
 	type SocialTracksDraft,
 	createDefaultCharacterDraft,
@@ -121,8 +123,8 @@ export default function ModelDetailPage() {
 		() => ({ openai: "gpt-image-1", nano_banana_2: "gemini-3.1-flash-image-preview", zai_glm: "glm-image", gpu: "sdxl-1.0" }),
 		[]
 	);
-	const [canonicalProvider, setCanonicalProvider] = useState<CanonicalProvider>("zai_glm");
-	const [canonicalModelId, setCanonicalModelId] = useState(canonicalProviderModelDefaults.zai_glm);
+	const [canonicalProvider, setCanonicalProvider] = useState<CanonicalProvider>("nano_banana_2");
+	const [canonicalModelId, setCanonicalModelId] = useState(canonicalProviderModelDefaults.nano_banana_2);
 	const [canonicalCandidatesPerShot, setCanonicalCandidatesPerShot] = useState("1");
 	const [canonicalSummary, setCanonicalSummary] = useState<CanonicalPackSummary | null>(null);
 	const [selectedCanonicalByShot, setSelectedCanonicalByShot] = useState<Record<string, string>>({});
@@ -132,6 +134,7 @@ export default function ModelDetailPage() {
 	const [approvingCanonical, setApprovingCanonical] = useState(false);
 	const [canonicalBusy, setCanonicalBusy] = useState(false);
 	const [canonicalInfo, setCanonicalInfo] = useState<string | null>(null);
+	const [photoImportSnapshot, setPhotoImportSnapshot] = useState<ModelPhotoImportSnapshot | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [saving, setSaving] = useState(false);
 
@@ -449,6 +452,19 @@ export default function ModelDetailPage() {
 	}
 
 	async function generateCanonicalReferences(input: { mode: "front_only" | "remaining" | "full"; packVersion?: number }) {
+		const photoImportIssue = getPhotoImportAnalysisIssue(photoImportSnapshot);
+		const frontGenerationBlockReason =
+			photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING"
+				? "Wait for photo analysis to finish before generating."
+				: photoImportIssue?.blocking
+					? photoImportIssue.description
+					: null;
+		if (input.mode === "front_only" && frontGenerationBlockReason) {
+			setError(frontGenerationBlockReason);
+			setCanonicalInfo(null);
+			return;
+		}
+
 		setGeneratingCanonical(true);
 		setCanonicalBusy(true);
 		setError(null);
@@ -697,6 +713,13 @@ export default function ModelDetailPage() {
 		return candidateId.length > 0;
 	}, [canonicalSummary, frontShot, frontShotApproved, selectedCanonicalByShot]);
 	const hasRemainingCandidates = useMemo(() => Boolean(canonicalSummary?.shots.some(shot => shot.shot_code !== FRONT_SHOT_CODE && shot.candidates.length > 0)), [canonicalSummary]);
+	const photoImportIssue = useMemo(() => getPhotoImportAnalysisIssue(photoImportSnapshot), [photoImportSnapshot]);
+	const frontGenerationBlockReason = useMemo(() => {
+		if (photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING") {
+			return "Wait for photo analysis to finish before generating.";
+		}
+		return photoImportIssue?.blocking ? photoImportIssue.description : null;
+	}, [photoImportIssue, photoImportSnapshot?.status]);
 
 	const canonicalProgress = useMemo(() => {
 		if (!canonicalSummary) return null;
@@ -993,6 +1016,7 @@ export default function ModelDetailPage() {
 						<ModelPhotoImporter
 							modelId={modelId}
 							onApplied={handlePhotoImportApplied}
+							onSnapshotChange={setPhotoImportSnapshot}
 							embedded
 							canonicalSettings={{
 								provider: canonicalProvider,
@@ -1004,6 +1028,18 @@ export default function ModelDetailPage() {
 							}}
 						/>
 					</div>
+				) : null}
+
+				{frontGenerationBlockReason || photoImportIssue ? (
+					<StateBlock
+						tone={photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING" ? "neutral" : photoImportIssue?.tone === "danger" ? "warning" : "neutral"}
+						title={
+							photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING"
+								? "Photo analysis is still running"
+								: photoImportIssue?.title ?? "Photo analysis needs attention"
+						}
+						description={frontGenerationBlockReason ?? photoImportIssue?.description ?? "Review the imported photos before generating."}
+					/>
 				) : null}
 
 				<div className="mb-3 grid gap-3 md:grid-cols-4 items-end rounded-xl border border-border bg-card/55 p-3">
@@ -1022,7 +1058,7 @@ export default function ModelDetailPage() {
 						<Input value={canonicalCandidatesPerShot} onChange={event => setCanonicalCandidatesPerShot(event.target.value)} inputMode="numeric" />
 					</FormField>
 					<div>
-						<Button className="w-full" type="button" onClick={() => void generateFrontCanonicalReferences()} disabled={canonicalBusy}>
+						<Button className="w-full" type="button" onClick={() => void generateFrontCanonicalReferences()} disabled={canonicalBusy || Boolean(frontGenerationBlockReason)}>
 							{generatingCanonical ? "Generating..." : frontShot?.candidates.length ? "Regenerate Front Look" : "Generate Front Look"}
 						</Button>
 					</div>
@@ -1400,4 +1436,3 @@ function resolveAssetPreviewUri(source: string | null | undefined): string | nul
 	if (normalized.startsWith("http://") || normalized.startsWith("https://")) return normalized;
 	return null;
 }
-

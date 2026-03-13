@@ -137,6 +137,7 @@ function buildPrompt(input: {
 	const lines = [
 		input.basePrompt,
 		"Character consistency lock: preserve the same identity across every output (face geometry, hairline, skin texture, and distinguishing facial details).",
+		"Match the exact same person from the identity references described in context. Do not average faces, beautify away natural features, or alter skull shape, eye spacing, nose structure, lip shape, jaw contour, hairline, skin undertone, or distinctive marks.",
 	];
 
 	if (input.references.length > 0) {

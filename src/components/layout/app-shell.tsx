@@ -257,7 +257,7 @@ export function AppShell({ role, showRoleSwitcher = false, children }: AppShellP
 				</div>
 
 				<div className="grid min-w-0 items-start gap-6 md:grid-cols-[264px_minmax(0,1fr)] xl:gap-7">
-					<aside className="ds-panel relative hidden overflow-hidden rounded-[1.45rem] p-3.5 md:sticky md:top-6 md:flex md:flex-col md:h-[calc(100dvh-3rem)] md:max-h-[calc(100dvh-3rem)] md:self-start">
+					<aside className="ds-panel relative max-md:hidden flex flex-col overflow-hidden rounded-[1.45rem] p-3.5 md:sticky md:top-6 md:h-[calc(100dvh-3rem)] md:max-h-[calc(100dvh-3rem)] md:self-start">
 						<SidebarContent
 							role={role}
 							showRoleSwitcher={showRoleSwitcher}

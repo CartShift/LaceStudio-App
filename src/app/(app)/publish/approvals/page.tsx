@@ -21,7 +21,7 @@ type QueueItem = {
 	status: "PENDING_APPROVAL" | "SCHEDULED" | "PUBLISHING" | "PUBLISHED" | "RETRY" | "FAILED" | "REJECTED" | "CANCELLED";
 	caption: string;
 	post_type: "feed" | "story" | "reel";
-	variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+	variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
 	scheduled_at: string;
 	pillar_key?: string | null;
 	rejection_reason?: string | null;

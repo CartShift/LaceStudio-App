@@ -96,8 +96,8 @@ export function ModelWizard() {
 		}),
 		[]
 	);
-	const [provider, setProvider] = useState<ImageModelProvider>("zai_glm");
-	const [providerModelId, setProviderModelId] = useState(providerModelDefaults.zai_glm);
+	const [provider, setProvider] = useState<ImageModelProvider>("nano_banana_2");
+	const [providerModelId, setProviderModelId] = useState(providerModelDefaults.nano_banana_2);
 	const [candidatesPerShot, setCandidatesPerShot] = useState(1);
 
 	const [creatingModel, setCreatingModel] = useState(false);

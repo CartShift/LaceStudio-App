@@ -17,7 +17,7 @@ const querySchema = z.object({
   end_date: z.coerce.date().optional(),
   page: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().positive().optional(),
-  sort_by: z.enum(["engagement_rate", "reach", "fetched_at"]).optional(),
+  sort_by: z.enum(["views", "engagement_rate", "reach", "fetched_at"]).optional(),
 });
 
 export async function GET(request: Request) {

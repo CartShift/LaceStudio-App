@@ -16,6 +16,7 @@ export async function scoreCanonicalCandidate(input: {
   imageUrl: string;
   shotCode: string;
   shotPrompt: string;
+  referenceImageUrls?: string[];
 }): Promise<CanonicalQaScore> {
   const visionScore = await tryZaiVisionScore(input);
   if (visionScore) return visionScore;
@@ -26,6 +27,7 @@ async function tryZaiVisionScore(input: {
   imageUrl: string;
   shotCode: string;
   shotPrompt: string;
+  referenceImageUrls?: string[];
 }): Promise<CanonicalQaScore | null> {
   let env: ReturnType<typeof getEnv>;
   try {
@@ -40,6 +42,7 @@ async function tryZaiVisionScore(input: {
 
   try {
     const endpoint = `${env.ZAI_API_BASE_URL.trim().replace(/\/$/, "")}/chat/completions`;
+    const comparisonMode = (input.referenceImageUrls?.length ?? 0) > 0;
     const response = await fetchWithTimeout(
       endpoint,
       {
@@ -57,9 +60,14 @@ async function tryZaiVisionScore(input: {
                 {
                   type: "text",
                   text: [
-                    "Score this studio reference image from 0 to 1 for realism, facial clarity, and identity consistency.",
+                    comparisonMode
+                      ? "The first image is a generated studio candidate. The remaining images are identity references of the same person."
+                      : "Score this studio reference image from 0 to 1 for realism, facial clarity, and identity consistency.",
                     `Shot code: ${input.shotCode}.`,
                     `Expected shot: ${input.shotPrompt}`,
+                    comparisonMode
+                      ? "Score identity consistency by comparing the candidate against the attached identity references. Identity consistency should dominate the overall score."
+                      : "Score identity consistency from the single candidate image alone.",
                     "Return strict JSON with keys realism_score, clarity_score, consistency_score, qa_notes.",
                   ].join("\n"),
                 },
@@ -69,6 +77,12 @@ async function tryZaiVisionScore(input: {
                     url: input.imageUrl,
                   },
                 },
+                ...(input.referenceImageUrls ?? []).slice(0, 4).map(url => ({
+                  type: "image_url" as const,
+                  image_url: {
+                    url,
+                  },
+                })),
               ],
             },
           ],
@@ -117,9 +131,10 @@ function heuristicScore(input: {
   imageUrl: string;
   shotCode: string;
   shotPrompt: string;
+  referenceImageUrls?: string[];
 }): CanonicalQaScore {
   const hash = createHash("sha256")
-    .update(`${input.imageUrl}|${input.shotCode}|${input.shotPrompt}`)
+    .update(`${input.imageUrl}|${input.shotCode}|${input.shotPrompt}|${(input.referenceImageUrls ?? []).slice(0, 4).join("|")}`)
     .digest();
 
   const realism_score = normalizeHash(hash[0] ?? 0, 0.74, 0.96);
@@ -138,7 +153,7 @@ function heuristicScore(input: {
 }
 
 function computeComposite(realism: number, clarity: number, consistency: number): number {
-  return clamp01(Number((realism * 0.45 + clarity * 0.3 + consistency * 0.25).toFixed(4)));
+  return clamp01(Number((realism * 0.25 + clarity * 0.2 + consistency * 0.55).toFixed(4)));
 }
 
 function normalizeHash(value: number, min: number, max: number): number {

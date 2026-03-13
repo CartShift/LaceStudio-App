@@ -16,6 +16,7 @@ const DEMO_PHOTO_IMPORT_SNAPSHOT = {
 	started_at: null,
 	completed_at: null,
 	error: null,
+	analysis_provider: null,
 	counts: {
 		pending: 0,
 		accepted: 0,

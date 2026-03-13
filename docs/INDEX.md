@@ -15,6 +15,7 @@
 - `CODE_REVIEW.md`: Broad architecture/code-quality review notes.
 - `PROJECT_ORGANIZATION.md`: Repository layout and organization conventions.
 - `instagram-publishing-2.0.md`: Profile-centric Instagram publishing architecture, setup, flow, and limitations.
+- `instagram-optimization-2026.md`: 2026 Instagram strategy findings plus Reel/video-generation, views-first analytics, and auto-queue implementation notes.
 - `gemini-nano-banana-2-docs.md`: Vendor reference notes for Nano Banana.
 - `gemini-veo-docs.md`: Vendor reference notes for Veo.
 

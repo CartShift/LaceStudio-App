@@ -18,6 +18,7 @@ const contentSecurityPolicy = [
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  serverExternalPackages: ["@prisma/client", "prisma"],
   experimental: {
     optimizePackageImports: ["lucide-react", "date-fns"],
     // Allow larger multipart uploads to route handlers (photo import).

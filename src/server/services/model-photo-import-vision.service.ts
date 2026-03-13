@@ -76,6 +76,9 @@ const ZAI_TIMEOUT_MS = 60_000;
 const GEMINI_TIMEOUT_MS = 90_000;
 const MAX_GEMINI_REFERENCE_BYTES = 4 * 1024 * 1024;
 const ALLOWED_REFERENCE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const PHOTO_REVIEW_VIEW_ANGLES = ["frontal", "left_45", "right_45", "left_profile", "right_profile", "unknown"] as const;
+const PHOTO_REVIEW_FRAMINGS = ["closeup", "head_shoulders", "half_body", "full_body", "unknown"] as const;
+const PHOTO_REVIEW_EXPRESSIONS = ["neutral", "soft_smile", "serious", "other"] as const;
 
 export async function analyzeModelPhotosWithVision(input: {
 	modelName: string;
@@ -313,6 +316,11 @@ function buildImageReviewList(
 	reason?: string;
 	solo_subject?: boolean;
 	face_visible?: boolean;
+	view_angle?: (typeof PHOTO_REVIEW_VIEW_ANGLES)[number];
+	framing?: (typeof PHOTO_REVIEW_FRAMINGS)[number];
+	expression?: (typeof PHOTO_REVIEW_EXPRESSIONS)[number];
+	sharpness_score?: number;
+	identity_anchor_score?: number;
 }> {
 	const parsed = Array.isArray(raw)
 		? raw
@@ -337,6 +345,11 @@ function buildImageReviewList(
 						typeof record.face_visible === "boolean"
 							? record.face_visible
 							: undefined;
+					const view_angle = readOptionalEnum(record.view_angle, PHOTO_REVIEW_VIEW_ANGLES);
+					const framing = readOptionalEnum(record.framing, PHOTO_REVIEW_FRAMINGS);
+					const expression = readOptionalEnum(record.expression, PHOTO_REVIEW_EXPRESSIONS);
+					const sharpness_score = readOptionalScore(record.sharpness_score);
+					const identity_anchor_score = readOptionalScore(record.identity_anchor_score);
 
 					if (!reference_id) return null;
 					return {
@@ -345,6 +358,11 @@ function buildImageReviewList(
 						reason,
 						solo_subject,
 						face_visible,
+						view_angle,
+						framing,
+						expression,
+						sharpness_score,
+						identity_anchor_score,
 					};
 				})
 				.filter((value): value is NonNullable<typeof value> => Boolean(value))
@@ -360,6 +378,11 @@ function buildImageReviewList(
 				accepted: true,
 				solo_subject: true,
 				face_visible: true,
+				view_angle: "unknown",
+				framing: "unknown",
+				expression: "other",
+				sharpness_score: 0.5,
+				identity_anchor_score: 0.5,
 			};
 		}
 
@@ -377,6 +400,11 @@ function buildImageReviewList(
 					: existing.reason ?? "Rejected: non-solo subject or face visibility is insufficient.",
 			solo_subject: existing.solo_subject,
 			face_visible: existing.face_visible,
+			view_angle: existing.view_angle ?? "unknown",
+			framing: existing.framing ?? "unknown",
+			expression: existing.expression ?? "other",
+			sharpness_score: existing.sharpness_score ?? 0.5,
+			identity_anchor_score: existing.identity_anchor_score ?? 0.5,
 		};
 	});
 }
@@ -487,6 +515,11 @@ function buildHeuristicSuggestion(
 			accepted: true,
 			solo_subject: true,
 			face_visible: true,
+			view_angle: "unknown",
+			framing: "unknown",
+			expression: "other",
+			sharpness_score: 0.5,
+			identity_anchor_score: 0.5,
 		})),
 	});
 }
@@ -528,7 +561,13 @@ function buildVisionPrompt(input: {
 		"Close-up headshots and tightly cropped portraits of one person are valid and should be accepted.",
 		"Do not reject for styling, makeup, hats, sunglasses, side profile, partial crop, or expression if one face is clearly visible.",
 		"image_reviews must include one entry per uploaded image with keys:",
-		"reference_id, accepted, reason, solo_subject, face_visible",
+		"reference_id, accepted, reason, solo_subject, face_visible, view_angle, framing, expression, sharpness_score, identity_anchor_score",
+		"view_angle must be one of: frontal, left_45, right_45, left_profile, right_profile, unknown.",
+		"framing must be one of: closeup, head_shoulders, half_body, full_body, unknown.",
+		"expression must be one of: neutral, soft_smile, serious, other.",
+		"sharpness_score must be 0..1 and reflect facial sharpness/detail quality.",
+		"identity_anchor_score must be 0..1 and reflect how useful the image is for preserving the exact same identity across generations.",
+		"Prefer high identity_anchor_score for sharp, unobstructed images where the face shape, eyes, nose, lips, jawline, hairline, skin tone, and distinctive marks are clearly visible.",
 		`Uploaded reference ids in order: ${input.references.map(item => item.reference_id).join(", ")}`,
 	].join("\n");
 }
@@ -548,6 +587,7 @@ function buildGeminiPrompt(input: {
 		modelDataJson,
 		"Face policy: reject image when not exactly one person or face visibility is poor.",
 		"Close-up portraits of one person are valid; do not reject just because framing is tight or stylized.",
+		"Each image_reviews item must also include view_angle, framing, expression, sharpness_score, identity_anchor_score.",
 		`Reference IDs: ${input.references.map(item => item.reference_id).join(", ")}`,
 	].join("\n");
 }
@@ -630,6 +670,19 @@ function asNumber(value: unknown, fallback: number): number {
 
 function clamp01(value: number): number {
 	return Math.max(0, Math.min(1, Number(value.toFixed(4))));
+}
+
+function readOptionalEnum<const T extends readonly string[]>(value: unknown, allowed: T): T[number] | undefined {
+	return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T[number]) : undefined;
+}
+
+function readOptionalScore(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return clamp01(value);
+	if (typeof value === "string") {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) return clamp01(parsed);
+	}
+	return undefined;
 }
 
 function buildGeminiEndpoint(baseUrl: string, model: string): string {

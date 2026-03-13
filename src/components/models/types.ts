@@ -89,10 +89,22 @@ export type CanonicalCandidate = {
 export type CanonicalPackSummary = {
   pack_version: number;
   status: "NOT_STARTED" | "GENERATING" | "READY" | "APPROVED" | "FAILED";
+  error?: string | null;
   progress?: {
     completed_shots: number;
     total_shots: number;
     generated_candidates: number;
+  };
+  generation?: {
+    mode?: "front_only" | "remaining" | "full";
+    provider?: "openai" | "nano_banana_2" | "zai_glm" | "gpu";
+    provider_model_id?: string;
+    started_at?: string;
+    heartbeat_at?: string;
+    failed_shots?: number;
+    shot_codes?: string[];
+    current_shot_code?: string;
+    current_shot_started_at?: string;
   };
   shots: Array<{
     shot_code: string;
@@ -119,6 +131,11 @@ export type ModelPhotoImportSuggestion = {
     reason?: string;
     solo_subject?: boolean;
     face_visible?: boolean;
+    view_angle?: "frontal" | "left_45" | "right_45" | "left_profile" | "right_profile" | "unknown";
+    framing?: "closeup" | "head_shoulders" | "half_body" | "full_body" | "unknown";
+    expression?: "neutral" | "soft_smile" | "serious" | "other";
+    sharpness_score?: number;
+    identity_anchor_score?: number;
   }>;
 };
 
@@ -141,6 +158,7 @@ export type ModelPhotoImportSnapshot = {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+  analysis_provider: "zai_vision" | "gemini_fallback" | "heuristic" | null;
   counts: {
     pending: number;
     accepted: number;

@@ -22,7 +22,7 @@ const SUPPORTED_PHOTO_IMPORT_MIME_TYPES = new Set(["image/jpeg", "image/png", "i
 const DEFAULT_PHOTO_IMPORT_OPTIONS = {
 	keep_as_references: true,
 	auto_generate_on_apply: false,
-	canonical_provider: "zai_glm" as const,
+	canonical_provider: "nano_banana_2" as const,
 	canonical_candidates_per_shot: 1
 };
 
@@ -61,6 +61,7 @@ export type ModelPhotoImportSnapshot = {
 	started_at: string | null;
 	completed_at: string | null;
 	error: string | null;
+	analysis_provider: "zai_vision" | "gemini_fallback" | "heuristic" | null;
 	counts: {
 		pending: number;
 		accepted: number;
@@ -146,6 +147,7 @@ export async function startModelPhotoImport(input: {
 					heartbeat_at: nowIso,
 					completed_at: undefined,
 					error: null,
+					provider: undefined,
 					latest_suggestion: undefined,
 					counts: {
 						pending: 0,
@@ -349,6 +351,7 @@ export async function getModelPhotoImportSnapshot(input: { modelId: string }): P
 		started_at: photoState?.started_at ?? null,
 		completed_at: photoState?.completed_at ?? null,
 		error: photoState?.error ?? null,
+		analysis_provider: photoState?.provider === "zai_vision" || photoState?.provider === "gemini_fallback" || photoState?.provider === "heuristic" ? photoState.provider : null,
 		counts: photoState?.counts ?? computedCounts,
 		options: {
 			keep_as_references: photoState?.keep_as_references ?? DEFAULT_PHOTO_IMPORT_OPTIONS.keep_as_references,
@@ -359,6 +362,91 @@ export async function getModelPhotoImportSnapshot(input: { modelId: string }): P
 		},
 		references: mappedReferences,
 		latest_suggestion: parsedSuggestion.success ? parsedSuggestion.data : null
+	};
+}
+
+export async function reanalyzeModelPhotoImport(input: {
+	modelId: string;
+	initiatedBy: string;
+}): Promise<{ job_id: string; status: "ANALYZING"; counts: { total: number } }> {
+	const sourceReferenceDelegate = getModelSourceReferenceDelegate();
+
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			id: true,
+			onboarding_state: true
+		}
+	});
+
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const photoState = readPhotoImportState(onboardingState);
+	if (!photoState?.job_id) {
+		throw new ApiError(409, "CONFLICT", "Upload photos before reanalyzing identity anchors.");
+	}
+
+	if (isPhotoImportLocked(photoState)) {
+		throw new ApiError(409, "CONFLICT", "Photo analysis is already running for this model.", { job_id: photoState.job_id });
+	}
+
+	const referenceCount = await sourceReferenceDelegate.count({
+		where: {
+			model_id: input.modelId,
+			image_gcs_uri: {
+				contains: `/${photoState.job_id}/`
+			}
+		}
+	});
+
+	if (referenceCount === 0) {
+		throw new ApiError(409, "CONFLICT", "No uploaded photos were found for the current import. Upload photos again and retry.");
+	}
+
+	const nowIso = new Date().toISOString();
+	await updatePhotoImportState({
+		modelId: input.modelId,
+		jobId: photoState.job_id,
+		status: "ANALYZING",
+		heartbeat_at: nowIso,
+		completed_at: undefined,
+		error: null,
+		counts: {
+			pending: referenceCount,
+			accepted: 0,
+			rejected: 0,
+			total: referenceCount
+		}
+	});
+
+	void runPhotoImportAnalysis({
+		modelId: input.modelId,
+		jobId: photoState.job_id,
+		initiatedBy: input.initiatedBy
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "model_photo_import_reanalysis_started",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.initiatedBy,
+		metadata: {
+			job_id: photoState.job_id,
+			photos_uploaded: referenceCount
+		}
+	});
+
+	return {
+		job_id: photoState.job_id,
+		status: "ANALYZING",
+		counts: {
+			total: referenceCount
+		}
 	};
 }
 
@@ -484,7 +572,7 @@ export async function applyModelPhotoImportSuggestion(input: {
 	const shouldStartCanonicalGeneration = input.startCanonicalGeneration === true;
 
 	if (shouldStartCanonicalGeneration) {
-		const provider = input.canonicalProvider ?? photoState.canonical_provider ?? "zai_glm";
+		const provider = input.canonicalProvider ?? photoState.canonical_provider ?? "nano_banana_2";
 		const candidatesPerShot = Math.max(
 			1,
 			Math.min(5, Math.trunc(input.canonicalCandidatesPerShot ?? photoState.canonical_candidates_per_shot ?? DEFAULT_PHOTO_IMPORT_OPTIONS.canonical_candidates_per_shot))
@@ -803,6 +891,7 @@ function readPhotoImportState(onboardingState: Record<string, unknown>): PhotoIm
 				: undefined,
 		canonical_model_id: typeof raw.canonical_model_id === "string" ? raw.canonical_model_id : undefined,
 		canonical_candidates_per_shot: readPositiveInt(raw.canonical_candidates_per_shot),
+		provider: raw.provider === "zai_vision" || raw.provider === "gemini_fallback" || raw.provider === "heuristic" ? raw.provider : undefined,
 		counts: countsRaw
 			? {
 					pending: readNonNegativeInt(countsRaw.pending) ?? 0,

@@ -16,6 +16,15 @@ type OpenAiImageResponse = {
   data?: OpenAiImageItem[];
 };
 
+type OpenAiErrorResponse = {
+  error?: {
+    message?: string;
+    type?: string;
+    code?: string;
+    param?: string;
+  };
+};
+
 type ResolvedReferenceImage = {
   fileName: string;
   blob: Blob;
@@ -55,6 +64,7 @@ export class OpenAiImageProvider implements ImageProvider {
     let endpoint: "images/generations" | "images/edits" = "images/generations";
     let response: Response;
     let editFallbackStatus: number | undefined;
+    const failedAttempts: OpenAiImageAttempt[] = [];
 
     let inputFidelity: "high" | "none" = "none";
 
@@ -71,35 +81,47 @@ export class OpenAiImageProvider implements ImageProvider {
         inputFidelity: "high",
       });
 
-      if (!response.ok && response.status === 400) {
+      if (!response.ok && shouldRetryEditWithoutFidelity(response.status)) {
         editFallbackStatus = response.status;
-        const retryAsGeneration = await requestOpenAiGeneration({
+        failedAttempts.push(await describeOpenAiAttempt(response.clone(), { endpoint: "images/edits", inputFidelity: "high" }));
+
+        const retryWithoutFidelity = await requestOpenAiEdits({
           apiKey,
           model,
           prompt,
           size,
           batchSize: input.batch_size,
+          references: resolvedReferences,
         });
 
-        if (retryAsGeneration.ok) {
-          response = retryAsGeneration;
-          endpoint = "images/generations";
-        } else {
-          const retryWithoutFidelity = await requestOpenAiEdits({
+        if (retryWithoutFidelity.ok) {
+          response = retryWithoutFidelity;
+          inputFidelity = "none";
+        } else if (shouldRetryAsGeneration(retryWithoutFidelity.status)) {
+          failedAttempts.push(
+            await describeOpenAiAttempt(retryWithoutFidelity.clone(), { endpoint: "images/edits", inputFidelity: "none" }),
+          );
+
+          const retryAsGeneration = await requestOpenAiGeneration({
             apiKey,
             model,
             prompt,
             size,
             batchSize: input.batch_size,
-            references: resolvedReferences,
           });
 
-          if (retryWithoutFidelity.ok) {
-            response = retryWithoutFidelity;
+          if (retryAsGeneration.ok) {
+            response = retryAsGeneration;
+            endpoint = "images/generations";
             inputFidelity = "none";
           } else {
             response = retryAsGeneration;
+            endpoint = "images/generations";
+            inputFidelity = "none";
           }
+        } else {
+          response = retryWithoutFidelity;
+          inputFidelity = "none";
         }
       }
     } else {
@@ -113,8 +135,14 @@ export class OpenAiImageProvider implements ImageProvider {
     }
 
     if (!response.ok) {
-      throw new ApiError(502, "INTERNAL_ERROR", "OpenAI couldn't create images for this request. Please try again.", {
-        status: response.status,
+      throw await toOpenAiImageApiError(response, {
+        endpoint,
+        inputFidelity: endpoint === "images/edits" ? inputFidelity : undefined,
+        attempts: failedAttempts,
+        model,
+        reference_images_attempted: prioritizedReferences.length,
+        reference_images_used: resolvedReferences.length,
+        reference_images_failed: prioritizedReferences.length - resolvedReferences.length,
       });
     }
 
@@ -158,6 +186,17 @@ async function requestOpenAiGeneration(input: {
   size: "1024x1024" | "1536x1024" | "1024x1536";
   batchSize: number;
 }): Promise<Response> {
+  const body: Record<string, string | number> = {
+    model: input.model,
+    prompt: input.prompt,
+    size: input.size,
+    n: input.batchSize,
+    quality: "high",
+  };
+  if (shouldRequestB64Json(input.model)) {
+    body.response_format = "b64_json";
+  }
+
   return requestOpenAiWithRetry({
     maxAttempts: OPENAI_RETRY_MAX_ATTEMPTS,
     timeoutMs: OPENAI_REQUEST_TIMEOUT_MS,
@@ -168,14 +207,7 @@ async function requestOpenAiGeneration(input: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${input.apiKey}`,
         },
-        body: JSON.stringify({
-          model: input.model,
-          prompt: input.prompt,
-          size: input.size,
-          n: input.batchSize,
-          quality: "high",
-          response_format: "b64_json",
-        }),
+        body: JSON.stringify(body),
         signal,
       }),
   });
@@ -199,7 +231,9 @@ async function requestOpenAiEdits(input: {
   if (input.inputFidelity) {
     form.set("input_fidelity", input.inputFidelity);
   }
-  form.set("response_format", "b64_json");
+  if (shouldRequestB64Json(input.model)) {
+    form.set("response_format", "b64_json");
+  }
 
   for (const reference of input.references) {
     form.append("image[]", reference.blob, reference.fileName);
@@ -252,6 +286,7 @@ function buildConsistencyPrompt(input: {
   const lines = [
     input.basePrompt,
     "Character consistency lock: preserve the same identity across every output (face geometry, hairline, skin texture, and distinguishing facial details).",
+    "Match the exact same person from the attached references. Do not average faces, beautify away natural features, or alter skull shape, eye spacing, nose structure, lip shape, jaw contour, hairline, skin undertone, or distinctive marks.",
   ];
 
   if (input.references.length > 0) {
@@ -269,6 +304,7 @@ function buildConsistencyPrompt(input: {
     if (labels.length > 0) {
       lines.push(`Reference set: ${labels.join(" | ")}`);
     }
+    lines.push("If reference images vary in lighting or expression, preserve the invariant identity traits that remain consistent across the set.");
 
     if (input.failedCount > 0) {
       lines.push(
@@ -398,6 +434,133 @@ function mimeTypeToExtension(mimeType: string): string {
   if (mimeType === "image/jpeg") return "jpg";
   if (mimeType === "image/webp") return "webp";
   return "png";
+}
+
+type OpenAiImageAttempt = {
+  endpoint: "images/generations" | "images/edits";
+  status: number;
+  input_fidelity?: "high" | "none";
+  message?: string;
+  request_id?: string;
+  error_code?: string;
+  error_type?: string;
+  error_param?: string;
+};
+
+function shouldRequestB64Json(model: string): boolean {
+  return !isGptImageModel(model);
+}
+
+function isGptImageModel(model: string): boolean {
+  return model.startsWith("gpt-image-");
+}
+
+function shouldRetryEditWithoutFidelity(status: number): boolean {
+  return status === 400 || status === 404 || status === 415 || status === 422;
+}
+
+function shouldRetryAsGeneration(status: number): boolean {
+  return shouldRetryEditWithoutFidelity(status);
+}
+
+async function toOpenAiImageApiError(
+  response: Response,
+  metadata: {
+    endpoint: "images/generations" | "images/edits";
+    inputFidelity?: "high" | "none";
+    attempts: OpenAiImageAttempt[];
+    model: string;
+    reference_images_attempted: number;
+    reference_images_used: number;
+    reference_images_failed: number;
+  },
+): Promise<ApiError> {
+  const finalAttempt = await describeOpenAiAttempt(response, {
+    endpoint: metadata.endpoint,
+    inputFidelity: metadata.inputFidelity,
+  });
+  const attempts = [...metadata.attempts, finalAttempt];
+  const bestMessage = attempts.map((attempt) => attempt.message).find(Boolean);
+
+  return new ApiError(
+    502,
+    "INTERNAL_ERROR",
+    bestMessage
+      ? `OpenAI image request failed: ${bestMessage}`
+      : `OpenAI image request failed with status ${response.status}.`,
+    {
+      provider: "openai",
+      model: metadata.model,
+      endpoint: metadata.endpoint,
+      input_fidelity: metadata.inputFidelity,
+      reference_images_attempted: metadata.reference_images_attempted,
+      reference_images_used: metadata.reference_images_used,
+      reference_images_failed: metadata.reference_images_failed,
+      status: response.status,
+      request_id: finalAttempt.request_id,
+      attempts,
+    },
+  );
+}
+
+async function describeOpenAiAttempt(
+  response: Response,
+  input: {
+    endpoint: "images/generations" | "images/edits";
+    inputFidelity?: "high" | "none";
+  },
+): Promise<OpenAiImageAttempt> {
+  const requestId = response.headers.get("x-request-id") ?? undefined;
+  const rawBody = await safeReadResponseText(response);
+  const payload = parseOpenAiErrorResponse(rawBody);
+  const message = normalizeOpenAiErrorMessage(payload, rawBody);
+
+  return {
+    endpoint: input.endpoint,
+    status: response.status,
+    input_fidelity: input.inputFidelity,
+    message,
+    request_id: requestId,
+    error_code: payload?.error?.code,
+    error_type: payload?.error?.type,
+    error_param: payload?.error?.param,
+  };
+}
+
+async function safeReadResponseText(response: Response): Promise<string | undefined> {
+  try {
+    const body = await response.text();
+    return body.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseOpenAiErrorResponse(body: string | undefined): OpenAiErrorResponse | undefined {
+  if (!body) return undefined;
+
+  try {
+    return JSON.parse(body) as OpenAiErrorResponse;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeOpenAiErrorMessage(
+  payload: OpenAiErrorResponse | undefined,
+  rawBody: string | undefined,
+): string | undefined {
+  const message = payload?.error?.message?.trim();
+  if (message) {
+    return message;
+  }
+
+  if (!rawBody) {
+    return undefined;
+  }
+
+  const flattened = rawBody.replace(/\s+/g, " ").trim();
+  return flattened || undefined;
 }
 
 async function requestOpenAiWithRetry(input: {

@@ -388,7 +388,7 @@ export class NanoBananaImageProvider implements ImageProvider {
 
 		const image = extractGeminiImage(payload);
 		if (!image) {
-			const errorDetail = payload.error?.message ?? "The response did not include an image.";
+			const errorDetail = payload.error?.message ?? extractGeminiText(payload) ?? "The response did not include an image.";
 			throw new ApiError(502, "INTERNAL_ERROR", `Nano Banana 2 could not create an image: ${errorDetail}`);
 		}
 
@@ -539,8 +539,21 @@ function extractGeminiImage(payload: GeminiGenerateContentResponse): { mimeType:
 		if (!data) continue;
 
 		const mimeType = normalizeMimeType(inlineData?.mimeType ?? inlineData?.mime_type ?? "image/png");
-		if (ALLOWED_REFERENCE_MIME_TYPES.has(mimeType) || mimeType === "image/png") {
+		if (mimeType.startsWith("image/")) {
 			return { mimeType, data };
+		}
+	}
+
+	return null;
+}
+
+function extractGeminiText(payload: GeminiGenerateContentResponse): string | null {
+	for (const candidate of payload.candidates ?? []) {
+		for (const part of candidate.content?.parts ?? []) {
+			const text = part.text?.trim();
+			if (text) {
+				return text;
+			}
 		}
 	}
 
@@ -568,6 +581,9 @@ function buildGeminiPrompt(input: {
 	lines.push(
 		"Character consistency lock: preserve exact identity across all outputs — face geometry, skin tone, skin texture, hairline, eye color, and key facial details must remain identical. " +
 			"Maintain body proportions and posture signature."
+	);
+	lines.push(
+		"Match the exact same person from the attached identity references. Do not average faces, reinterpret features, beautify away distinguishing traits, or change skull shape, eye spacing, nose structure, lip shape, jaw contour, hairline, skin undertone, or natural marks."
 	);
 
 	// Creative controls → structured prompt enrichment
@@ -645,6 +661,7 @@ function buildGeminiPrompt(input: {
 				"Use them for identity consistency, styling, and compositional guidance. " +
 				"The first reference marked as primary should be the strongest influence."
 		);
+		lines.push("When reference images disagree because of lighting, makeup, or expression, preserve the invariant identity traits shared across them.");
 	}
 
 	if (input.failedReferenceCount > 0) {

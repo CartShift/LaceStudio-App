@@ -61,7 +61,11 @@ export async function publishDuePosts(now = new Date()): Promise<number> {
       ],
     },
     include: {
-      asset: true,
+      asset: {
+        include: {
+          variants: true,
+        },
+      },
       profile: true,
     },
     orderBy: [{ scheduled_at: "asc" }, { created_at: "asc" }],
@@ -139,14 +143,15 @@ export async function publishDuePosts(now = new Date()): Promise<number> {
     try {
       await refreshPublishingLease(item.id);
 
-      const imageUrl = await resolveImageUrlForPublishing(
-        item.asset.approved_gcs_uri ?? item.asset.raw_gcs_uri,
-        env.INSTAGRAM_PROVIDER_MODE === "live",
-      );
+      const mediaUrl = await resolvePublishingMediaUrl({
+        asset: item.asset,
+        variantType: item.variant_type,
+        shouldSignGsUrls: env.INSTAGRAM_PROVIDER_MODE === "live",
+      });
 
       if (!containerId) {
         currentRequestPayload = {
-          image_url: imageUrl,
+          media_url: mediaUrl,
           caption: item.caption,
           post_type: item.post_type,
         };
@@ -158,9 +163,11 @@ export async function publishDuePosts(now = new Date()): Promise<number> {
         }
 
         const media = await provider.createMedia(account, {
-          imageUrl,
+          imageUrl: item.post_type === "reel" ? undefined : mediaUrl,
+          videoUrl: item.post_type === "reel" ? mediaUrl : undefined,
           caption: item.caption,
           postType: item.post_type,
+          shareToFeed: item.post_type === "reel",
         });
         createdContainerId = media.containerId;
         containerId = media.containerId;
@@ -352,6 +359,22 @@ async function resolveImageUrlForPublishing(assetUri: string, shouldSignGsUrls: 
   }
 
   throw new ApiError(400, "VALIDATION_ERROR", "This asset URL format is not supported for Instagram publishing.");
+}
+
+async function resolvePublishingMediaUrl(input: {
+  asset: {
+    approved_gcs_uri: string | null;
+    raw_gcs_uri: string;
+    variants: Array<{
+      format_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
+      gcs_uri: string;
+    }>;
+  };
+  variantType: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
+  shouldSignGsUrls: boolean;
+}) {
+  const matchedVariant = input.asset.variants.find((variant) => variant.format_type === input.variantType);
+  return resolveImageUrlForPublishing(matchedVariant?.gcs_uri ?? input.asset.approved_gcs_uri ?? input.asset.raw_gcs_uri, input.shouldSignGsUrls);
 }
 
 async function createPublishingLog(input: {

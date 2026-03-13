@@ -1,5 +1,6 @@
 import { ApiError } from "@/lib/http";
 import { prisma } from "@/lib/prisma";
+import { toInputJson } from "@/lib/prisma-json";
 import { getInstagramProvider } from "@/server/providers";
 import {
   bootstrapInstagramPublishingState,
@@ -44,7 +45,7 @@ export async function ingestAnalyticsSnapshots(now = new Date()): Promise<number
 
       const metrics = await provider.fetchInsights(account, { mediaId: post.ig_media_id });
       const engagementTotal =
-        metrics.likes_count + metrics.comments_count + metrics.saves_count + metrics.shares_count;
+        metrics.likes_count + metrics.comments_count + metrics.saves_count + metrics.shares_count + metrics.replies_count;
       const engagementRate = metrics.reach > 0 ? (engagementTotal / metrics.reach) * 100 : 0;
 
       await prisma.analyticsSnapshot.create({
@@ -53,12 +54,19 @@ export async function ingestAnalyticsSnapshots(now = new Date()): Promise<number
           ig_media_id: post.ig_media_id,
           impressions: metrics.impressions,
           reach: metrics.reach,
+          views: metrics.views,
           likes_count: metrics.likes_count,
           comments_count: metrics.comments_count,
           saves_count: metrics.saves_count,
           shares_count: metrics.shares_count,
+          replies_count: metrics.replies_count,
+          avg_watch_time_ms: metrics.avg_watch_time_ms,
+          total_watch_time_ms: metrics.total_watch_time_ms,
+          profile_visits_count: metrics.profile_visits_count,
+          follows_count: metrics.follows_count,
           engagement_total: engagementTotal,
           engagement_rate: engagementRate,
+          raw_metrics: toInputJson(metrics.raw_metrics ?? {}),
         },
       });
 

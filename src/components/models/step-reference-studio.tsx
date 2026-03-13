@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
+import { ImagePlus, ScanFace, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -116,6 +117,12 @@ export function StepReferenceStudio({
   const hasFrontCandidates = (frontShot?.candidates.length ?? 0) > 0;
   const frontApproved = (frontShot?.candidates ?? []).some((candidate) => candidate.status === "SELECTED");
   const selectedFrontCandidateId = selectedByShot[FRONT_SHOT_CODE] ?? frontShot?.recommended_candidate_id ?? "";
+  const selectedFrontCandidate =
+    (frontShot?.candidates ?? []).find((candidate) => candidate.status === "SELECTED") ??
+    (frontShot?.candidates ?? []).find((candidate) => candidate.id === selectedFrontCandidateId) ??
+    (frontShot?.candidates ?? []).find((candidate) => candidate.id === frontShot?.recommended_candidate_id) ??
+    null;
+  const selectedFrontPreview = selectedFrontCandidate ? resolveCandidatePreviewUri(selectedFrontCandidate) : null;
   const hasRemainingCandidates = (summary?.shots ?? []).some(
     (shot) => shot.shot_code !== FRONT_SHOT_CODE && shot.candidates.length > 0,
   );
@@ -140,64 +147,136 @@ export function StepReferenceStudio({
         <div>
           <h2 className="font-display text-2xl">Reference Studio</h2>
           <p className="text-sm text-muted-foreground">
-            Create and choose the best looks for your 8-angle Reference Set.
+            Lock the front identity first, then expand it into the full 8-angle set.
           </p>
         </div>
         <Badge tone={toneForPackStatus(canonicalPackStatus)}>{humanizeStatusLabel(canonicalPackStatus)}</Badge>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-3">
-        <div>
-          <p className="mb-1 text-xs font-subheader">Image Engine</p>
-          <SelectField
-            value={provider}
-            onChange={(event) => onProviderChange(event.target.value as ImageModelProvider)}
-            disabled={generating}
-          >
-            <option value="openai">OpenAI</option>
-            <option value="nano_banana_2">Nano Banana 2</option>
-            <option value="zai_glm">Z.AI GLM</option>
-            <option value="gpu">GPU</option>
-          </SelectField>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(18rem,0.85fr)]">
+        <div className="space-y-4">
+          <div className="grid gap-2.5 md:grid-cols-3">
+            <StudioStage
+              icon={<ImagePlus className="size-4" />}
+              label="Front Look"
+              description={hasFrontCandidates ? `${frontShot?.candidates.length ?? 0} option(s) ready` : "Create the best frontal identity match first."}
+              tone={hasFrontCandidates ? "success" : generating ? "warning" : "neutral"}
+            />
+            <StudioStage
+              icon={<ScanFace className="size-4" />}
+              label="Approve Anchor"
+              description={frontApproved ? "Front anchor approved and locked." : hasFrontCandidates ? "Choose the front image that looks most like you." : "Waiting for front options."}
+              tone={frontApproved ? "success" : hasFrontCandidates ? "warning" : "neutral"}
+            />
+            <StudioStage
+              icon={<Sparkles className="size-4" />}
+              label="Expand Set"
+              description={hasRemainingCandidates ? "Remaining angles are available to review." : frontApproved ? "Generate the remaining 7 angles from the approved anchor." : "Unlocks after front approval."}
+              tone={hasRemainingCandidates ? "success" : frontApproved ? "warning" : "neutral"}
+            />
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            <div>
+              <p className="mb-1 text-xs font-subheader">Image Engine</p>
+              <SelectField
+                value={provider}
+                onChange={(event) => onProviderChange(event.target.value as ImageModelProvider)}
+                disabled={generating}
+              >
+                <option value="openai">OpenAI</option>
+                <option value="nano_banana_2">Nano Banana 2</option>
+                <option value="zai_glm">Z.AI GLM</option>
+                <option value="gpu">GPU</option>
+              </SelectField>
+            </div>
+            <div>
+              <p className="mb-1 text-xs font-subheader">Engine Version</p>
+              <Input value={providerModelId} onChange={(event) => onProviderModelIdChange(event.target.value)} />
+            </div>
+            <div>
+              <p className="mb-1 text-xs font-subheader">Options per Angle</p>
+              <Input
+                type="number"
+                min={1}
+                max={5}
+                value={String(candidatesPerShot)}
+                onChange={(event) => onCandidatesPerShotChange(Number(event.target.value || 1))}
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" onClick={() => void onGenerateFront()} disabled={generating}>
+              {generating ? "Generating..." : frontButtonLabel}
+            </Button>
+            {hasFrontCandidates && !frontApproved ? (
+              <Button type="button" variant="secondary" onClick={() => void onApproveFront()} disabled={!canApproveFront}>
+                {approvingFront ? "Approving Front..." : "Approve Front Look"}
+              </Button>
+            ) : null}
+            {frontApproved && summary?.status === "READY" ? (
+              <Button type="button" variant="secondary" onClick={() => void onGenerateRemaining()} disabled={!canGenerateRemaining}>
+                {generating ? "Generating..." : hasRemainingCandidates ? "Regenerate Remaining Looks" : "Generate Remaining Looks"}
+              </Button>
+            ) : null}
+          </div>
         </div>
-        <div>
-          <p className="mb-1 text-xs font-subheader">Engine Version</p>
-          <Input value={providerModelId} onChange={(event) => onProviderModelIdChange(event.target.value)} />
-        </div>
-        <div>
-          <p className="mb-1 text-xs font-subheader">Options per Angle</p>
-          <Input
-            type="number"
-            min={1}
-            max={5}
-            value={String(candidatesPerShot)}
-            onChange={(event) => onCandidatesPerShotChange(Number(event.target.value || 1))}
-          />
+
+        <div className="rounded-[1.55rem] border border-border/70 bg-[linear-gradient(150deg,color-mix(in_oklab,var(--card),white_18%),color-mix(in_oklab,var(--accent),transparent_72%))] p-4 shadow-[var(--shadow-soft)]">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Current Anchor</p>
+              <p className="mt-1 font-display text-2xl leading-none">{frontApproved ? "Locked" : hasFrontCandidates ? "Awaiting approval" : "Not generated"}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {frontApproved
+                  ? "The approved front look will be reused as the identity anchor for the remaining angles."
+                  : hasFrontCandidates
+                    ? "Pick the front option that matches your exact face best, not the prettiest one."
+                    : "Generate the front look first so the system has a clean identity anchor."}
+              </p>
+            </div>
+            <Badge tone={frontApproved ? "success" : hasFrontCandidates ? "warning" : "neutral"}>
+              {frontApproved ? "Anchor set" : hasFrontCandidates ? "Review first" : "Step 1"}
+            </Badge>
+          </div>
+
+          {selectedFrontCandidate && selectedFrontPreview ? (
+            <div className="mt-4 rounded-[1.2rem] border border-border/70 bg-background/76 p-3">
+              <SquareImageThumbnail src={selectedFrontPreview} alt="Front anchor preview" containerClassName="rounded-[1rem]" placeholder="Preview unavailable" />
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold">Front option #{selectedFrontCandidate.candidate_index}</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {frontApproved ? "Approved as the reference anchor" : "This is the current selected/recommended front candidate"}
+                  </p>
+                </div>
+                <Badge tone={frontApproved ? "success" : "neutral"}>{Number(selectedFrontCandidate.composite_score ?? 0).toFixed(3)}</Badge>
+              </div>
+            </div>
+          ) : (
+            <div className="mt-4 rounded-[1.2rem] border border-dashed border-border/70 bg-background/55 p-4 text-[11px] text-muted-foreground">
+              No front anchor yet. Start with a frontal close-up and approve the result that best preserves your identity.
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" onClick={() => void onGenerateFront()} disabled={generating}>
-          {generating ? "Generating..." : frontButtonLabel}
-        </Button>
-        {hasFrontCandidates && !frontApproved ? (
-          <Button type="button" variant="secondary" onClick={() => void onApproveFront()} disabled={!canApproveFront}>
-            {approvingFront ? "Approving Front..." : "Approve Front Look"}
-          </Button>
-        ) : null}
-        {frontApproved && summary?.status === "READY" ? (
-          <Button type="button" variant="secondary" onClick={() => void onGenerateRemaining()} disabled={!canGenerateRemaining}>
-            {generating ? "Generating..." : hasRemainingCandidates ? "Regenerate Remaining Looks" : "Generate Remaining Looks"}
-          </Button>
-        ) : null}
-        <p className="text-xs text-muted-foreground">
-          Approve one front look first, then create the remaining angles. This page updates as each look is ready.
-        </p>
-      </div>
+      <StateBlock
+        tone={frontApproved ? "success" : hasFrontCandidates ? "warning" : "neutral"}
+        title={frontApproved ? "Front anchor approved" : hasFrontCandidates ? "Review the front options carefully" : "Front-first workflow"}
+        description={
+          frontApproved
+            ? "You can generate the remaining looks now. The approved front anchor keeps the other angles closer to your actual face."
+            : hasFrontCandidates
+              ? "Identity fidelity matters more than lighting or polish here. Approve the front option with the best facial match, then expand the set."
+              : "Generate the frontal close-up first. That image becomes the anchor for the rest of the reference pack."
+        }
+      />
 
       {summary?.progress ? (
         <div className="rounded-lg border border-border bg-card p-3">
-          <p className="text-xs text-muted-foreground">{`${summary.progress.completed_shots}/${summary.progress.total_shots} angles ready · ${summary.progress.generated_candidates} options`}</p>
+          <p className="text-xs text-muted-foreground">{`${summary.progress.completed_shots}/${summary.progress.total_shots} angles ready · ${summary.progress.generated_candidates} options · ${frontApproved ? "anchor locked" : "anchor pending"}`}</p>
           <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted/60">
             <div
               className="h-full rounded-full bg-[var(--color-primary)] transition-all duration-500"
@@ -262,10 +341,10 @@ export function StepReferenceStudio({
                       />
 
                       <div className="grid gap-1 text-xs">
-                        <p>{`Overall score: ${score.toFixed(3)}`}</p>
+                        <p>{`Composite score: ${score.toFixed(3)}`}</p>
                         <p>{`Natural look: ${Number(candidate.realism_score ?? 0).toFixed(3)}`}</p>
                         <p>{`Sharpness: ${Number(candidate.clarity_score ?? 0).toFixed(3)}`}</p>
-                        <p>{`Style match: ${Number(candidate.consistency_score ?? 0).toFixed(3)}`}</p>
+                        <p>{`Identity match: ${Number(candidate.consistency_score ?? 0).toFixed(3)}`}</p>
                       </div>
                     </button>
                   );
@@ -464,3 +543,31 @@ function resolveCandidatePreviewUri(candidate: { image_gcs_uri: string; preview_
   return null;
 }
 
+function StudioStage({
+  icon,
+  label,
+  description,
+  tone,
+}: {
+  icon: ReactNode;
+  label: string;
+  description: string;
+  tone: "neutral" | "warning" | "success" | "danger";
+}) {
+  return (
+    <div className="rounded-[1.3rem] border border-border/70 bg-card/80 p-3 shadow-[var(--shadow-soft)]">
+      <div className="flex items-center gap-2">
+        <span className="inline-flex size-8 items-center justify-center rounded-full border border-border/70 bg-background/80 text-foreground">
+          {icon}
+        </span>
+        <div>
+          <p className="text-xs font-semibold">{label}</p>
+          <Badge className="mt-1 w-fit" tone={tone}>
+            {tone === "success" ? "Ready" : tone === "warning" ? "Next" : tone === "danger" ? "Check" : "Waiting"}
+          </Badge>
+        </div>
+      </div>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{description}</p>
+    </div>
+  );
+}

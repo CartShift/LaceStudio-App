@@ -49,7 +49,7 @@ export async function withRouteErrorHandling<T extends NextResponse>(request: Ne
 			level: error instanceof ApiError && error.status < 500 ? "warn" : "error",
 			service: "api",
 			action: "route_error",
-			error: error instanceof Error ? error.message : String(error),
+			error: error instanceof Error ? error.stack ?? error.message : String(error),
 			metadata: {
 				method: request.method,
 				path,

@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getCanonicalPackSummary, startCanonicalPackGeneration } from "@/server/services/canonical-pack.service";
+import {
+	buildCanonicalShotProviderOrder,
+	buildAllFailedCanonicalErrorMessage,
+	getCanonicalPackSummary,
+	resolveCanonicalGenerationProviderSelection,
+	startCanonicalPackGeneration
+} from "@/server/services/canonical-pack.service";
 
 const { prismaMock } = vi.hoisted(() => ({
 	prismaMock: {
@@ -226,5 +232,49 @@ describe("canonical-pack.service", () => {
 		).resolves.toMatchObject({
 			pack_version: 1
 		});
+	});
+
+	it("reroutes zai glm canonical generation to nano when identity references are present", () => {
+		expect(
+			resolveCanonicalGenerationProviderSelection({
+				requestedProvider: "zai_glm",
+				requestedModelId: "glm-image",
+				conditioningReferenceCount: 4
+			})
+		).toEqual({
+			provider: "nano_banana_2"
+		});
+	});
+
+	it("preserves the requested provider and model id when the provider supports conditioning", () => {
+		expect(
+			resolveCanonicalGenerationProviderSelection({
+				requestedProvider: "openai",
+				requestedModelId: "gpt-image-1",
+				conditioningReferenceCount: 4
+			})
+		).toEqual({
+			provider: "openai",
+			providerModelId: "gpt-image-1"
+		});
+	});
+
+	it("preserves shot-level failures when every angle fails", () => {
+		expect(
+			buildAllFailedCanonicalErrorMessage({
+				completedShots: 0,
+				totalShots: 1,
+				shotErrors: ["Shot frontal_closeup: provider timeout"]
+			})
+		).toContain("Shot frontal_closeup: provider timeout");
+	});
+
+	it("falls back from nano to openai for reference-conditioned canonical shots", () => {
+		expect(
+			buildCanonicalShotProviderOrder({
+				requestedProvider: "nano_banana_2",
+				referenceCount: 4
+			})
+		).toEqual(["nano_banana_2", "openai"]);
 	});
 });

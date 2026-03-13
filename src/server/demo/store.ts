@@ -178,7 +178,7 @@ type DemoPublishingStatus = "PENDING_APPROVAL" | "SCHEDULED" | "PUBLISHING" | "P
 type DemoPublishingQueue = {
 	id: string;
 	asset_id: string;
-	variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+	variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
 	post_type: "feed" | "story" | "reel";
 	caption: string;
 	hashtag_preset_id: string | null;
@@ -1508,24 +1508,31 @@ export const demoStore = {
 
 		return {
 			kpis: {
+				total_views: 286000,
 				total_reach: 125000,
 				avg_engagement_rate: 4.8,
+				avg_share_rate: 1.7,
+				avg_save_rate: 1.4,
 				total_posts: Math.max(1, published),
 				top_post: {
 					id: "demo-top-post",
+					views: 42800,
 					engagement_rate: 7.2
 				}
 			},
 			model_breakdown: store.models.map(model => ({
 				model_id: model.id,
+				views: 64000,
 				reach: 42000,
 				engagement_rate: 4.6,
+				share_rate: 1.6,
+				save_rate: 1.3,
 				post_count: 5
 			})),
 			trend_data: [
-				{ date: "2026-02-20", engagement_rate: 4.1 },
-				{ date: "2026-02-24", engagement_rate: 4.7 },
-				{ date: "2026-02-28", engagement_rate: 5.2 }
+				{ date: "2026-02-20", views: 38400, engagement_rate: 4.1 },
+				{ date: "2026-02-24", views: 51600, engagement_rate: 4.7 },
+				{ date: "2026-02-28", views: 60200, engagement_rate: 5.2 }
 			]
 		};
 	},
@@ -1537,9 +1544,23 @@ export const demoStore = {
 			.map(item => ({
 				publishing_queue_id: item.id,
 				ig_media_id: item.ig_media_id ?? `demo-${item.id.slice(0, 8)}`,
+				impressions: 12000 + Math.floor(Math.random() * 4000),
 				reach: 10000 + Math.floor(Math.random() * 5000),
+				views: 18000 + Math.floor(Math.random() * 12000),
 				engagement_rate: 3.5 + Math.random() * 2.5,
+				share_rate: 1 + Math.random() * 1.4,
+				save_rate: 0.8 + Math.random() * 1.2,
+				likes_count: 900 + Math.floor(Math.random() * 250),
+				comments_count: 45 + Math.floor(Math.random() * 20),
+				saves_count: 140 + Math.floor(Math.random() * 60),
+				shares_count: 180 + Math.floor(Math.random() * 75),
+				replies_count: item.post_type === "story" ? 12 + Math.floor(Math.random() * 8) : 0,
+				avg_watch_time_ms: item.post_type === "reel" ? 5200 + Math.floor(Math.random() * 1400) : null,
+				post_type: item.post_type,
+				profile_handle: store.models.find(model => model.id === store.campaigns.find(campaign => campaign.id === store.assets.find(a => a.id === item.asset_id)?.campaign_id)?.model_id)?.name ?? "Profile",
 				fetched_at: item.published_at ?? item.updated_at,
+				scheduled_at: item.scheduled_at,
+				published_at: item.published_at ?? item.updated_at,
 				queue: {
 					asset: {
 						campaign: store.campaigns.find(campaign => campaign.id === store.assets.find(a => a.id === item.asset_id)?.campaign_id)
@@ -1772,7 +1793,7 @@ export const demoStore = {
 
 	schedulePost(input: {
 		asset_id: string;
-		variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "master";
+		variant_type: "feed_1x1" | "feed_4x5" | "story_9x16" | "reel_9x16" | "master";
 		post_type: "feed" | "story" | "reel";
 		caption: string;
 		hashtag_preset_id?: string;

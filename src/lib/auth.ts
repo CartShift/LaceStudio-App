@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { cookies, headers } from "next/headers";
-import { UserRole } from "@prisma/client";
+import { Prisma, UserRole } from "@prisma/client";
 import { getEnv } from "@/lib/env";
 import { ApiError } from "@/lib/http";
 import { shouldEnableLocalhostAdminBypass } from "@/lib/localhost-auth";
@@ -26,17 +26,45 @@ const DEMO_SEED_USERS: Record<string, { email: string; display_name: string; rol
 	[DEMO_ROLE_USER_IDS.client]: { email: "client@lacestudio.internal", display_name: "LaceStudio Client", role: UserRole.CLIENT }
 };
 
+function isPrismaUnavailableError(error: unknown): boolean {
+	if (
+		error instanceof Prisma.PrismaClientInitializationError ||
+		error instanceof Prisma.PrismaClientRustPanicError
+	) {
+		return true;
+	}
+
+	if (!(error instanceof Error)) {
+		return false;
+	}
+
+	return (
+		error.message.includes("Error validating datasource `db`") ||
+		error.message.includes("prisma://") ||
+		error.message.includes("prisma+postgres://") ||
+		error.message.includes("Prisma Client could not locate the Query Engine")
+	);
+}
+
 async function ensureSeedUserExists(userId: string): Promise<void> {
 	const seed = DEMO_SEED_USERS[userId];
 	if (!seed) return;
-	const existing = await prisma.user.findUnique({ where: { id: userId } });
-	if (existing) return;
-	const byEmail = await prisma.user.findUnique({ where: { email: seed.email } });
-	if (byEmail) {
-		await prisma.$executeRawUnsafe(`UPDATE users SET id = $1::uuid WHERE email = $2`, userId, seed.email);
-		return;
+	try {
+		const existing = await prisma.user.findUnique({ where: { id: userId } });
+		if (existing) return;
+		const byEmail = await prisma.user.findUnique({ where: { email: seed.email } });
+		if (byEmail) {
+			await prisma.$executeRawUnsafe(`UPDATE users SET id = $1::uuid WHERE email = $2`, userId, seed.email);
+			return;
+		}
+		await prisma.user.create({ data: { id: userId, ...seed } });
+	} catch (error) {
+		if (isPrismaUnavailableError(error)) {
+			console.warn("[AUTH] Skipping demo seed user sync because Prisma is unavailable", error instanceof Error ? error.message : String(error));
+			return;
+		}
+		throw error;
 	}
-	await prisma.user.create({ data: { id: userId, ...seed } });
 }
 
 function parseRole(value: string | null | undefined): AppRole | null {
@@ -230,6 +258,10 @@ export async function getOptionalSessionContext(): Promise<SessionContext | null
 		return await getSessionContext();
 	} catch (error) {
 		if (error instanceof ApiError && (error.status === 401 || error.status === 503)) {
+			return null;
+		}
+		if (isPrismaUnavailableError(error)) {
+			console.warn("[AUTH] Optional session disabled because Prisma is unavailable", error instanceof Error ? error.message : String(error));
 			return null;
 		}
 		throw error;
