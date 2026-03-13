@@ -29,7 +29,7 @@ export function ToggleRow({
         <p className="text-sm font-medium leading-tight">{label}</p>
         {description ? <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p> : null}
       </div>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
+      <Switch aria-label={label} checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
     </div>
   );
 }

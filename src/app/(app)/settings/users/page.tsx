@@ -81,7 +81,7 @@ export default function SettingsUsersPage() {
 			/>
 
 			{loading ? <StateBlock title="Loading users..." /> : null}
-			{error ? <StateBlock tone="error" title="User loading failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="User loading failed" description={error} /> : null}
 
 			<TableShell
 				title="Directory"

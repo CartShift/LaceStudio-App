@@ -191,7 +191,7 @@ export default function AnalyticsPage() {
 			</FilterShell>
 
 			{query.isLoading ? <StateBlock title="Loading analytics…" /> : null}
-			{query.error instanceof Error ? <StateBlock tone="error" title="Couldn't load analytics" description={query.error.message} /> : null}
+			{query.error instanceof Error ? <StateBlock tone="danger" title="Couldn't load analytics" description={query.error.message} /> : null}
 
 			<div className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
 				<EditorialCard>

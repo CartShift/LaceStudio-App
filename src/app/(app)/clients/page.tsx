@@ -171,7 +171,7 @@ export default function ClientsPage() {
 			<PageHeader title="Clients" description="Manage clients and brand profiles." />
 
 			{loading ? <StateBlock title="Loading clients..." /> : null}
-			{error ? <StateBlock tone="error" title="Client operation failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Client operation failed" description={error} /> : null}
 
 			<div className="grid gap-4 lg:grid-cols-2">
 				<FormShell title="Create Client" description="Add a client account.">

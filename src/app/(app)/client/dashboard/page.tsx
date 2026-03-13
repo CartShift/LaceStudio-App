@@ -94,7 +94,7 @@ export default function ClientDashboardPage() {
 			/>
 
 			{loading ? <StateBlock title="Loading client view..." /> : null}
-			{error ? <StateBlock tone="error" title="Client dashboard failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Client dashboard failed" description={error} /> : null}
 
 			<TableShell
 				title="Client Portfolio"

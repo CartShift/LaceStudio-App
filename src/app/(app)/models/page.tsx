@@ -96,7 +96,7 @@ export default function ModelsPage() {
 			</FilterShell>
 
 			{query.isLoading ? <StateBlock title="Loading models…" /> : null}
-			{query.error instanceof Error ? <StateBlock tone="error" title="Couldn't load models" description={query.error.message} /> : null}
+			{query.error instanceof Error ? <StateBlock tone="danger" title="Couldn't load models" description={query.error.message} /> : null}
 
 			<TableShell
 				title="Model Library"

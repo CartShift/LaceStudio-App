@@ -19,7 +19,7 @@ export function PageHeader({ title, description, action }: { title: string; desc
 	const { text } = splitDecoratedTitle(title);
 
 	return (
-		<EditorialCard className="mb-1 rounded-[1.8rem] p-5 md:p-6">
+		<EditorialCard className="mb-1 rounded-4xl p-5 md:p-6">
 			<div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
 				<div className="min-w-0 max-w-3xl space-y-2">
 					<PageBreadcrumbs />

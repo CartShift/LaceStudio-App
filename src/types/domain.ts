@@ -86,6 +86,7 @@ export type CanonicalPackSummary = {
   pack_version: number;
   status: CanonicalPackStatus;
   error?: string | null;
+  error_request_id?: string | null;
   progress?: {
     completed_shots: number;
     total_shots: number;

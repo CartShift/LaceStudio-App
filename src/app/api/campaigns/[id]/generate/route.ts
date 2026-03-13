@@ -1,4 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
+import { buildCampaignVideoPrompt } from "@/lib/campaign-video";
 import { z } from "zod";
 import { assertRole, getSessionContext } from "@/lib/auth";
 import { ApiError, ok } from "@/lib/http";
@@ -17,8 +18,10 @@ import { buildCreativePromptFragments, createDefaultCreativeControls, estimateId
 import { generateDeterministicSeeds } from "@/server/services/prompt-builder";
 import { calculateBudgetUsagePercentage, isBudgetExceeded, isBudgetWarning } from "@/server/services/gpu-budget";
 import { canTransitionCampaign } from "@/server/services/campaign-state";
+import { resolveCampaignVideoSettings, selectCampaignVideoAssetIds } from "@/server/services/campaign-video-plan";
 import { CampaignGenerationValidationError, resolveCampaignGenerationPlan, type CampaignGenerationMode } from "@/server/services/campaign-generation-plan";
 import { createSignedReadUrlForGcsUri } from "@/server/services/storage/gcs-storage";
+import { queueVideoJobsForAssets } from "@/server/services/video-generation.service";
 import { isDemoMode } from "@/server/demo/mode";
 import { demoStore } from "@/server/demo/store";
 
@@ -75,6 +78,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 
 			const controls = mergeCreativeControls(campaign.creative_controls ? creativeControlsSchema.parse(campaign.creative_controls) : createDefaultCreativeControls(), body.creative_controls_override);
 			let promptText = mergePromptWithCreativeControls(body.prompt_text, controls);
+			const videoSettings = resolveCampaignVideoSettings(controls);
 			const plan = resolveGenerationPlanOrThrow({
 				generationMode,
 				isSelectiveRegeneration: selectiveRegeneration,
@@ -109,6 +113,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 				throw new ApiError(400, "VALIDATION_ERROR", "Generation request details are invalid. Please review your input and try again.");
 			}
 
+			const videoGenerationPlanned =
+				selectCampaignVideoAssetIds({
+					videoSettings,
+					generationMode: plan.generationMode,
+					assetIds: ["planned-asset"],
+				}).length > 0;
+
 			return ok(
 				{
 					job_id: generated.job_id,
@@ -116,7 +127,10 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 					generation_mode: plan.generationMode,
 					anchor_asset_id: generated.anchor_asset_id ?? effectiveAnchorAssetId ?? null,
 					budget_warning: false,
-					identity_drift_alert: generated.identity_drift_alert
+					identity_drift_alert: generated.identity_drift_alert,
+					video_generation_planned: videoGenerationPlanned,
+					video_generation_scope: videoSettings.generation_scope,
+					video_generation_duration_seconds: videoSettings.duration_seconds,
 				},
 				202
 			);
@@ -223,6 +237,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 
 		const controls = mergeCreativeControls(campaign.creative_controls ? creativeControlsSchema.parse(campaign.creative_controls) : createDefaultCreativeControls(), body.creative_controls_override);
 		let promptText = mergePromptWithCreativeControls(body.prompt_text, controls);
+		const videoSettings = resolveCampaignVideoSettings(controls);
+		const videoGenerationPlanned =
+			selectCampaignVideoAssetIds({
+				videoSettings,
+				generationMode: plan.generationMode,
+				assetIds: ["planned-asset"],
+			}).length > 0;
 		if (!selectiveRegeneration && plan.generationMode === "batch") {
 			promptText = prependSceneLockPrompt(promptText);
 		}
@@ -378,13 +399,21 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 			reference_images_campaign_anchor: referenceStats.campaign_anchor,
 			reference_images_refinement_base: referenceStats.refinement_base,
 			reference_images_pose: referenceStats.pose,
-			reference_images_aesthetic_lut: referenceStats.aesthetic_lut
+			reference_images_aesthetic_lut: referenceStats.aesthetic_lut,
+			video_generation: {
+				enabled: videoSettings.enabled,
+				generation_scope: videoSettings.generation_scope,
+				duration_seconds: videoSettings.duration_seconds,
+				prompt_text: videoSettings.prompt_text,
+				planned_for_run: videoGenerationPlanned,
+			}
 		};
 
 		const driftScore = estimateIdentityDriftScore(controls);
 		const driftAlert = shouldAlertIdentityDrift(controls, driftScore);
 		const sequenceStart = (campaign.assets[0]?.sequence_number ?? 0) + 1;
 		const completed = response.status === "completed" && response.assets && response.assets.length > 0;
+		let createdAssetIds: string[] = [];
 
 		await prisma.$transaction(async tx => {
 			await tx.campaign.update({
@@ -418,21 +447,25 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 				const assets = response.assets ?? [];
 
 				if (assets.length > 0) {
+					const persistedAssets = assets.map((asset, index) => ({
+						id: randomUUID(),
+						campaign_id: campaign.id,
+						job_id: jobId,
+						status: "PENDING" as const,
+						raw_gcs_uri: asset.uri,
+						seed: asset.seed,
+						width: asset.width,
+						height: asset.height,
+						prompt_text: promptText,
+						generation_time_ms: asset.generation_time_ms,
+						sequence_number: sequenceStart + index,
+						identity_drift_score: driftScore,
+						refinement_index: body.regenerate_asset_id ? 1 : 0
+					}));
+					createdAssetIds = persistedAssets.map(asset => asset.id);
+
 					await tx.asset.createMany({
-						data: assets.map((asset, index) => ({
-							campaign_id: campaign.id,
-							job_id: jobId,
-							status: "PENDING",
-							raw_gcs_uri: asset.uri,
-							seed: asset.seed,
-							width: asset.width,
-							height: asset.height,
-							prompt_text: promptText,
-							generation_time_ms: asset.generation_time_ms,
-							sequence_number: sequenceStart + index,
-							identity_drift_score: driftScore,
-							refinement_index: body.regenerate_asset_id ? 1 : 0
-						}))
+						data: persistedAssets
 					});
 				}
 
@@ -456,6 +489,32 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 			}
 		});
 
+		let queuedVideoJobs = {
+			created: 0,
+			failed: 0,
+			jobIds: [] as string[],
+			errors: [] as string[],
+		};
+		const videoAssetIds = selectCampaignVideoAssetIds({
+			videoSettings,
+			generationMode: plan.generationMode,
+			assetIds: createdAssetIds,
+		});
+
+		if (completed && videoAssetIds.length > 0) {
+			queuedVideoJobs = await queueVideoJobsForAssets({
+				assetIds: videoAssetIds,
+				userId: session.userId,
+				promptText: buildCampaignVideoPrompt({
+					campaignPromptText: promptText,
+					motionPromptText: videoSettings.prompt_text,
+					modelName: campaign.model.name,
+				}),
+				durationSeconds: videoSettings.duration_seconds,
+				allowPendingAssets: true,
+			});
+		}
+
 		return ok(
 			{
 				job_id: response.job_id,
@@ -466,7 +525,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 				budget_warning: warning,
 				identity_drift_alert: driftAlert.alert,
 				identity_drift_score: driftScore,
-				identity_drift_threshold: driftAlert.threshold
+				identity_drift_threshold: driftAlert.threshold,
+				video_generation_planned: videoGenerationPlanned,
+				video_generation_scope: videoSettings.generation_scope,
+				video_generation_duration_seconds: videoSettings.duration_seconds,
+				video_generation_jobs_created: queuedVideoJobs.created,
+				video_generation_jobs_failed: queuedVideoJobs.failed,
+				video_generation_job_ids: queuedVideoJobs.jobIds,
 			},
 			202
 		);

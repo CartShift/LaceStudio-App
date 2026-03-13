@@ -13,7 +13,7 @@ import { FormField } from "@/components/workspace/form-field";
 import { DropZone } from "@/components/campaigns/drop-zone";
 import { apiFormRequest, apiRequest } from "@/lib/client-api";
 import { humanizeStatusLabel } from "@/lib/status-labels";
-import { getPhotoImportAnalysisIssue } from "@/components/models/photo-import-analysis";
+import { getPhotoImportAnalysisIssue, isHeuristicPhotoAnalysis } from "@/components/models/photo-import-analysis";
 import type { CharacterDesignDraft, ModelPhotoImportSnapshot, PersonalityDraft, SocialTracksDraft } from "@/components/models/types";
 import type { ImageModelProvider } from "@/server/schemas/creative";
 
@@ -135,6 +135,7 @@ export function ModelPhotoImporter({
 
 	const previewableReferences = useMemo(() => (snapshot?.references ?? []).filter(reference => Boolean(reference.preview_url)), [snapshot?.references]);
 	const reviewByReferenceId = useMemo(() => new Map((snapshot?.latest_suggestion?.image_reviews ?? []).map(review => [review.reference_id, review])), [snapshot?.latest_suggestion?.image_reviews]);
+	const heuristicAnalysis = useMemo(() => isHeuristicPhotoAnalysis(snapshot), [snapshot]);
 	const reviewedReferences = useMemo<ReviewedReference[]>(
 		() =>
 			(snapshot?.references ?? []).map(reference => ({
@@ -143,17 +144,20 @@ export function ModelPhotoImporter({
 			})),
 		[snapshot?.references, reviewByReferenceId]
 	);
+	const hasStructuredReviews = !heuristicAnalysis && (snapshot?.latest_suggestion?.image_reviews.length ?? 0) > 0;
 	const acceptedReviewedReferences = useMemo(
 		() =>
-			reviewedReferences
-				.filter(reference => reference.status === "ACCEPTED")
-				.sort(
-					(a, b) =>
-						Number(b.identity_anchor_score ?? 0) - Number(a.identity_anchor_score ?? 0) ||
-						Number(b.sharpness_score ?? 0) - Number(a.sharpness_score ?? 0) ||
-						a.sort_order - b.sort_order
-				),
-		[reviewedReferences]
+			hasStructuredReviews
+				? reviewedReferences
+						.filter(reference => reference.status === "ACCEPTED" && reviewByReferenceId.has(reference.id))
+						.sort(
+							(a, b) =>
+								Number(b.identity_anchor_score ?? 0) - Number(a.identity_anchor_score ?? 0) ||
+								Number(b.sharpness_score ?? 0) - Number(a.sharpness_score ?? 0) ||
+								a.sort_order - b.sort_order
+						)
+				: [],
+		[hasStructuredReviews, reviewByReferenceId, reviewedReferences]
 	);
 	const topIdentityAnchors = useMemo(() => acceptedReviewedReferences.slice(0, 3), [acceptedReviewedReferences]);
 	const readiness = useMemo(() => deriveIdentityReadiness(acceptedReviewedReferences), [acceptedReviewedReferences]);
@@ -287,70 +291,69 @@ export function ModelPhotoImporter({
 
 	const body = (
 		<>
-			<div className="relative overflow-hidden rounded-[1.75rem] border border-border/70 bg-[linear-gradient(140deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--accent),transparent_76%)_54%,color-mix(in_oklab,var(--primary),transparent_92%))] p-4 shadow-[var(--shadow-soft)] md:p-5">
-				<div className="pointer-events-none absolute inset-y-0 right-0 w-[34%] bg-[radial-gradient(circle_at_100%_0%,color-mix(in_oklab,var(--primary),transparent_82%),transparent_62%)]" />
-				<div className="relative grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(17rem,0.8fr)]">
-					<div className="space-y-4">
-						<div className="flex flex-wrap items-start justify-between gap-3">
-							<div>
-								<p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Identity Intake</p>
-								<h3 className="font-display text-[clamp(1.6rem,3vw,2.15rem)] leading-[0.95]">Build the anchor set before you generate.</h3>
-								<p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-									Upload 3-20 photos, let the system rank likeness anchors, then use the strongest front match to drive the rest of the reference set.
-								</p>
-							</div>
-							<Badge tone={statusTone(status)}>{humanizeStatusLabel(status)}</Badge>
+			<header className="relative grid gap-5 rounded-4xl border border-border/70 bg-[linear-gradient(140deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--accent),transparent_76%)_54%,color-mix(in_oklab,var(--primary),transparent_92%))] p-4 shadow-[var(--shadow-soft)] md:p-5 lg:grid-cols-[minmax(0,1.2fr),minmax(17rem,0.8fr)]">
+				<div aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-[34%] bg-[radial-gradient(circle_at_100%_0%,color-mix(in_oklab,var(--primary),transparent_82%),transparent_62%)]" />
+				
+				<div className="relative grid content-between gap-5">
+					<div className="flex flex-wrap items-start justify-between gap-4">
+						<div className="grid max-w-2xl gap-1">
+							<p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Identity Intake</p>
+							<h3 className="font-display text-[clamp(1.6rem,3vw,2.15rem)] leading-[0.95]">Build the anchor set before you generate.</h3>
+							<p className="mt-1 text-sm text-muted-foreground/90">
+								Upload 3-20 photos, let the system rank likeness anchors, then use the strongest front match to drive the rest of the reference set.
+							</p>
 						</div>
-
-						<div className="grid gap-2.5 md:grid-cols-3">
-							<FlowStep
-								icon={<Images className="size-4" />}
-								label="1. Upload"
-								description={selectedFiles.length > 0 ? `${selectedFiles.length} file(s) queued` : "3-20 solo photos"}
-								tone={selectedFiles.length > 0 || snapshot?.counts.total ? "success" : "neutral"}
-							/>
-							<FlowStep
-								icon={<ScanFace className="size-4" />}
-								label="2. Analyze"
-								description={
-									status === "UPLOADING" || status === "ANALYZING"
-										? "Reviewing angle, sharpness, anchor strength"
-										: analysisIssue?.blocking
-											? "Vision analysis needs another pass before anchors are trustworthy"
-											: "Angle + anchor scoring"
-								}
-								tone={status === "UPLOADING" || status === "ANALYZING" ? "warning" : analysisIssue?.blocking ? "danger" : snapshot?.latest_suggestion ? "success" : "neutral"}
-							/>
-							<FlowStep
-								icon={<Sparkles className="size-4" />}
-								label="3. Generate"
-								description={readiness.nextStep}
-								tone={readiness.tone}
-							/>
-						</div>
+						<Badge tone={statusTone(status)}>{humanizeStatusLabel(status)}</Badge>
 					</div>
 
-					<div className="rounded-[1.5rem] border border-border/70 bg-background/72 p-4 shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_26%)]">
-						<p className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Identity Readiness</p>
-						<div className="mt-3 flex items-center justify-between gap-3">
-							<div>
-								<p className="font-display text-2xl leading-none">{readiness.label}</p>
-								<p className="mt-1 text-xs text-muted-foreground">{readiness.description}</p>
-							</div>
-							<Badge tone={readiness.tone}>{readiness.scoreLabel}</Badge>
-						</div>
-
-						<div className="mt-4 grid gap-2 sm:grid-cols-2">
-							<CoveragePill label="Frontal anchor" ready={readiness.coverage.frontal} />
-							<CoveragePill label="Left 45" ready={readiness.coverage.left45} />
-							<CoveragePill label="Right 45" ready={readiness.coverage.right45} />
-							<CoveragePill label="Body framing" ready={readiness.coverage.body} />
-						</div>
+					<div className="grid gap-2.5 md:grid-cols-3">
+						<FlowStep
+							icon={<Images className="size-4" />}
+							label="1. Upload"
+							description={selectedFiles.length > 0 ? `${selectedFiles.length} file(s) queued` : "3-20 solo photos"}
+							tone={selectedFiles.length > 0 || snapshot?.counts.total ? "success" : "neutral"}
+						/>
+						<FlowStep
+							icon={<ScanFace className="size-4" />}
+							label="2. Analyze"
+							description={
+								status === "UPLOADING" || status === "ANALYZING"
+									? "Reviewing angle, sharpness, anchor strength"
+									: analysisIssue?.blocking
+										? "Vision analysis needs another pass before anchors are trustworthy"
+										: "Angle + anchor scoring"
+							}
+							tone={status === "UPLOADING" || status === "ANALYZING" ? "warning" : analysisIssue?.blocking ? "danger" : snapshot?.latest_suggestion ? "success" : "neutral"}
+						/>
+						<FlowStep
+							icon={<Sparkles className="size-4" />}
+							label="3. Generate"
+							description={readiness.nextStep}
+							tone={readiness.tone}
+						/>
 					</div>
 				</div>
-			</div>
 
-			{error ? <StateBlock tone="error" title="Photo Setup Issue" description={error} /> : null}
+				<aside className="relative rounded-3xl border border-border/70 bg-background/72 p-4 shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_26%)]">
+					<p className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Identity Readiness</p>
+					<div className="mt-3 flex items-center justify-between gap-3">
+						<div className="grid gap-1">
+							<p className="font-display text-2xl leading-none">{readiness.label}</p>
+							<p className="text-xs text-muted-foreground">{readiness.description}</p>
+						</div>
+						<Badge tone={readiness.tone}>{readiness.scoreLabel}</Badge>
+					</div>
+
+					<div className="mt-4 grid gap-2 sm:grid-cols-2">
+						<CoveragePill label="Frontal anchor" ready={readiness.coverage.frontal} />
+						<CoveragePill label="Left 45" ready={readiness.coverage.left45} />
+						<CoveragePill label="Right 45" ready={readiness.coverage.right45} />
+						<CoveragePill label="Body framing" ready={readiness.coverage.body} />
+					</div>
+				</aside>
+			</header>
+
+			{error ? <StateBlock tone="danger" title="Photo Setup Issue" description={error} /> : null}
 			{info ? <StateBlock tone="success" title="Model Updated" description={info} /> : null}
 			{analysisIssue && !embedded ? <StateBlock tone={analysisIssue.tone === "danger" ? "warning" : "neutral"} title={analysisIssue.title} description={analysisIssue.description} /> : null}
 
@@ -449,7 +452,7 @@ export function ModelPhotoImporter({
 				</div>
 			) : null}
 
-			{topIdentityAnchors.length > 0 ? (
+			{hasStructuredReviews && topIdentityAnchors.length > 0 ? (
 				<div className="space-y-2">
 					<div className="flex flex-wrap items-center justify-between gap-2">
 						<p className="text-xs font-subheader">Best Identity Anchors</p>
@@ -457,26 +460,27 @@ export function ModelPhotoImporter({
 					</div>
 					<div className="grid gap-3 md:grid-cols-3">
 						{topIdentityAnchors.map((reference, index) => (
-							<div key={`anchor-${reference.id}`} className="rounded-[1.4rem] border border-border/70 bg-card/90 p-3 shadow-[var(--shadow-soft)]">
+							<div key={`anchor-${reference.id}`} className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-card/90 p-3 shadow-[var(--shadow-soft)]">
 								<SquareImageThumbnail
 									src={reference.preview_url}
 									alt={reference.file_name ?? reference.id}
 									placeholder="Preview unavailable"
-									containerClassName="mb-3 rounded-[1.1rem]"
+									containerClassName="rounded-xl border-border/70"
 									onImageClick={() => {
 										const previewPosition = previewIndexByReferenceId.get(reference.id);
 										if (typeof previewPosition === "number") setPreviewIndex(previewPosition);
 									}}
 								/>
-								<div className="flex items-center justify-between gap-2">
-									<p className="text-sm font-semibold">{index === 0 ? "Primary anchor" : `Anchor ${index + 1}`}</p>
-									<Badge tone={index === 0 ? "success" : "neutral"}>{formatPercent(reference.identity_anchor_score)}</Badge>
+								<div className="min-w-0">
+									<p className="truncate text-sm font-semibold">{index === 0 ? "Primary anchor" : `Anchor ${index + 1}`}</p>
+									<Badge className="mt-2 w-fit px-2 py-0.5 text-[10px]" tone={index === 0 ? "success" : "neutral"}>
+										{formatPercent(reference.identity_anchor_score)}
+									</Badge>
 								</div>
-								<div className="mt-2 flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
-									<MiniTag label={humanizeAngle(reference.view_angle)} />
-									<MiniTag label={humanizeFraming(reference.framing)} />
-									<MiniTag label={humanizeExpression(reference.expression)} />
-									<MiniTag label={`Sharp ${formatPercent(reference.sharpness_score)}`} />
+								<div className="flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
+									{buildReferenceDetailTags(reference, { includeSharpness: true }).map(label => (
+										<MiniTag key={`${reference.id}-${label}`} label={label} />
+									))}
 								</div>
 							</div>
 						))}
@@ -498,32 +502,39 @@ export function ModelPhotoImporter({
 
 			{snapshot?.references.length ? (
 				<div className="space-y-2">
-					<p className="text-xs font-subheader">Imported Photos</p>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<p className="text-xs font-subheader">Imported Photos</p>
+						{heuristicAnalysis ? <p className="text-[11px] text-muted-foreground">Angle and anchor tags stay hidden until live analysis succeeds.</p> : null}
+					</div>
 					<div className="grid gap-2 md:grid-cols-2 lg:grid-cols-4">
 						{reviewedReferences.map(reference => (
-							<div key={reference.id} className="rounded-lg border border-border bg-card p-2">
+							<div key={reference.id} className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card/90 p-3 shadow-[var(--shadow-soft)]">
 								<SquareImageThumbnail
 									src={reference.preview_url}
 									alt={reference.file_name ?? reference.id}
 									placeholder="No preview"
-									containerClassName="mb-2"
+									containerClassName="rounded-lg border-border/70"
 									onImageClick={() => {
 										const index = previewIndexByReferenceId.get(reference.id);
 										if (typeof index === "number") setPreviewIndex(index);
 									}}
 								/>
-								<div className="flex items-center justify-between gap-2">
-									<p className="truncate text-[11px]">{reference.file_name ?? "Uploaded photo"}</p>
-									<Badge tone={reference.status === "ACCEPTED" ? "success" : reference.status === "REJECTED" ? "danger" : "neutral"}>
+								<div className="min-w-0">
+									<p className="truncate text-[11px] font-medium">{reference.file_name ?? "Uploaded photo"}</p>
+									<Badge
+										className="mt-2 w-fit px-2 py-0.5 text-[10px]"
+										tone={reference.status === "ACCEPTED" ? "success" : reference.status === "REJECTED" ? "danger" : "neutral"}>
 										{humanizeStatusLabel(reference.status)}
 									</Badge>
 								</div>
-								<div className="mt-2 flex flex-wrap gap-1.5">
-									{reference.view_angle ? <MiniTag label={humanizeAngle(reference.view_angle)} /> : null}
-									{reference.framing ? <MiniTag label={humanizeFraming(reference.framing)} /> : null}
-									{typeof reference.identity_anchor_score === "number" ? <MiniTag label={`Anchor ${formatPercent(reference.identity_anchor_score)}`} /> : null}
-								</div>
-								{reference.rejection_reason ? <p className="mt-1 text-[10px] text-muted-foreground">{reference.rejection_reason}</p> : null}
+								{hasStructuredReviews ? (
+									<div className="flex flex-wrap gap-1.5">
+										{buildReferenceDetailTags(reference, { includeAnchorScore: true }).map(label => (
+											<MiniTag key={`${reference.id}-${label}`} label={label} />
+										))}
+									</div>
+								) : null}
+								{reference.rejection_reason ? <p className="text-[10px] text-muted-foreground">{reference.rejection_reason}</p> : null}
 							</div>
 						))}
 					</div>
@@ -609,28 +620,26 @@ function FlowStep({
 	tone: "neutral" | "warning" | "success" | "danger";
 }) {
 	return (
-		<div className="rounded-[1.25rem] border border-border/70 bg-background/70 p-3">
-			<div className="flex items-center gap-2">
-				<span className="inline-flex size-8 items-center justify-center rounded-full border border-border/70 bg-card text-foreground">{icon}</span>
-				<div>
-					<p className="text-xs font-semibold">{label}</p>
-					<Badge className="mt-1 w-fit" tone={tone}>
+		<div className="grid gap-2 rounded-xl border border-border/70 bg-background/70 p-3">
+			<div className="flex items-center gap-2.5">
+				<div aria-hidden className="inline-flex size-8 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-foreground">{icon}</div>
+				<div className="grid gap-0.5">
+					<p className="text-xs font-semibold leading-tight">{label}</p>
+					<Badge className="w-fit scale-[0.85] origin-left" tone={tone}>
 						{tone === "success" ? "Ready" : tone === "warning" ? "In progress" : tone === "danger" ? "Needs attention" : "Waiting"}
 					</Badge>
 				</div>
 			</div>
-			<p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{description}</p>
+			<p className="text-[11px] leading-relaxed text-muted-foreground">{description}</p>
 		</div>
 	);
 }
 
 function CoveragePill({ label, ready }: { label: string; ready: boolean }) {
 	return (
-		<div className={`rounded-full border px-3 py-2 text-[11px] font-medium ${ready ? "border-[var(--status-success-border)] bg-[var(--status-success-bg)] text-[var(--status-success)]" : "border-border/70 bg-muted/45 text-muted-foreground"}`}>
-			<span className="inline-flex items-center gap-1.5">
-				{ready ? <Check className="size-3.5" /> : <ArrowRight className="size-3.5" />}
-				{label}
-			</span>
+		<div className={`flex items-center gap-1.5 rounded-full border px-3 py-2 text-[11px] font-medium ${ready ? "border-[var(--status-success-border)] bg-[var(--status-success-bg)] text-[var(--status-success)]" : "border-border/70 bg-muted/45 text-muted-foreground"}`}>
+			{ready ? <Check className="size-3.5" /> : <ArrowRight className="size-3.5" />}
+			{label}
 		</div>
 	);
 }
@@ -645,7 +654,7 @@ function MetricPanel({
 	tone: "neutral" | "warning" | "success" | "danger";
 }) {
 	return (
-		<div className="rounded-[1.2rem] border border-border/70 bg-card/85 p-3">
+		<div className="rounded-xl border border-border/70 bg-card/85 p-3">
 			<div className="flex items-center justify-between gap-2">
 				<p className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">{label}</p>
 				<Badge tone={tone}>{tone === "success" ? "Good" : tone === "warning" ? "Watch" : tone === "danger" ? "Low" : "Info"}</Badge>
@@ -736,4 +745,36 @@ function humanizeExpression(value: ReviewedReference["expression"]): string {
 	if (value === "soft_smile") return "Soft smile";
 	if (value === "serious") return "Serious";
 	return "Neutral";
+}
+
+function buildReferenceDetailTags(
+	reference: Pick<ReviewedReference, "view_angle" | "framing" | "expression" | "identity_anchor_score" | "sharpness_score">,
+	options?: {
+		includeAnchorScore?: boolean;
+		includeSharpness?: boolean;
+	}
+): string[] {
+	const tags: string[] = [];
+
+	if (reference.view_angle && reference.view_angle !== "unknown") {
+		tags.push(humanizeAngle(reference.view_angle));
+	}
+
+	if (reference.framing && reference.framing !== "unknown") {
+		tags.push(humanizeFraming(reference.framing));
+	}
+
+	if (reference.expression && reference.expression !== "other") {
+		tags.push(humanizeExpression(reference.expression));
+	}
+
+	if (options?.includeAnchorScore && typeof reference.identity_anchor_score === "number") {
+		tags.push(`Anchor ${formatPercent(reference.identity_anchor_score)}`);
+	}
+
+	if (options?.includeSharpness && typeof reference.sharpness_score === "number") {
+		tags.push(`Sharp ${formatPercent(reference.sharpness_score)}`);
+	}
+
+	return tags;
 }

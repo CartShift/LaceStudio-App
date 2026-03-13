@@ -43,6 +43,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 			candidatesPerShot: body.candidates_per_shot,
 			generationMode: body.generation_mode,
 			packVersion: body.pack_version,
+			shotCodes: body.shot_codes,
+			replaceCandidateId: body.candidate_id,
+			regenerateExisting: body.regenerate_existing,
 			awaitCompletion: false
 		});
 

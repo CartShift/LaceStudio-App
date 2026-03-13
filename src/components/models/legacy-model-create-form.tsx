@@ -61,7 +61,7 @@ export function LegacyModelCreateForm() {
           />
         </FormField>
 
-        {error ? <StateBlock tone="error" title="Model creation issue" description={error} /> : null}
+        {error ? <StateBlock tone="danger" title="Model creation issue" description={error} /> : null}
 
         <Button type="submit" disabled={saving}>
           {saving ? "Creating..." : "Create Model"}

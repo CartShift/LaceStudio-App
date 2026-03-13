@@ -1,12 +1,12 @@
-
 "use client";
 
 import Image from "next/image";
 import Link from "next/link";
-import { useParams, usePathname } from "next/navigation";
+import { useParams, usePathname, useRouter } from "next/navigation";
 import { type ReactNode, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, ImagePlus, RefreshCw, ScanFace, SlidersHorizontal, Sparkles, WandSparkles } from "lucide-react";
+import { CheckCircle2, Clapperboard, ImagePlus, RefreshCw, ScanFace, SlidersHorizontal, Sparkles, WandSparkles } from "lucide-react";
 import { CampaignAssetLightbox } from "@/components/campaigns/campaign-asset-lightbox";
+import { CampaignModelPicker, type CampaignModelPickerItem } from "@/components/campaigns/campaign-model-picker";
 import { CostEstimate } from "@/components/campaigns/cost-estimate";
 import { DropZone } from "@/components/campaigns/drop-zone";
 import { GenerationProgress } from "@/components/campaigns/generation-progress";
@@ -14,20 +14,25 @@ import { PromptSuggestions } from "@/components/campaigns/prompt-suggestions";
 import { ResolutionPicker } from "@/components/campaigns/resolution-picker";
 import { PageHeader } from "@/components/layout/page-header";
 import { useBreadcrumb } from "@/components/providers/breadcrumb-provider";
+import { useNotice } from "@/components/providers/notice-provider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ChipInput } from "@/components/ui/chip-input";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { EditorialCard } from "@/components/ui/editorial-card";
+import { ImageGenerationSurface } from "@/components/ui/image-generation-surface";
 import { Input } from "@/components/ui/input";
 import { OptionCardGrid } from "@/components/ui/option-card-grid";
 import { SelectField } from "@/components/ui/select";
 import { SliderWithPreview } from "@/components/ui/slider-with-preview";
 import { StateBlock } from "@/components/ui/state-block";
 import { Textarea } from "@/components/ui/textarea";
+import { ToggleRow } from "@/components/ui/toggle-row";
 import { XpProgressBar } from "@/components/ui/xp-progress-bar";
 import { FormField } from "@/components/workspace/form-field";
 import { TableShell, type TableShellColumn } from "@/components/workspace/table-shell";
 import { apiFormRequest, apiRequest } from "@/lib/client-api";
+import { CAMPAIGN_VIDEO_DURATION_VALUES, type CampaignVideoDurationSeconds, type CampaignVideoGenerationScope, DEFAULT_CAMPAIGN_VIDEO_SETTINGS } from "@/lib/campaign-video";
 import { humanizeStatusLabel, toneForCampaignStatus } from "@/lib/status-labels";
 import { clampFloat } from "@/lib/utils";
 
@@ -119,6 +124,16 @@ const PROVIDER_OPTIONS = [
 	{ value: "gpu" as const, label: "GPU Pipeline", emoji: "⚡", description: "Custom image flow" }
 ];
 
+const VIDEO_SCOPE_OPTIONS = [
+	{ value: "all_images" as const, label: "Every shot", emoji: "🎞️", description: "Queue a matching vertical reel for each new image in this run." },
+	{ value: "anchor_only" as const, label: "Anchor only", emoji: "🧷", description: "Generate motion proof from the anchor and keep the rest as stills." }
+];
+
+const VIDEO_DURATION_OPTIONS = [
+	{ value: String(CAMPAIGN_VIDEO_DURATION_VALUES[1]), label: "8 sec", emoji: "🎬", description: "Longer editorial movement" },
+	{ value: String(CAMPAIGN_VIDEO_DURATION_VALUES[0]), label: "6 sec", emoji: "⚡", description: "Quicker, lighter loop" }
+];
+
 type Asset = {
 	id: string;
 	status: "PENDING" | "APPROVED" | "REJECTED";
@@ -136,6 +151,8 @@ type Job = {
 	dispatched_at: string;
 };
 
+type ModelOption = CampaignModelPickerItem;
+
 type ReferenceItem = {
 	id?: string;
 	source?: "pinterest_upload" | "pinterest_url" | "external_url";
@@ -150,10 +167,13 @@ type CampaignDetail = {
 	id: string;
 	name: string;
 	status: CampaignStatus;
+	campaign_group_id?: string | null;
+	source_campaign_id?: string | null;
 	anchor_asset_id?: string | null;
 	prompt_text: string | null;
 	image_model_provider: ImageProvider;
 	image_model_id: string | null;
+	model?: { id: string; name: string } | null;
 	creative_controls?: {
 		reference_board?: {
 			items?: ReferenceItem[];
@@ -184,12 +204,25 @@ type CampaignDetail = {
 		aesthetic?: {
 			mood_tags?: string[];
 		};
+		video?: {
+			enabled?: boolean;
+			generation_scope?: CampaignVideoGenerationScope;
+			duration_seconds?: CampaignVideoDurationSeconds;
+			prompt_text?: string;
+		};
 	};
 	assets: Asset[];
 	generation_jobs: Job[];
 	batch_size?: number;
 	resolution_width?: number;
 	resolution_height?: number;
+	linked_campaigns?: Array<{
+		id: string;
+		name: string;
+		status: CampaignStatus;
+		source_campaign_id?: string | null;
+		model?: { id: string; name: string } | null;
+	}>;
 };
 
 type ReferenceBoardResponse = {
@@ -197,25 +230,34 @@ type ReferenceBoardResponse = {
 };
 
 export default function CampaignDetailPage() {
+	const router = useRouter();
 	const params = useParams<{ id: string }>();
 	const pathname = usePathname();
 	const { setSegmentTitle } = useBreadcrumb();
+	const { notify } = useNotice();
 	const campaignId = params.id;
 	const segmentIndex = pathname.split("/").filter(Boolean).indexOf(campaignId);
 
 	const [campaign, setCampaign] = useState<CampaignDetail | null>(null);
 	const [references, setReferences] = useState<ReferenceItem[]>([]);
+	const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
 
 	const [loading, setLoading] = useState(true);
 	const [refreshing, setRefreshing] = useState(false);
+	const [loadingModelOptions, setLoadingModelOptions] = useState(true);
 	const [savingStyle, setSavingStyle] = useState(false);
 	const [savingSettings, setSavingSettings] = useState(false);
 	const [runningGeneration, setRunningGeneration] = useState(false);
 	const [submittingReference, setSubmittingReference] = useState(false);
 	const [settingAnchorId, setSettingAnchorId] = useState<string | null>(null);
+	const [duplicatingCampaigns, setDuplicatingCampaigns] = useState(false);
 
 	const [error, setError] = useState<string | null>(null);
 	const [info, setInfo] = useState<string | null>(null);
+	const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false);
+	const [duplicateName, setDuplicateName] = useState("");
+	const [duplicateModelIds, setDuplicateModelIds] = useState<string[]>([]);
+	const [duplicateError, setDuplicateError] = useState<string | null>(null);
 
 	const [promptText, setPromptText] = useState("");
 	const [promptCustomized, setPromptCustomized] = useState(false);
@@ -244,6 +286,10 @@ export default function CampaignDetailPage() {
 	const [editBatchSize, setEditBatchSize] = useState("8");
 	const [editResWidth, setEditResWidth] = useState(1024);
 	const [editResHeight, setEditResHeight] = useState(1024);
+	const [videoEnabled, setVideoEnabled] = useState(DEFAULT_CAMPAIGN_VIDEO_SETTINGS.enabled);
+	const [videoScope, setVideoScope] = useState<CampaignVideoGenerationScope>(DEFAULT_CAMPAIGN_VIDEO_SETTINGS.generation_scope);
+	const [videoDurationSeconds, setVideoDurationSeconds] = useState<CampaignVideoDurationSeconds>(DEFAULT_CAMPAIGN_VIDEO_SETTINGS.duration_seconds);
+	const [videoPromptText, setVideoPromptText] = useState(DEFAULT_CAMPAIGN_VIDEO_SETTINGS.prompt_text ?? "");
 
 	const [expandedAssetId, setExpandedAssetId] = useState<string | null>(null);
 	const [lastRequestedBatchSize, setLastRequestedBatchSize] = useState(0);
@@ -280,12 +326,20 @@ export default function CampaignDetailPage() {
 				const nextSilhouette = coerceValue(campaignData.creative_controls?.outfit?.silhouette, SILHOUETTE_VALUES, "structured");
 				const nextLens = coerceValue(campaignData.creative_controls?.realism?.lens_simulation, LENS_VALUES, "85mm_editorial");
 				const nextMoodTags = campaignData.creative_controls?.aesthetic?.mood_tags?.length ? campaignData.creative_controls.aesthetic.mood_tags : ["editorial luxe"];
+				const nextVideoEnabled = campaignData.creative_controls?.video?.enabled ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.enabled;
+				const nextVideoScope = campaignData.creative_controls?.video?.generation_scope ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.generation_scope;
+				const nextVideoDuration = campaignData.creative_controls?.video?.duration_seconds ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.duration_seconds;
+				const nextVideoPrompt = campaignData.creative_controls?.video?.prompt_text?.trim() ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.prompt_text ?? "";
 
 				setPosePreset(nextPose);
 				setExpressionPreset(nextExpression);
 				setSilhouette(nextSilhouette);
 				setLensSimulation(nextLens);
 				setMoodTags(nextMoodTags.slice(0, 12));
+				setVideoEnabled(nextVideoEnabled);
+				setVideoScope(nextVideoScope);
+				setVideoDurationSeconds(nextVideoDuration);
+				setVideoPromptText(nextVideoPrompt);
 
 				setShoulderAngle(String(clampFloat(campaignData.creative_controls?.pose?.micro_rotation?.shoulder_angle ?? 0, 0, -1, 1)));
 				setHipShift(String(clampFloat(campaignData.creative_controls?.pose?.micro_rotation?.hip_shift ?? 0, 0, -1, 1)));
@@ -319,15 +373,44 @@ export default function CampaignDetailPage() {
 		[campaignId, segmentIndex, setSegmentTitle]
 	);
 
+	const loadModelOptions = useCallback(async () => {
+		setLoadingModelOptions(true);
+
+		try {
+			const payload = await apiRequest<{ data: ModelOption[] }>("/api/models?limit=100");
+			setModelOptions(payload.data.filter(model => model.status === "ACTIVE"));
+		} catch (err) {
+			notify({
+				tone: "error",
+				title: "Model list unavailable",
+				description: err instanceof Error ? err.message : "We couldn't load the available models for duplication.",
+			});
+		} finally {
+			setLoadingModelOptions(false);
+		}
+	}, [notify]);
+
 	useEffect(() => {
 		void load("initial");
 	}, [load]);
+
+	useEffect(() => {
+		void loadModelOptions();
+	}, [loadModelOptions]);
 
 	useEffect(() => {
 		return () => {
 			if (segmentIndex >= 0) setSegmentTitle(segmentIndex, null);
 		};
 	}, [segmentIndex, setSegmentTitle]);
+
+	useEffect(() => {
+		if (!duplicateDialogOpen) {
+			setDuplicateError(null);
+			setDuplicateName("");
+			setDuplicateModelIds([]);
+		}
+	}, [duplicateDialogOpen]);
 
 	const isBusy = savingStyle || savingSettings || runningGeneration || submittingReference || Boolean(settingAnchorId);
 	const hasAnchor = Boolean(campaign?.anchor_asset_id);
@@ -338,6 +421,17 @@ export default function CampaignDetailPage() {
 	const promptTextTrimmed = promptText.trim();
 	const promptWordCount = promptTextTrimmed ? promptTextTrimmed.split(/\s+/).filter(Boolean).length : 0;
 	const activeProviderLabel = PROVIDER_OPTIONS.find(option => option.value === editProvider)?.label ?? editProvider;
+	const motionPromptTrimmed = videoPromptText.trim();
+	const videoCoverageLabel = videoScope === "all_images" ? "Every generated shot" : "Anchor only";
+	const videoPlanLabel = videoEnabled ? `${videoCoverageLabel} · ${videoDurationSeconds}s vertical reel` : "Images only";
+	const videoPlanHint = videoEnabled
+		? videoScope === "all_images"
+			? `Anchor pass queues 1 video. Batch runs queue ${anchorBatchSize} more from the new campaign images.`
+			: "Only the anchor pass will queue a matching vertical video."
+		: "Turn motion on if you want reel-ready video variants to auto-queue with new images.";
+	const linkedCampaigns = campaign?.linked_campaigns ?? [];
+	const linkedCampaignCount = linkedCampaigns.length;
+	const duplicateReady = duplicateModelIds.length > 0 && !duplicatingCampaigns;
 
 	const { approvedCount, pendingCount, flaggedCount } = useMemo(() => {
 		let approved = 0;
@@ -395,6 +489,10 @@ export default function CampaignDetailPage() {
 				silhouette,
 				lensSimulation,
 				moodTags,
+				videoEnabled,
+				videoScope,
+				videoDurationSeconds,
+				videoPromptText,
 				shoulderAngle,
 				hipShift,
 				chinTilt,
@@ -402,7 +500,23 @@ export default function CampaignDetailPage() {
 				hemLength,
 				skinRealism
 			}),
-		[posePreset, expressionPreset, silhouette, lensSimulation, moodTags, shoulderAngle, hipShift, chinTilt, smileIntensity, hemLength, skinRealism]
+		[
+			posePreset,
+			expressionPreset,
+			silhouette,
+			lensSimulation,
+			moodTags,
+			videoEnabled,
+			videoScope,
+			videoDurationSeconds,
+			videoPromptText,
+			shoulderAngle,
+			hipShift,
+			chinTilt,
+			smileIntensity,
+			hemLength,
+			skinRealism
+		]
 	);
 
 	const savedStyleSnapshot = useMemo(() => {
@@ -412,6 +526,10 @@ export default function CampaignDetailPage() {
 		const savedSilhouette = coerceValue(campaign.creative_controls?.outfit?.silhouette, SILHOUETTE_VALUES, "structured");
 		const savedLens = coerceValue(campaign.creative_controls?.realism?.lens_simulation, LENS_VALUES, "85mm_editorial");
 		const savedMoodTags = campaign.creative_controls?.aesthetic?.mood_tags?.length ? campaign.creative_controls.aesthetic.mood_tags.slice(0, 12) : ["editorial luxe"];
+		const savedVideoEnabled = campaign.creative_controls?.video?.enabled ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.enabled;
+		const savedVideoScope = campaign.creative_controls?.video?.generation_scope ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.generation_scope;
+		const savedVideoDuration = campaign.creative_controls?.video?.duration_seconds ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.duration_seconds;
+		const savedVideoPrompt = campaign.creative_controls?.video?.prompt_text?.trim() ?? DEFAULT_CAMPAIGN_VIDEO_SETTINGS.prompt_text ?? "";
 		const inferredPrompt = buildAutoPrompt(savedPose, savedExpression, savedSilhouette, savedLens, savedMoodTags);
 		return {
 			posePreset: savedPose,
@@ -419,6 +537,10 @@ export default function CampaignDetailPage() {
 			silhouette: savedSilhouette,
 			lensSimulation: savedLens,
 			moodTags: savedMoodTags,
+			videoEnabled: savedVideoEnabled,
+			videoScope: savedVideoScope,
+			videoDurationSeconds: savedVideoDuration,
+			videoPromptText: savedVideoPrompt,
 			shoulderAngle: String(clampFloat(campaign.creative_controls?.pose?.micro_rotation?.shoulder_angle ?? 0, 0, -1, 1)),
 			hipShift: String(clampFloat(campaign.creative_controls?.pose?.micro_rotation?.hip_shift ?? 0, 0, -1, 1)),
 			chinTilt: String(clampFloat(campaign.creative_controls?.pose?.micro_rotation?.chin_tilt ?? 0, 0, -1, 1)),
@@ -437,6 +559,10 @@ export default function CampaignDetailPage() {
 			silhouette !== savedStyleSnapshot.silhouette ||
 			lensSimulation !== savedStyleSnapshot.lensSimulation ||
 			!arrayEquals(moodTags, savedStyleSnapshot.moodTags) ||
+			videoEnabled !== savedStyleSnapshot.videoEnabled ||
+			videoScope !== savedStyleSnapshot.videoScope ||
+			videoDurationSeconds !== savedStyleSnapshot.videoDurationSeconds ||
+			videoPromptText.trim() !== savedStyleSnapshot.videoPromptText ||
 			shoulderAngle !== savedStyleSnapshot.shoulderAngle ||
 			hipShift !== savedStyleSnapshot.hipShift ||
 			chinTilt !== savedStyleSnapshot.chinTilt ||
@@ -452,6 +578,10 @@ export default function CampaignDetailPage() {
 		silhouette,
 		lensSimulation,
 		moodTags,
+		videoEnabled,
+		videoScope,
+		videoDurationSeconds,
+		videoPromptText,
 		shoulderAngle,
 		hipShift,
 		chinTilt,
@@ -474,15 +604,9 @@ export default function CampaignDetailPage() {
 		);
 	}, [campaign, editProvider, editModelId, plannedBatchSize, editResWidth, editResHeight]);
 
-	const anchorAsset = useMemo(
-		() => campaign?.assets.find(asset => asset.id === campaign?.anchor_asset_id) ?? null,
-		[campaign?.assets, campaign?.anchor_asset_id]
-	);
+	const anchorAsset = useMemo(() => campaign?.assets.find(asset => asset.id === campaign?.anchor_asset_id) ?? null, [campaign?.assets, campaign?.anchor_asset_id]);
 
-	const generatedSetCount = useMemo(
-		() => (campaign?.assets ?? []).filter(asset => asset.id !== campaign?.anchor_asset_id).length,
-		[campaign?.assets, campaign?.anchor_asset_id]
-	);
+	const generatedSetCount = useMemo(() => (campaign?.assets ?? []).filter(asset => asset.id !== campaign?.anchor_asset_id).length, [campaign?.assets, campaign?.anchor_asset_id]);
 
 	useEffect(() => {
 		if (!expandedAssetId) return;
@@ -601,7 +725,12 @@ export default function CampaignDetailPage() {
 				if (!saved) return;
 			}
 
-			await apiRequest(`/api/campaigns/${campaignId}/generate`, {
+			const response = await apiRequest<{
+				job_id: string;
+				campaign_status: CampaignStatus;
+				video_generation_planned?: boolean;
+				video_generation_jobs_created?: number;
+			}>(`/api/campaigns/${campaignId}/generate`, {
 				method: "POST",
 				body: JSON.stringify({
 					prompt_text: prompt,
@@ -612,7 +741,12 @@ export default function CampaignDetailPage() {
 			});
 
 			setLastRequestedBatchSize(mode === "anchor" ? 1 : anchorBatchSize);
-			setInfo(mode === "anchor" ? "Anchor generation started." : "Campaign generation started.");
+			const shouldMentionVideo = response.video_generation_planned;
+			if (mode === "anchor") {
+				setInfo(shouldMentionVideo ? "Anchor generation started. A matching vertical video will queue automatically when the anchor frame lands." : "Anchor generation started.");
+			} else {
+				setInfo(shouldMentionVideo ? "Campaign generation started. Matching vertical videos will queue automatically for the new campaign shots." : "Campaign generation started.");
+			}
 			await load();
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "Generation request failed.");
@@ -637,6 +771,46 @@ export default function CampaignDetailPage() {
 			setError(err instanceof Error ? err.message : "We couldn't set this anchor.");
 		} finally {
 			setSettingAnchorId(null);
+		}
+	}
+
+	async function duplicateCampaign() {
+		if (!campaign || duplicateModelIds.length === 0) {
+			setDuplicateError("Select at least one model.");
+			return;
+		}
+
+		setDuplicatingCampaigns(true);
+		setDuplicateError(null);
+
+		try {
+			const duplicated = await apiRequest<{
+				id: string;
+				primary_campaign_id?: string;
+				campaigns?: Array<{ id: string }>;
+			}>(`/api/campaigns/${campaignId}/duplicate`, {
+				method: "POST",
+				body: JSON.stringify({
+					name: duplicateName.trim() || undefined,
+					model_ids: duplicateModelIds,
+				}),
+			});
+
+			const createdCount = duplicated.campaigns?.length ?? duplicateModelIds.length;
+			notify({
+				tone: "success",
+				title: createdCount > 1 ? "Campaigns duplicated" : "Campaign duplicated",
+				description:
+					createdCount > 1
+						? `${createdCount} linked drafts were created from this setup.`
+						: "A new draft was created from this setup.",
+			});
+			setDuplicateDialogOpen(false);
+			router.push(`/campaigns/${duplicated.primary_campaign_id ?? duplicated.id}`);
+		} catch (err) {
+			setDuplicateError(err instanceof Error ? err.message : "We couldn't duplicate this campaign.");
+		} finally {
+			setDuplicatingCampaigns(false);
 		}
 	}
 
@@ -721,26 +895,37 @@ export default function CampaignDetailPage() {
 		{
 			key: "thumbnail",
 			header: "Preview",
-			cell: (asset: Asset) =>
-				asset.raw_gcs_uri ? (
-					<button
-						type="button"
-						onClick={() => setExpandedAssetId(asset.id)}
-						className="block h-16 w-16 overflow-hidden rounded-md border border-border bg-muted hover:opacity-80 transition-opacity"
-						aria-label={`Open asset ${asset.sequence_number}`}>
-						{/* eslint-disable-next-line @next/next/no-img-element */}
-						<img src={asset.raw_gcs_uri} alt={`Seed ${asset.seed}`} className="h-full w-full object-cover" />
+			cell: (asset: Asset) => {
+				const preview = (
+					<ImageGenerationSurface
+						src={asset.raw_gcs_uri}
+						alt={`Seed ${asset.seed}`}
+						className="h-16 w-16 rounded-md"
+						placeholder={null}
+						loading={campaign?.status === "GENERATING" && !asset.raw_gcs_uri}
+						loadingTitle="Rendering"
+						loadingBadge={`#${asset.sequence_number}`}
+						loadingVariant="compact"
+					/>
+				);
+
+				return asset.raw_gcs_uri ? (
+					<button type="button" onClick={() => setExpandedAssetId(asset.id)} className="block transition-opacity hover:opacity-85" aria-label={`Open asset ${asset.sequence_number}`}>
+						{preview}
 					</button>
 				) : (
-					<div className="h-16 w-16 rounded-md border border-border bg-muted" />
-				)
+					preview
+				);
+			}
 		},
 		{ key: "sequence", header: "#", cell: (asset: Asset) => <span>#{asset.sequence_number}</span> },
 		{ key: "seed", header: "Seed", cell: (asset: Asset) => <code className="text-xs">{asset.seed}</code> },
 		{
 			key: "status",
 			header: "Status",
-			cell: (asset: Asset) => <Badge tone={asset.status === "APPROVED" ? "success" : asset.status === "REJECTED" ? "danger" : "warning"}>{asset.status === "PENDING" ? "NEEDS REVIEW" : asset.status}</Badge>
+			cell: (asset: Asset) => (
+				<Badge tone={asset.status === "APPROVED" ? "success" : asset.status === "REJECTED" ? "danger" : "warning"}>{asset.status === "PENDING" ? "NEEDS REVIEW" : asset.status}</Badge>
+			)
 		},
 		{
 			key: "quality",
@@ -787,7 +972,7 @@ export default function CampaignDetailPage() {
 		return (
 			<div className="space-y-4">
 				<PageHeader title="Campaign" description="Campaign workspace" />
-				<StateBlock tone="error" title="Couldn't load campaign" description={error ?? "Please refresh and try again."} />
+				<StateBlock tone="danger" title="Couldn't load campaign" description={error ?? "Please refresh and try again."} />
 			</div>
 		);
 	}
@@ -798,10 +983,15 @@ export default function CampaignDetailPage() {
 				title={`🎬 ${campaign.name}`}
 				description="Refine references, tune creative controls, and generate campaign-ready assets."
 				action={
-					<Button variant="secondary" type="button" onClick={() => void load("refresh")} disabled={refreshing || isBusy} aria-label="Refresh campaign">
-						<RefreshCw className={`h-4 w-4 ${refreshing || loading ? "animate-spin" : ""}`} />
-						Refresh
-					</Button>
+					<div className="flex flex-wrap gap-2">
+						<Button type="button" onClick={() => setDuplicateDialogOpen(true)} disabled={duplicatingCampaigns || loadingModelOptions}>
+							Duplicate Setup
+						</Button>
+						<Button variant="secondary" type="button" onClick={() => void load("refresh")} disabled={refreshing || isBusy} aria-label="Refresh campaign">
+							<RefreshCw className={`h-4 w-4 ${refreshing || loading ? "animate-spin" : ""}`} />
+							Refresh
+						</Button>
+					</div>
 				}
 			/>
 
@@ -814,6 +1004,45 @@ export default function CampaignDetailPage() {
 					{ key: "published", label: "Published", done: false, active: campaign.status === "PUBLISHED" }
 				]}
 			/>
+
+			{linkedCampaignCount > 1 ? (
+				<EditorialCard className="space-y-4">
+					<div className="flex flex-wrap items-start justify-between gap-3">
+						<div>
+							<p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Linked Campaign Set</p>
+							<h2 className="mt-2 font-display text-xl font-semibold">One setup, {linkedCampaignCount} model-specific workspaces.</h2>
+							<p className="mt-2 text-sm text-muted-foreground">
+								Each linked campaign keeps the same direction and settings, but runs against its own model identity.
+							</p>
+						</div>
+						<Badge tone="neutral">{linkedCampaignCount} linked campaigns</Badge>
+					</div>
+
+					<div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+						{linkedCampaigns.map(linkedCampaign => (
+							<Link
+								key={linkedCampaign.id}
+								href={`/campaigns/${linkedCampaign.id}`}
+								className={`rounded-2xl border p-3 transition-colors ${
+									linkedCampaign.id === campaign.id
+										? "border-primary/55 bg-primary/7 shadow-[0_0_0_1px_color-mix(in_oklab,var(--primary),transparent_65%)]"
+										: "border-border/70 bg-card/55 hover:border-border"
+								}`}
+							>
+								<div className="flex flex-wrap items-center gap-2">
+									<p className="font-medium">{linkedCampaign.model?.name ?? linkedCampaign.name}</p>
+									{linkedCampaign.id === campaign.id ? <Badge tone="success">Current</Badge> : null}
+									{campaign.source_campaign_id && linkedCampaign.id === campaign.source_campaign_id ? <Badge tone="neutral">Source</Badge> : null}
+								</div>
+								<p className="mt-2 text-sm text-muted-foreground">{linkedCampaign.name}</p>
+								<div className="mt-3 flex flex-wrap gap-2">
+									<Badge tone={toneForCampaignStatus(linkedCampaign.status)}>{humanizeStatusLabel(linkedCampaign.status)}</Badge>
+								</div>
+							</Link>
+						))}
+					</div>
+				</EditorialCard>
+			) : null}
 
 			<EditorialCard className="overflow-hidden">
 				<div className="grid gap-4 xl:grid-cols-[minmax(0,1.18fr)_minmax(18rem,0.82fr)]">
@@ -893,7 +1122,7 @@ export default function CampaignDetailPage() {
 						</div>
 					</div>
 
-					<div className="rounded-[1.6rem] border border-border/70 bg-[linear-gradient(145deg,color-mix(in_oklab,var(--card),white_16%),color-mix(in_oklab,var(--accent),transparent_72%))] p-4 shadow-[var(--shadow-soft)]">
+					<div className="rounded-3xl border border-border/70 bg-[linear-gradient(145deg,color-mix(in_oklab,var(--card),white_16%),color-mix(in_oklab,var(--accent),transparent_72%))] p-4 shadow-[var(--shadow-soft)]">
 						<div className="flex items-start justify-between gap-3">
 							<div>
 								<p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Current Anchor</p>
@@ -911,11 +1140,13 @@ export default function CampaignDetailPage() {
 							<button
 								type="button"
 								onClick={() => setExpandedAssetId(anchorAsset.id)}
-								className="mt-4 block w-full rounded-[1.2rem] border border-border/70 bg-background/70 p-3 text-left transition hover:border-primary/40">
-								<div className="overflow-hidden rounded-[1rem] border border-border/70 bg-muted/40">
-									{/* eslint-disable-next-line @next/next/no-img-element */}
-									<img src={anchorAsset.raw_gcs_uri} alt={`Anchor asset ${anchorAsset.sequence_number}`} className="aspect-[4/5] w-full object-cover" />
-								</div>
+								className="mt-4 block w-full rounded-xl border border-border/70 bg-background/70 p-3 text-left transition hover:border-primary/40">
+								<ImageGenerationSurface
+									src={anchorAsset.raw_gcs_uri}
+									alt={`Anchor asset ${anchorAsset.sequence_number}`}
+									aspectClassName="aspect-[4/5] w-full"
+									className="rounded-lg border border-border/70 bg-muted/40"
+								/>
 								<div className="mt-3 flex items-center justify-between gap-3">
 									<div>
 										<p className="text-sm font-semibold">Anchor #{anchorAsset.sequence_number}</p>
@@ -924,22 +1155,48 @@ export default function CampaignDetailPage() {
 									<Badge tone="success">{anchorAsset.status}</Badge>
 								</div>
 							</button>
+						) : isGenerating ? (
+							<div className="mt-4 rounded-xl border border-border/70 bg-background/70 p-3">
+								<ImageGenerationSurface
+									src={null}
+									alt="Generating campaign anchor"
+									aspectClassName="aspect-[4/5] w-full"
+									className="rounded-lg border border-border/70 bg-muted/40"
+									loading
+									loadingTitle={generationProgressBatchSize <= 1 ? "Crafting anchor shot" : "Preparing anchor preview"}
+									loadingDescription="The lead frame appears here first so the rest of the campaign can follow its identity, pose, and scene direction."
+									loadingBadge={generationProgressBatchSize <= 1 ? "Anchor pass" : "Rendering"}
+								/>
+								<div className="mt-3 flex items-center justify-between gap-3">
+									<div>
+										<p className="text-sm font-semibold">Anchor is on the way</p>
+										<p className="text-[11px] text-muted-foreground">This preview updates as soon as the first usable frame lands from the generator.</p>
+									</div>
+									<Badge tone="warning">Live render</Badge>
+								</div>
+							</div>
 						) : (
-							<div className="mt-4 rounded-[1.2rem] border border-dashed border-border/70 bg-background/55 p-4 text-[11px] text-muted-foreground">
+							<div className="mt-4 rounded-xl border border-dashed border-border/70 bg-background/55 p-4 text-[11px] text-muted-foreground">
 								No anchor is set yet. The first generation pass should produce one image that preserves the face, outfit direction, and scene intent well enough to reuse.
 							</div>
 						)}
 
-						<div className="mt-4 grid gap-2 sm:grid-cols-2">
+						<div className="mt-4 grid gap-2 sm:grid-cols-3">
 							<SignalTile label="Run size" value={`${plannedBatchSize} images`} hint={`${anchorBatchSize} remain after the anchor`} tone="neutral" />
-							<SignalTile label="Resolution" value={`${editResWidth} × ${editResHeight}`} hint={`${activeProviderLabel} · ${editModelId.trim() || PROVIDER_MODEL_DEFAULTS[editProvider]}`} tone="neutral" />
+							<SignalTile
+								label="Resolution"
+								value={`${editResWidth} × ${editResHeight}`}
+								hint={`${activeProviderLabel} · ${editModelId.trim() || PROVIDER_MODEL_DEFAULTS[editProvider]}`}
+								tone="neutral"
+							/>
+							<SignalTile label="Motion" value={videoPlanLabel} hint={videoPlanHint} tone={videoEnabled ? "success" : "neutral"} />
 						</div>
 					</div>
 				</div>
 			</EditorialCard>
 
 			{info ? <StateBlock tone="success" title="Done" description={info} /> : null}
-			{error ? <StateBlock tone="error" title="Action failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Action failed" description={error} /> : null}
 
 			<div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]">
 				<div className="space-y-4">
@@ -953,9 +1210,19 @@ export default function CampaignDetailPage() {
 						</div>
 
 						<div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
-							<SignalTile label="Total refs" value={String(referenceSummary.totalCount)} hint="4-8 works best" tone={referenceSummary.totalCount >= 4 ? "success" : referenceSummary.totalCount > 0 ? "warning" : "neutral"} />
+							<SignalTile
+								label="Total refs"
+								value={String(referenceSummary.totalCount)}
+								hint="4-8 works best"
+								tone={referenceSummary.totalCount >= 4 ? "success" : referenceSummary.totalCount > 0 ? "warning" : "neutral"}
+							/>
 							<SignalTile label="Primary" value={String(referenceSummary.primaryCount)} hint="1-3 identity anchors" tone={referenceSummary.primaryCount >= 1 ? "success" : "warning"} />
-							<SignalTile label="Uploads" value={String(referenceSummary.uploadedCount)} hint={`${referenceSummary.linkedCount} linked`} tone={referenceSummary.uploadedCount > 0 ? "success" : "neutral"} />
+							<SignalTile
+								label="Uploads"
+								value={String(referenceSummary.uploadedCount)}
+								hint={`${referenceSummary.linkedCount} linked`}
+								tone={referenceSummary.uploadedCount > 0 ? "success" : "neutral"}
+							/>
 							<SignalTile label="Coverage" value={referenceSummary.readinessLabel} hint="Use primary for face fidelity" tone={referenceSummary.readinessTone} />
 						</div>
 
@@ -980,12 +1247,7 @@ export default function CampaignDetailPage() {
 							<form className="space-y-2" onSubmit={uploadReferenceImage}>
 								<FormField label="Upload single reference" id="campaign-reference-upload">
 									<div className="flex gap-2">
-										<Input
-											key={uploadInputKey}
-											type="file"
-											accept="image/jpeg,image/png,image/webp"
-											onChange={event => setUploadReferenceFile(event.target.files?.[0] ?? null)}
-										/>
+										<Input key={uploadInputKey} type="file" accept="image/jpeg,image/png,image/webp" onChange={event => setUploadReferenceFile(event.target.files?.[0] ?? null)} />
 										<SelectField value={uploadReferenceWeight} onChange={event => setUploadReferenceWeight(event.target.value as "primary" | "secondary")}>
 											<option value="secondary">Secondary</option>
 											<option value="primary">Primary</option>
@@ -1011,8 +1273,8 @@ export default function CampaignDetailPage() {
 									return (
 										<div
 											key={`${reference.url}-${reference.id ?? ""}`}
-											className={`rounded-[1.25rem] border p-3 ${reference.weight === "primary" ? "border-primary/35 bg-primary/5" : "border-border/70 bg-card"}`}>
-											<div className="relative overflow-hidden rounded-[1rem] border border-border/70 bg-muted/35">
+											className={`rounded-xl border p-3 ${reference.weight === "primary" ? "border-primary/35 bg-primary/5" : "border-border/70 bg-card"}`}>
+											<div className="relative overflow-hidden rounded-lg border border-border/70 bg-muted/35">
 												{preview ? (
 													<Image src={preview} alt={reference.title ?? "Reference"} width={640} height={480} className="aspect-[4/3] w-full object-cover" unoptimized />
 												) : (
@@ -1086,7 +1348,7 @@ export default function CampaignDetailPage() {
 						</div>
 
 						<div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
-							<div className="space-y-3 rounded-[1.35rem] border border-border/70 bg-card/50 p-4">
+							<div className="space-y-3 rounded-2xl border border-border/70 bg-card/50 p-4">
 								<div className="flex flex-wrap items-center justify-between gap-2">
 									<p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{promptCustomized ? "Custom Prompt" : "Auto Prompt"}</p>
 									{promptCustomized ? (
@@ -1128,13 +1390,11 @@ export default function CampaignDetailPage() {
 								<div className="flex flex-wrap items-center gap-2">
 									<Badge tone={promptCustomized ? "warning" : "neutral"}>{promptCustomized ? "Custom prompt" : "Auto prompt"}</Badge>
 									<Badge tone="neutral">{promptWordCount} words</Badge>
-									<Badge tone={hasUnsavedStyleChanges ? "warning" : "success"}>
-										{hasUnsavedStyleChanges ? "Generate uses live controls" : "Direction saved"}
-									</Badge>
+									<Badge tone={hasUnsavedStyleChanges ? "warning" : "success"}>{hasUnsavedStyleChanges ? "Generate uses live controls" : "Direction saved"}</Badge>
 								</div>
 							</div>
 
-							<div className="rounded-[1.35rem] border border-border/70 bg-[linear-gradient(160deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--accent),transparent_78%))] p-4">
+							<div className="rounded-2xl border border-border/70 bg-[linear-gradient(160deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--accent),transparent_78%))] p-4">
 								<p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Direction Snapshot</p>
 								<p className="mt-2 text-sm text-muted-foreground">Keep these aligned so the prompt, controls, and references all describe the same scene.</p>
 								<div className="mt-3 flex flex-wrap gap-2">
@@ -1160,8 +1420,8 @@ export default function CampaignDetailPage() {
 					<EditorialCard className="space-y-4">
 						<div className="flex items-start justify-between gap-3">
 							<div>
-								<h3 className="font-display text-lg font-semibold">Image + Generate</h3>
-								<p className="text-xs text-muted-foreground">Choose the engine, confirm the output size, then run the anchor-first sequence.</p>
+								<h3 className="font-display text-lg font-semibold">Output Plan</h3>
+								<p className="text-xs text-muted-foreground">Lock the image run first, then decide whether matching 9:16 videos should auto-queue from the same campaign shots.</p>
 							</div>
 							<Badge tone={hasUnsavedImageSettings ? "warning" : "success"}>{hasUnsavedImageSettings ? "Unsaved setup" : "Setup synced"}</Badge>
 						</div>
@@ -1182,8 +1442,20 @@ export default function CampaignDetailPage() {
 							<CampaignStageCard
 								icon={<CheckCircle2 className="size-4" />}
 								label="Campaign Batch"
-								description={editProvider === "gpu" ? "GPU currently supports anchor-only mode here." : hasAnchor ? `Generate ${anchorBatchSize} campaign shots from the anchor.` : "Batch unlocks after the anchor is ready."}
+								description={
+									editProvider === "gpu"
+										? "GPU currently supports anchor-only mode here."
+										: hasAnchor
+											? `Generate ${anchorBatchSize} campaign shots from the anchor.`
+											: "Batch unlocks after the anchor is ready."
+								}
 								tone={editProvider === "gpu" ? "neutral" : hasAnchor ? "warning" : "neutral"}
+							/>
+							<CampaignStageCard
+								icon={<Clapperboard className="size-4" />}
+								label="Motion Outputs"
+								description={videoEnabled ? videoPlanHint : "Optional. Turn this on when the same campaign run should also produce reel-ready vertical video variants."}
+								tone={videoEnabled ? "success" : "neutral"}
 							/>
 						</div>
 
@@ -1229,13 +1501,78 @@ export default function CampaignDetailPage() {
 							</Button>
 						</div>
 
+						<div className="space-y-3 rounded-xl border border-border/50 bg-[linear-gradient(160deg,color-mix(in_oklab,var(--card),white_8%),color-mix(in_oklab,var(--accent),transparent_82%))] p-3">
+							<div className="flex items-start justify-between gap-2">
+								<div>
+									<p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Matching Videos</p>
+									<p className="text-xs text-muted-foreground">
+										Use the newly generated campaign images as the source frames so the video inherits the anchor-locked styling instead of starting from scratch.
+									</p>
+								</div>
+								<Badge tone={videoEnabled ? "success" : "neutral"}>{videoEnabled ? "Auto-queue on" : "Optional"}</Badge>
+							</div>
+
+							<ToggleRow
+								label="Generate matching reel videos with this campaign"
+								description="When enabled, image generation also queues vertical 9:16 videos from the new campaign shots."
+								checked={videoEnabled}
+								onCheckedChange={setVideoEnabled}
+								className="border border-border/70 bg-background/65"
+							/>
+
+							{videoEnabled ? (
+								<>
+									<div>
+										<p className="mb-2 text-xs font-semibold text-muted-foreground">Coverage</p>
+										<OptionCardGrid options={VIDEO_SCOPE_OPTIONS} value={videoScope} onChange={value => setVideoScope(value as CampaignVideoGenerationScope)} columns={2} size="sm" />
+									</div>
+
+									<div>
+										<p className="mb-2 text-xs font-semibold text-muted-foreground">Duration</p>
+										<OptionCardGrid
+											options={VIDEO_DURATION_OPTIONS}
+											value={String(videoDurationSeconds)}
+											onChange={value => setVideoDurationSeconds(Number(value) as CampaignVideoDurationSeconds)}
+											columns={2}
+											size="sm"
+										/>
+									</div>
+
+									<FormField label="Motion Direction" description="Optional. Describe movement, pacing, or camera behavior without changing the visual identity established by the images.">
+										<Textarea
+											rows={3}
+											value={videoPromptText}
+											onChange={event => setVideoPromptText(event.target.value)}
+											placeholder="e.g. subtle dolly-in, natural hair movement, slow luxury pacing, clean loop finish"
+										/>
+									</FormField>
+
+									<div className="flex flex-wrap gap-2">
+										<Badge tone="neutral">Vertical 9:16</Badge>
+										<Badge tone="neutral">{videoCoverageLabel}</Badge>
+										<Badge tone="neutral">{videoDurationSeconds}s</Badge>
+										{motionPromptTrimmed ? <Badge tone="warning">Custom motion prompt</Badge> : <Badge tone="success">Uses campaign direction</Badge>}
+									</div>
+
+									<p className="text-xs text-muted-foreground">
+										{videoPlanHint}{" "}
+										{hasUnsavedStyleChanges
+											? "These motion settings save with Creative Direction, but the next run will still use the live values shown here."
+											: "Saved motion settings carry forward for the next run."}
+									</p>
+								</>
+							) : (
+								<p className="text-xs text-muted-foreground">Leave this off when you want to review stills first and decide on motion later asset by asset.</p>
+							)}
+						</div>
+
 						<div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
 							<div className="flex items-start justify-between gap-2">
 								<div>
 									<p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Dispatch</p>
 									<p className="text-xs text-muted-foreground">Anchor-first generation keeps campaign outputs visually coherent.</p>
 								</div>
-								<Badge tone={hasAnchor ? "success" : "warning"}>{hasAnchor ? "Anchor ready" : "No anchor"}</Badge>
+								<Badge tone={videoEnabled ? "success" : hasAnchor ? "success" : "warning"}>{videoEnabled ? "Images + motion" : hasAnchor ? "Anchor ready" : "No anchor"}</Badge>
 							</div>
 
 							<div className="space-y-2">
@@ -1280,6 +1617,7 @@ export default function CampaignDetailPage() {
 							{editProvider === "gpu" ? <p className="text-xs text-muted-foreground">Batch mode with anchor is unavailable for the GPU image engine.</p> : null}
 							{hasUnsavedStyleChanges ? <p className="text-xs text-muted-foreground">Generation uses the live creative controls on this page, even before you save them.</p> : null}
 							{hasUnsavedImageSettings ? <p className="text-xs text-muted-foreground">The next run will auto-save the engine and resolution settings before dispatching.</p> : null}
+							{videoEnabled ? <p className="text-xs text-muted-foreground">{videoPlanHint}</p> : null}
 
 							<GenerationProgress batchSize={generationProgressBatchSize} isGenerating={isGenerating ?? false} onPollComplete={() => void load()} />
 
@@ -1301,17 +1639,67 @@ export default function CampaignDetailPage() {
 				rows={campaign.assets}
 				columns={assetColumns}
 				rowKey={row => row.id}
-				emptyMessage="No assets yet. Generate an anchor shot to begin."
+				emptyMessage={isGenerating ? "Images are rendering now. The live slots above stay animated until the queue fills in." : "No assets yet. Generate an anchor shot to begin."}
 			/>
 
-			<TableShell title="Generation Jobs" description="Recent dispatch and completion activity for this campaign." rows={campaign.generation_jobs} columns={jobColumns} rowKey={row => row.id} emptyMessage="No generation jobs yet." />
-
-			<CampaignAssetLightbox
-				assets={campaign.assets}
-				activeAssetId={expandedAssetId}
-				onClose={() => setExpandedAssetId(null)}
-				onSelectAsset={setExpandedAssetId}
+			<TableShell
+				title="Generation Jobs"
+				description="Recent dispatch and completion activity for this campaign."
+				rows={campaign.generation_jobs}
+				columns={jobColumns}
+				rowKey={row => row.id}
+				emptyMessage="No generation jobs yet."
 			/>
+
+			<Dialog open={duplicateDialogOpen} onOpenChange={setDuplicateDialogOpen}>
+				<DialogContent className="sm:max-w-2xl">
+					<DialogHeader>
+						<DialogTitle>Duplicate Campaign Setup</DialogTitle>
+						<DialogDescription>
+							Create one new draft per selected model. Assets, anchor frames, and review history stay behind.
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="space-y-4">
+						<FormField
+							label="Base Name"
+							description="Optional. Leave blank to reuse the current campaign name and adapt it for each selected model."
+						>
+							<Input
+								value={duplicateName}
+								onChange={event => setDuplicateName(event.target.value)}
+								placeholder={campaign.name}
+							/>
+						</FormField>
+
+						<FormField
+							label="Target Models"
+							description="Choose the models that should receive a fresh linked draft from this setup."
+						>
+							<CampaignModelPicker
+								models={modelOptions}
+								selectedModelIds={duplicateModelIds}
+								onSelectedModelIdsChange={setDuplicateModelIds}
+								currentModelId={campaign.model?.id}
+								disabled={loadingModelOptions || duplicatingCampaigns}
+								error={duplicateError ?? undefined}
+								emptyMessage="No active models are available to duplicate into."
+							/>
+						</FormField>
+					</div>
+
+					<DialogFooter>
+						<Button type="button" variant="outline" onClick={() => setDuplicateDialogOpen(false)} disabled={duplicatingCampaigns}>
+							Cancel
+						</Button>
+						<Button type="button" onClick={() => void duplicateCampaign()} disabled={!duplicateReady}>
+							{duplicatingCampaigns ? "Duplicating…" : duplicateModelIds.length > 1 ? `Create ${duplicateModelIds.length} Linked Drafts` : "Create Duplicate"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<CampaignAssetLightbox assets={campaign.assets} activeAssetId={expandedAssetId} onClose={() => setExpandedAssetId(null)} onSelectAsset={setExpandedAssetId} />
 		</div>
 	);
 }
@@ -1324,6 +1712,10 @@ function buildCreativeControlsPayload({
 	silhouette,
 	lensSimulation,
 	moodTags,
+	videoEnabled,
+	videoScope,
+	videoDurationSeconds,
+	videoPromptText,
 	shoulderAngle,
 	hipShift,
 	chinTilt,
@@ -1336,6 +1728,10 @@ function buildCreativeControlsPayload({
 	silhouette: Silhouette;
 	lensSimulation: LensSimulation;
 	moodTags: string[];
+	videoEnabled: boolean;
+	videoScope: CampaignVideoGenerationScope;
+	videoDurationSeconds: CampaignVideoDurationSeconds;
+	videoPromptText: string;
 	shoulderAngle: string;
 	hipShift: string;
 	chinTilt: string;
@@ -1368,6 +1764,12 @@ function buildCreativeControlsPayload({
 		},
 		aesthetic: {
 			mood_tags: moodTags.slice(0, 12)
+		},
+		video: {
+			enabled: videoEnabled,
+			generation_scope: videoScope,
+			duration_seconds: videoDurationSeconds,
+			prompt_text: videoPromptText.trim()
 		}
 	};
 }
@@ -1431,15 +1833,10 @@ function arrayEquals(left: string[], right: string[]): boolean {
 }
 
 function CampaignStageCard({ icon, label, description, tone }: { icon: ReactNode; label: string; description: string; tone: WorkflowTone }) {
-	const toneClassName =
-		tone === "success"
-			? "border-emerald-400/30 bg-emerald-500/10"
-			: tone === "warning"
-				? "border-amber-400/30 bg-amber-500/10"
-				: "border-border/70 bg-card/60";
+	const toneClassName = tone === "success" ? "border-emerald-400/30 bg-emerald-500/10" : tone === "warning" ? "border-amber-400/30 bg-amber-500/10" : "border-border/70 bg-card/60";
 
 	return (
-		<div className={`rounded-[1.2rem] border p-3 ${toneClassName}`}>
+		<div className={`rounded-xl border p-3 ${toneClassName}`}>
 			<div className="flex items-start gap-3">
 				<div className="rounded-full border border-border/70 bg-background/80 p-2 text-muted-foreground">{icon}</div>
 				<div className="space-y-1">
@@ -1455,7 +1852,7 @@ function SignalTile({ label, value, hint, tone }: { label: string; value: string
 	const valueClassName = tone === "success" ? "text-[var(--status-success)]" : tone === "warning" ? "text-[var(--status-warning)]" : "text-foreground";
 
 	return (
-		<div className="rounded-[1.1rem] border border-border/70 bg-card/55 p-3">
+		<div className="rounded-xl border border-border/70 bg-card/55 p-3">
 			<p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">{label}</p>
 			<p className={`mt-2 text-sm font-semibold ${valueClassName}`}>{value}</p>
 			<p className="mt-1 text-[11px] text-muted-foreground">{hint}</p>

@@ -26,6 +26,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 			initiatedBy: session.userId,
 			shotCode: body.shot_code,
 			imageDataUrl: body.image_data_url,
+			candidateId: body.candidate_id,
 			candidateIndex: body.candidate_index,
 			packVersion: body.pack_version
 		});

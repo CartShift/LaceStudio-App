@@ -582,5 +582,9 @@ describe("model-photo-import.service", () => {
 			counts: { total: 3 },
 		});
 		expect(prismaMock.aiModel.update).toHaveBeenCalledTimes(1);
+		const updatePayload = prismaMock.aiModel.update.mock.calls[0]?.[0] as {
+			data?: { onboarding_state?: { photo_import?: { latest_suggestion?: unknown } } };
+		};
+		expect(updatePayload.data?.onboarding_state?.photo_import?.latest_suggestion).toBeNull();
 	});
 });

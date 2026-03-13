@@ -353,6 +353,8 @@ model Campaign {
   id                      String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name                    String           @db.VarChar(200)
   model_id                String           @db.Uuid
+  campaign_group_id       String?          @db.Uuid
+  source_campaign_id      String?          @db.Uuid
   preset_version_id       String           @db.Uuid
   pose_pack_id            String?          @db.Uuid
   image_model_provider    ImageModelProvider @default(zai_glm)
@@ -389,6 +391,8 @@ model Campaign {
   @@index([created_by], map: "idx_campaigns_created_by")
   @@index([preset_version_id], map: "idx_campaigns_preset_version_id")
   @@index([created_at(sort: Desc)], map: "idx_campaigns_created_at")
+  @@index([campaign_group_id], map: "idx_campaigns_group_id")
+  @@index([source_campaign_id], map: "idx_campaigns_source_campaign_id")
   @@map("campaigns")
 }
 

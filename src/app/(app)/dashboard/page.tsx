@@ -2,20 +2,7 @@
 
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import {
-	Activity,
-	AlertTriangle,
-	ArrowRight,
-	BarChart3,
-	Bot,
-	CheckCircle2,
-	Clock3,
-	Megaphone,
-	Rocket,
-	Send,
-	Sparkles,
-	type LucideIcon
-} from "lucide-react";
+import { Activity, AlertTriangle, ArrowRight, BarChart3, Bot, CheckCircle2, Clock3, Megaphone, Rocket, Send, Sparkles, type LucideIcon } from "lucide-react";
 import { PageScaffold } from "@/components/layout/page-scaffold";
 import { PageBreadcrumbs } from "@/components/layout/page-breadcrumbs";
 import { Button } from "@/components/ui/button";
@@ -103,39 +90,34 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 			? {
 					eyebrow: "Studio setup",
 					title: "Set the first signature model",
-					description:
-						"No model profiles are set up yet. Start there so campaigns, approvals, and publishing all have a clear creative base.",
+					description: "No model profiles are set up yet. Start there so campaigns, approvals, and publishing all have a clear creative base.",
 					tone: "warning" as const
 				}
 			: blockers > 0
 				? {
 						eyebrow: "Needs attention",
 						title: `${pluralize(blockers, "studio issue")} to clear`,
-						description:
-							"Failed publishing or stalled renders slow the whole flow. Clear them before starting new launches.",
+						description: "Failed publishing or stalled renders slow the whole flow. Clear them before starting new launches.",
 						tone: "danger" as const
 					}
 				: reviewLoad > 0
 					? {
 							eyebrow: "Review queue open",
 							title: `${pluralize(reviewLoad, "decision")} waiting`,
-							description:
-								"Creative review and approvals are now setting the pace. A quick pass here will move the studio forward.",
+							description: "Creative review and approvals are now setting the pace. A quick pass here will move the studio forward.",
 							tone: "warning" as const
 						}
 					: summary.active_jobs > 0
 						? {
 								eyebrow: "Production running",
 								title: `${pluralize(summary.active_jobs, "look")} in motion`,
-								description:
-									"Looks are moving cleanly and the approval queue is calm. This is a good time to line up the next campaign.",
+								description: "Looks are moving cleanly and the approval queue is calm. This is a good time to line up the next campaign.",
 								tone: "success" as const
 							}
 						: {
 								eyebrow: "Calm studio",
 								title: "Ready for the next launch",
-								description:
-									"No blockers, no review pile-up, and no live renders competing for attention.",
+								description: "No blockers, no review pile-up, and no live renders competing for attention.",
 								tone: "neutral" as const
 							};
 
@@ -143,32 +125,28 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 		{
 			label: "Blockers",
 			value: blockers === 0 ? "Clear" : String(blockers),
-			description:
-				blockers === 0 ? "No failed publishing or stalled renders." : `${pluralize(blockers, "issue")} need attention.`,
+			description: blockers === 0 ? "No failed publishing or stalled renders." : `${pluralize(blockers, "issue")} need attention.`,
 			tone: blockers === 0 ? "success" : "danger",
 			icon: AlertTriangle
 		},
 		{
 			label: "Review load",
 			value: reviewLoad === 0 ? "Light" : String(reviewLoad),
-			description:
-				reviewLoad === 0 ? "Nothing is waiting for review." : `${pluralize(reviewLoad, "item")} waiting for review or approval.`,
+			description: reviewLoad === 0 ? "Nothing is waiting for review." : `${pluralize(reviewLoad, "item")} waiting for review or approval.`,
 			tone: reviewLoad === 0 ? "success" : "warning",
 			icon: Clock3
 		},
 		{
 			label: "Looks in motion",
 			value: summary.active_jobs === 0 ? "Idle" : String(summary.active_jobs),
-			description:
-				summary.active_jobs === 0 ? "No looks are rendering right now." : `${pluralize(summary.active_jobs, "look")} moving through production.`,
+			description: summary.active_jobs === 0 ? "No looks are rendering right now." : `${pluralize(summary.active_jobs, "look")} moving through production.`,
 			tone: summary.active_jobs > 0 ? "success" : "neutral",
 			icon: Sparkles
 		},
 		{
 			label: "Campaign lineup",
 			value: String(summary.campaigns_total),
-			description:
-				summary.campaigns_total === 0 ? "No campaigns are in the lineup yet." : `${pluralize(summary.campaigns_total, "campaign")} in the studio lineup.`,
+			description: summary.campaigns_total === 0 ? "No campaigns are in the lineup yet." : `${pluralize(summary.campaigns_total, "campaign")} in the studio lineup.`,
 			tone: summary.campaigns_total === 0 ? "warning" : "neutral",
 			icon: Megaphone
 		}
@@ -256,8 +234,7 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 		{
 			label: "Model lineup",
 			value: String(summary.models_total),
-			description:
-				summary.models_total === 0 ? "Build the first signature model before scaling production." : "Signature models ready to power campaigns.",
+			description: summary.models_total === 0 ? "Build the first signature model before scaling production." : "Signature models ready to power campaigns.",
 			href: "/models",
 			tone: summary.models_total === 0 ? "warning" : "success",
 			icon: Bot
@@ -265,8 +242,7 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 		{
 			label: "Creative review",
 			value: String(summary.campaigns_in_review),
-			description:
-				summary.campaigns_in_review === 0 ? "No campaign selects are waiting for review." : "Creative is waiting for feedback before release.",
+			description: summary.campaigns_in_review === 0 ? "No campaign selects are waiting for review." : "Creative is waiting for feedback before release.",
 			href: "/campaigns",
 			tone: summary.campaigns_in_review > 0 ? "warning" : "neutral",
 			icon: Megaphone
@@ -274,8 +250,7 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 		{
 			label: "Publishing approvals",
 			value: String(summary.publishing_pending_approval),
-			description:
-				summary.publishing_pending_approval === 0 ? "Publishing is clear for delivery." : "Approvals are the current hold-up.",
+			description: summary.publishing_pending_approval === 0 ? "Publishing is clear for delivery." : "Approvals are the current hold-up.",
 			href: "/publish/approvals",
 			tone: summary.publishing_pending_approval > 0 ? "warning" : "neutral",
 			icon: Send
@@ -284,11 +259,7 @@ function buildDashboardViewModel(summary: DashboardSummaryResponse): DashboardVi
 			label: "Render watch",
 			value: summary.stale_jobs > 0 ? `${summary.stale_jobs} stale` : summary.active_jobs > 0 ? `${summary.active_jobs} live` : "Idle",
 			description:
-				summary.stale_jobs > 0
-					? "Some looks have stalled and need attention."
-					: summary.active_jobs > 0
-						? "Looks are moving through production cleanly."
-						: "No renders are running right now.",
+				summary.stale_jobs > 0 ? "Some looks have stalled and need attention." : summary.active_jobs > 0 ? "Looks are moving through production cleanly." : "No renders are running right now.",
 			href: "/dashboard",
 			tone: summary.stale_jobs > 0 ? "danger" : summary.active_jobs > 0 ? "success" : "neutral",
 			icon: Activity
@@ -370,7 +341,7 @@ function SignalCard({ signal }: { signal: SignalCardModel }) {
 	const Icon = signal.icon;
 
 	return (
-		<div className={cn("ds-signal-card rounded-[1.35rem] p-4", toneSurfaceClass(signal.tone))}>
+		<div className={cn("ds-signal-card rounded-2xl p-4", toneSurfaceClass(signal.tone))}>
 			<div className="relative flex items-start justify-between gap-3">
 				<div>
 					<p className="ds-kicker">{signal.label}</p>
@@ -389,19 +360,12 @@ function ActionCard({ action }: { action: PriorityAction }) {
 	const Icon = action.icon;
 
 	return (
-		<Link
-			href={action.href}
-			className={cn(
-				"ds-signal-card group block rounded-[1.5rem] p-5 transition-transform duration-200 hover:-translate-y-1",
-				toneSurfaceClass(action.tone)
-			)}>
+		<Link href={action.href} className={cn("ds-signal-card group block rounded-3xl p-5 transition-transform duration-200 hover:-translate-y-1", toneSurfaceClass(action.tone))}>
 			<div className="relative">
 				<div className="flex items-start justify-between gap-3">
 					<div>
 						<p className="ds-kicker">{action.eyebrow}</p>
-						<h3 className="mt-2 font-display text-[1.55rem] font-semibold leading-[1.02] tracking-[-0.04em] text-balance">
-							{action.title}
-						</h3>
+						<h3 className="mt-2 font-display text-[1.55rem] font-semibold leading-[1.02] tracking-[-0.04em] text-balance">{action.title}</h3>
 					</div>
 					<span className={cn("rounded-full border p-2.5", toneIconClass(action.tone))}>
 						<Icon className="h-4 w-4" />
@@ -426,12 +390,7 @@ function PipelineCard({ lane }: { lane: PipelineLane }) {
 	const Icon = lane.icon;
 
 	return (
-		<Link
-			href={lane.href}
-			className={cn(
-				"ds-signal-card group block rounded-[1.4rem] p-4 transition-transform duration-200 hover:-translate-y-0.5",
-				toneSurfaceClass(lane.tone)
-			)}>
+		<Link href={lane.href} className={cn("ds-signal-card group block rounded-2xl p-4 transition-transform duration-200 hover:-translate-y-0.5", toneSurfaceClass(lane.tone))}>
 			<div className="relative">
 				<div className="flex items-start justify-between gap-3">
 					<div>
@@ -463,30 +422,28 @@ export default function DashboardPage() {
 
 	return (
 		<PageScaffold className="space-y-6">
-			{error instanceof Error ? <StateBlock tone="error" title="Dashboard metrics failed to load" description={error.message} /> : null}
+			{error instanceof Error ? <StateBlock tone="danger" title="Dashboard metrics failed to load" description={error.message} /> : null}
 
 			<section className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_380px]">
-				<EditorialCard className="rounded-[1.9rem] p-5 md:p-6">
+				<EditorialCard className="rounded-4xl p-5 md:p-6">
 					<div className="space-y-5">
 						<div className="space-y-2">
 							<PageBreadcrumbs />
 							<p className="ds-kicker">{view.health.eyebrow}</p>
-							<h2 className="font-display text-[clamp(2.15rem,4.8vw,3.75rem)] font-bold leading-[0.93] tracking-[-0.06em] text-balance">
-								{view.health.title}
-							</h2>
+							<h2 className="font-display text-[clamp(2.15rem,4.8vw,3.75rem)] font-bold leading-[0.93] tracking-[-0.06em] text-balance">{view.health.title}</h2>
 							<p className="max-w-3xl text-sm leading-relaxed text-muted-foreground">{view.health.description}</p>
 						</div>
 
 						<div className="grid gap-3 sm:grid-cols-3">
-							<div className="ds-signal-card rounded-[1.15rem] p-3.5">
+							<div className="ds-signal-card rounded-xl p-3.5">
 								<p className="ds-kicker">Models</p>
 								<p className="ds-stat-value mt-2 text-[1.45rem]">{isLoading ? "..." : String(view.summary.models_total)}</p>
 							</div>
-							<div className="ds-signal-card rounded-[1.15rem] p-3.5">
+							<div className="ds-signal-card rounded-xl p-3.5">
 								<p className="ds-kicker">Campaigns</p>
 								<p className="ds-stat-value mt-2 text-[1.45rem]">{isLoading ? "..." : String(view.summary.campaigns_total)}</p>
 							</div>
-							<div className="ds-signal-card rounded-[1.15rem] p-3.5">
+							<div className="ds-signal-card rounded-xl p-3.5">
 								<p className="ds-kicker">Approvals</p>
 								<p className="ds-stat-value mt-2 text-[1.45rem]">{isLoading ? "..." : String(view.summary.publishing_pending_approval)}</p>
 							</div>
@@ -524,7 +481,7 @@ export default function DashboardPage() {
 					</div>
 				</div>
 
-				<EditorialCard className="rounded-[1.7rem] p-5">
+				<EditorialCard className="rounded-4xl p-5">
 					<div>
 						<h2 className="font-display text-[1.9rem] font-semibold tracking-[-0.04em]">Shortcuts</h2>
 						<p className="mt-2 text-sm leading-relaxed text-muted-foreground">Common actions you may want next.</p>
@@ -538,7 +495,7 @@ export default function DashboardPage() {
 								<Link
 									key={command.href}
 									href={command.href}
-									className="group flex items-center gap-3 rounded-[1.15rem] border border-border/55 bg-background/35 px-3.5 py-3 transition-all duration-200 hover:-translate-y-0.5 hover:border-[color:color-mix(in_oklab,var(--primary),transparent_76%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_74%)]">
+									className="group flex items-center gap-3 rounded-xl border border-border/55 bg-background/35 px-3.5 py-3 transition-all duration-200 hover:-translate-y-0.5 hover:border-[color:color-mix(in_oklab,var(--primary),transparent_76%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_74%)]">
 									<span className="rounded-full border border-border/60 bg-background/60 p-2.5 text-primary">
 										<Icon className="h-4 w-4" />
 									</span>

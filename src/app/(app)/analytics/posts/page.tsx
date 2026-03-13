@@ -193,7 +193,7 @@ export default function AnalyticsPostsPage() {
 			</FilterShell>
 
 			{query.isLoading ? <StateBlock title="Loading post analytics..." /> : null}
-			{query.error instanceof Error ? <StateBlock tone="error" title="Couldn't load post analytics" description={query.error.message} /> : null}
+			{query.error instanceof Error ? <StateBlock tone="danger" title="Couldn't load post analytics" description={query.error.message} /> : null}
 
 			<TableShell
 				title="Post Metrics"

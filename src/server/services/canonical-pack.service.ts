@@ -42,15 +42,19 @@ type CanonicalGenerationState = {
 	pack_version?: number;
 	provider?: ImageModelProvider;
 	provider_model_id?: string;
+	error_request_id?: string;
 	generation_mode?: CanonicalGenerationMode;
-	status?: "GENERATING" | "READY" | "FAILED";
+	status?: "GENERATING" | "READY" | "FAILED" | "APPROVED";
+	error?: string | null;
 	started_at?: string;
 	heartbeat_at?: string;
 	completed_at?: string;
 	completed_shots?: number;
 	total_shots?: number;
 	failed_shots?: number;
+	candidates_per_shot?: number;
 	shot_codes?: CanonicalShotCode[];
+	reference_pool?: CanonicalConditioningReference[];
 };
 
 type PhotoImportImageReview = {
@@ -76,7 +80,15 @@ type CanonicalConditioningReference = ImageReferenceInput & {
 	sharpness_score?: number;
 };
 
-export async function uploadCandidateReference(input: { modelId: string; initiatedBy: string; shotCode: string; imageDataUrl: string; candidateIndex?: number; packVersion?: number }) {
+export async function uploadCandidateReference(input: {
+	modelId: string;
+	initiatedBy: string;
+	shotCode: string;
+	imageDataUrl: string;
+	candidateId?: string;
+	candidateIndex?: number;
+	packVersion?: number;
+}) {
 	const model = await prisma.aiModel.findUnique({
 		where: { id: input.modelId },
 		select: {
@@ -102,9 +114,18 @@ export async function uploadCandidateReference(input: { modelId: string; initiat
 	const nowIso = new Date().toISOString();
 	const onboardingState = asRecord(model.onboarding_state) ?? {};
 	const generationState = readCanonicalGenerationState(onboardingState);
+	const packState = readCanonicalPackState(onboardingState, packVersion);
 
 	// Manual uploads can recover packs that were never started or previously failed.
 	if (model.canonical_pack_status === "NOT_STARTED" || model.canonical_pack_status === "FAILED") {
+		const nextPackState: CanonicalGenerationState = {
+			...(packState ?? generationState ?? {}),
+			pack_version: packVersion,
+			status: "READY",
+			error: null,
+			heartbeat_at: nowIso,
+			completed_at: nowIso
+		};
 		await prisma.aiModel.update({
 			where: { id: input.modelId },
 			data: {
@@ -114,18 +135,24 @@ export async function uploadCandidateReference(input: { modelId: string; initiat
 					canonical_pack_error: null,
 					canonical_pack_generation: {
 						...generationState,
-						status: "READY",
-						pack_version: packVersion,
-						heartbeat_at: nowIso,
-						completed_at: nowIso
-					}
+						...nextPackState
+					},
+					canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, packVersion, nextPackState)
 				}
 			}
 		});
 	}
 
+	const replacementTarget = await findCanonicalCandidateReplacementTarget({
+		modelId: input.modelId,
+		packVersion,
+		shotCode: input.shotCode,
+		candidateId: input.candidateId,
+		candidateIndex: input.candidateIndex
+	});
+
 	// Auto-increment candidate index if not provided
-	let candidateIndex = input.candidateIndex;
+	let candidateIndex = replacementTarget?.candidate_index ?? input.candidateIndex;
 	if (!candidateIndex) {
 		const aggregate = await prisma.modelReferenceCandidate.aggregate({
 			where: { model_id: input.modelId, pack_version: packVersion, shot_code: input.shotCode },
@@ -163,25 +190,46 @@ export async function uploadCandidateReference(input: { modelId: string; initiat
 		shotPrompt
 	});
 
-	const candidate = await prisma.modelReferenceCandidate.create({
-		data: {
-			model_id: input.modelId,
-			pack_version: packVersion,
-			shot_code: input.shotCode,
-			candidate_index: candidateIndex,
-			seed: randomInt(10_000, 999_999), // Just a dummy seed for manual uploads
-			prompt_text: shotPrompt,
-			image_gcs_uri: gcsUri,
-			provider: "openai", // Treat manual config as openai/gpu basically
-			provider_model_id: "manual-upload",
-			realism_score: score.realism_score,
-			clarity_score: score.clarity_score,
-			consistency_score: score.consistency_score,
-			composite_score: score.composite_score,
-			qa_notes: "Uploaded manually. " + (score.qa_notes ?? ""),
-			status: "CANDIDATE"
-		}
-	});
+	const candidateData = {
+		model_id: input.modelId,
+		pack_version: packVersion,
+		shot_code: input.shotCode,
+		candidate_index: candidateIndex,
+		seed: randomInt(10_000, 999_999), // Just a dummy seed for manual uploads
+		prompt_text: shotPrompt,
+		image_gcs_uri: gcsUri,
+		provider: "openai" as const, // Treat manual config as openai/gpu basically
+		provider_model_id: "manual-upload",
+		realism_score: score.realism_score,
+		clarity_score: score.clarity_score,
+		consistency_score: score.consistency_score,
+		composite_score: score.composite_score,
+		qa_notes: "Uploaded manually. " + (score.qa_notes ?? "")
+	};
+
+	const candidate = replacementTarget
+		? await prisma.modelReferenceCandidate.update({
+				where: { id: replacementTarget.id },
+				data: candidateData
+		  })
+		: await prisma.modelReferenceCandidate.create({
+				data: {
+					...candidateData,
+					status: "CANDIDATE"
+				}
+		  });
+
+	if (replacementTarget) {
+		await syncCanonicalReferenceForCandidate({
+			modelId: input.modelId,
+			packVersion,
+			candidateId: replacementTarget.id,
+			seed: candidateData.seed,
+			promptText: candidateData.prompt_text,
+			imageGcsUri: candidateData.image_gcs_uri,
+			qaNotes: candidateData.qa_notes
+		});
+	}
 
 	log({
 		level: "info",
@@ -208,6 +256,9 @@ export async function startCanonicalPackGeneration(input: {
 	candidatesPerShot: number;
 	generationMode?: CanonicalGenerationMode;
 	packVersion?: number;
+	shotCodes?: CanonicalShotCode[];
+	replaceCandidateId?: string;
+	regenerateExisting?: boolean;
 	awaitCompletion?: boolean;
 }): Promise<{ job_id: string; pack_version: number }> {
 	const model = await prisma.aiModel.findUnique({
@@ -242,9 +293,7 @@ export async function startCanonicalPackGeneration(input: {
 		throw new ApiError(400, "VALIDATION_ERROR", "This Model has no active version for GPU image creation. Use another Image Engine or activate a version.");
 	}
 
-	const generationMode = input.generationMode ?? "front_only";
-	const shotCodes = resolveShotCodesForGenerationMode(generationMode);
-	const requestedCandidatesPerShot = Math.max(1, Math.min(5, Math.trunc(input.candidatesPerShot || 1)));
+	const requestedGenerationMode = input.generationMode ?? "front_only";
 	const onboardingState = asRecord(model.onboarding_state) ?? {};
 	const activeGenerationState = readCanonicalGenerationState(onboardingState);
 	const staleFromState = model.canonical_pack_status === "GENERATING" ? isCanonicalGenerationStateStale(activeGenerationState) : false;
@@ -290,11 +339,29 @@ export async function startCanonicalPackGeneration(input: {
 		where: { model_id: input.modelId },
 		_max: { pack_version: true }
 	});
+	const trackedPackVersions = Object.keys(readCanonicalPackStateMap(onboardingState))
+		.map(value => Number(value))
+		.filter(value => Number.isInteger(value) && value > 0);
+	const latestTrackedPackVersion = trackedPackVersions.length > 0 ? Math.max(...trackedPackVersions) : 0;
+	const requestedPackVersion = input.packVersion ?? 0;
+	const resumeExistingPack = requestedPackVersion > 0;
+	const latestKnownPackVersion = Math.max(
+		model.active_canonical_pack_version,
+		maxCandidatePack._max.pack_version ?? 0,
+		activeGenerationState?.pack_version ?? 0,
+		latestTrackedPackVersion
+	);
+	const storedGenerationForPack =
+		activeGenerationState?.pack_version === requestedPackVersion ? activeGenerationState : readCanonicalPackState(onboardingState, requestedPackVersion);
+	const generationMode = resumeExistingPack && storedGenerationForPack?.generation_mode ? storedGenerationForPack.generation_mode : requestedGenerationMode;
 	let selectedFrontCandidateUri: string | undefined;
-	let packVersion = Math.max(model.active_canonical_pack_version, maxCandidatePack._max.pack_version ?? 0) + 1;
+	const packVersion = resumeExistingPack ? requestedPackVersion : Math.max(model.active_canonical_pack_version, maxCandidatePack._max.pack_version ?? 0, latestTrackedPackVersion) + 1;
+
+	if (resumeExistingPack && latestKnownPackVersion > 0 && requestedPackVersion > latestKnownPackVersion) {
+		throw new ApiError(400, "VALIDATION_ERROR", "This Reference Set version could not be found. Refresh and try again.");
+	}
 
 	if (generationMode === "remaining") {
-		packVersion = input.packVersion ?? 0;
 		if (packVersion <= 0) {
 			throw new ApiError(400, "VALIDATION_ERROR", "A valid set version is required before creating remaining looks. Refresh and try again.");
 		}
@@ -319,23 +386,37 @@ export async function startCanonicalPackGeneration(input: {
 	}
 
 	const photoImportReviews = readPhotoImportImageReviews(onboardingState);
-	const conditioningReferencePool = buildCanonicalConditioningReferencePool({
-		selectedFrontCandidateUri,
-		canonicalReferences: model.canonical_references.map(item => ({
-			url: item.reference_image_url,
-			shotCode: normalizeCanonicalShotCode(item.shot_code)
-		})),
-		sourceReferences: (model.source_references ?? []).map(item => ({
-			id: item.id,
-			url: item.image_gcs_uri,
-			fileName: item.file_name,
-			sortOrder: item.sort_order
-		})),
-		photoImportReviews
-	});
+	const conditioningReferencePool =
+		resumeExistingPack && storedGenerationForPack?.reference_pool && storedGenerationForPack.reference_pool.length > 0
+			? storedGenerationForPack.reference_pool
+			: buildCanonicalConditioningReferencePool({
+					selectedFrontCandidateUri,
+					canonicalReferences: model.canonical_references.map(item => ({
+						url: item.reference_image_url,
+						shotCode: normalizeCanonicalShotCode(item.shot_code)
+					})),
+					sourceReferences: (model.source_references ?? []).map(item => ({
+						id: item.id,
+						url: item.image_gcs_uri,
+						fileName: item.file_name,
+						sortOrder: item.sort_order
+					})),
+					photoImportReviews
+			  });
+	const requestedCandidatesPerShot = Math.max(1, Math.min(5, Math.trunc(input.candidatesPerShot || 1)));
+	const effectiveCandidatesPerShot = resumeExistingPack && storedGenerationForPack?.candidates_per_shot ? storedGenerationForPack.candidates_per_shot : requestedCandidatesPerShot;
+	const requestedProvider = resumeExistingPack && storedGenerationForPack?.provider ? storedGenerationForPack.provider : input.provider;
+	const requestedProviderModelId =
+		resumeExistingPack && storedGenerationForPack?.provider_model_id ? storedGenerationForPack.provider_model_id : input.providerModelId;
+	const shotCodes = normalizeRequestedCanonicalShotCodes(input.shotCodes);
+	const storedShotCodes = resolveTrackedCanonicalShotCodes(storedGenerationForPack);
+	const targetShotCodes = shotCodes.length > 0 ? shotCodes : storedShotCodes.length > 0 ? storedShotCodes : resolveShotCodesForGenerationMode(generationMode);
+	if (input.replaceCandidateId && targetShotCodes.length !== 1) {
+		throw new ApiError(400, "VALIDATION_ERROR", "Replacing an existing reference only works for a single angle at a time.");
+	}
 	const effectiveProviderSelection = resolveCanonicalGenerationProviderSelection({
-		requestedProvider: input.provider,
-		requestedModelId: input.providerModelId,
+		requestedProvider,
+		requestedModelId: requestedProviderModelId,
 		conditioningReferenceCount: conditioningReferencePool.length
 	});
 
@@ -349,18 +430,22 @@ export async function startCanonicalPackGeneration(input: {
 		provider_model_id: effectiveProviderSelection.providerModelId,
 		generation_mode: generationMode,
 		status: "GENERATING",
+		error: null,
 		started_at: nowIso,
 		heartbeat_at: nowIso,
 		completed_at: undefined,
 		completed_shots: 0,
-		total_shots: shotCodes.length,
+		total_shots: targetShotCodes.length,
 		failed_shots: 0,
-		shot_codes: shotCodes
+		candidates_per_shot: effectiveCandidatesPerShot,
+		shot_codes: targetShotCodes,
+		reference_pool: conditioningReferencePool
 	};
 	const onboardingStateForGeneration = {
 		...onboardingState,
 		canonical_pack_error: null,
-		canonical_pack_generation: generationPayload
+		canonical_pack_generation: generationPayload,
+		canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, packVersion, generationPayload)
 	};
 
 	if (model.canonical_pack_status === "GENERATING" && staleGeneration) {
@@ -400,10 +485,12 @@ export async function startCanonicalPackGeneration(input: {
 		metadata: {
 			pack_version: packVersion,
 			provider: effectiveProviderSelection.provider,
-			requested_provider: input.provider,
-			candidates_per_shot: requestedCandidatesPerShot,
+			requested_provider: requestedProvider,
+			candidates_per_shot: effectiveCandidatesPerShot,
 			generation_mode: generationMode,
 			job_id: jobId,
+			resume_existing_pack: resumeExistingPack,
+			regenerate_existing: input.regenerateExisting === true,
 			stale_takeover: model.canonical_pack_status === "GENERATING" && staleGeneration,
 			conditioning_reference_count: conditioningReferencePool.length
 		}
@@ -412,8 +499,8 @@ export async function startCanonicalPackGeneration(input: {
 	const generationRequest = {
 		...input,
 		provider: effectiveProviderSelection.provider,
-		candidatesPerShot: requestedCandidatesPerShot,
 		providerModelId: effectiveProviderSelection.providerModelId,
+		candidatesPerShot: effectiveCandidatesPerShot,
 		packVersion,
 		jobId,
 		modelName: model.name,
@@ -421,8 +508,10 @@ export async function startCanonicalPackGeneration(input: {
 		faceProfile: asRecord(model.face_profile),
 		imperfectionFingerprint: asRecordArray(model.imperfection_fingerprint),
 		referencePool: conditioningReferencePool,
-		shotCodes,
-		generationMode
+		shotCodes: targetShotCodes,
+		replaceCandidateId: input.replaceCandidateId,
+		generationMode,
+		regenerateExisting: input.regenerateExisting === true
 	};
 
 	if (input.awaitCompletion) {
@@ -474,10 +563,13 @@ async function generateCanonicalPackInternal(input: {
 	imperfectionFingerprint: Array<Record<string, unknown>> | null;
 	referencePool: CanonicalConditioningReference[];
 	shotCodes: CanonicalShotCode[];
+	replaceCandidateId?: string;
 	generationMode: CanonicalGenerationMode;
+	regenerateExisting: boolean;
 }) {
 	let completedShots = 0;
 	let totalShots: number = input.shotCodes.length;
+	let lastErrorRequestId: string | undefined;
 
 	try {
 		const isCurrentJob = await ensureCanonicalJobStillCurrent(input.modelId, input.jobId);
@@ -527,7 +619,32 @@ async function generateCanonicalPackInternal(input: {
 				}
 			});
 		}
+		const completedShotCodes = await listCompletedCanonicalShotCodes({
+			modelId: input.modelId,
+			packVersion: input.packVersion,
+			shotCodes: shotPlan.map(shot => shot.shot_code)
+		});
+		const pendingShotPlan = input.regenerateExisting ? shotPlan : shotPlan.filter(shot => !completedShotCodes.has(shot.shot_code));
+		completedShots = input.regenerateExisting ? 0 : shotPlan.filter(shot => completedShotCodes.has(shot.shot_code)).length;
 		const shotErrors: string[] = [];
+
+		if (completedShots > 0) {
+			log({
+				level: "info",
+				service: "api",
+				action: "canonical_pack_generation_resumed",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: {
+					pack_version: input.packVersion,
+					job_id: input.jobId,
+					completed_shots: completedShots,
+					pending_shots: pendingShotPlan.length,
+					total_shots: totalShots
+				}
+			});
+		}
 
 		await updateCanonicalGenerationState({
 			modelId: input.modelId,
@@ -541,11 +658,22 @@ async function generateCanonicalPackInternal(input: {
 			completedShots,
 			totalShots,
 			failedShots: 0,
-			error: null
+			error: null,
+			candidatesPerShot: input.candidatesPerShot,
+			referencePool: input.referencePool
 		});
 
-		for (let shotIndex = 0; shotIndex < shotPlan.length; shotIndex += 1) {
-			const shot = shotPlan[shotIndex]!;
+		for (let shotIndex = 0; shotIndex < pendingShotPlan.length; shotIndex += 1) {
+			const shot = pendingShotPlan[shotIndex]!;
+			const replacementTarget =
+				input.replaceCandidateId && pendingShotPlan.length === 1
+					? await findCanonicalCandidateReplacementTarget({
+							modelId: input.modelId,
+							packVersion: input.packVersion,
+							shotCode: shot.shot_code,
+							candidateId: input.replaceCandidateId
+					  })
+					: null;
 
 			// Rate-limit delay between shots (skip for first shot)
 			if (shotIndex > 0) {
@@ -623,12 +751,16 @@ async function generateCanonicalPackInternal(input: {
 					throw new ApiError(502, "INTERNAL_ERROR", "The Image Engine returned no images. Try again or switch Image Engines.");
 				}
 
-				let candidateIndex = await nextCandidateIndexForShot(input.modelId, input.packVersion, shot.shot_code);
+				let candidateIndex = replacementTarget?.candidate_index ?? (await nextCandidateIndexForShot(input.modelId, input.packVersion, shot.shot_code));
 				let persistedCandidates = 0;
 
-				for (const asset of assets) {
-					const assignedCandidateIndex = candidateIndex;
-					candidateIndex += 1;
+				for (let assetIndex = 0; assetIndex < assets.length; assetIndex += 1) {
+					const asset = assets[assetIndex]!;
+					const replacementForAsset = assetIndex === 0 ? replacementTarget : null;
+					const assignedCandidateIndex = replacementForAsset?.candidate_index ?? candidateIndex;
+					if (!replacementForAsset) {
+						candidateIndex += 1;
+					}
 
 					try {
 						const destinationPath = `${input.modelId}/canonical/v${input.packVersion}/${shot.shot_code}/candidate-${assignedCandidateIndex}-${Date.now()}.png`;
@@ -675,25 +807,45 @@ async function generateCanonicalPackInternal(input: {
 							referenceImageUrls: shotReferences.map(reference => reference.url).slice(0, MAX_QA_REFERENCE_IMAGES)
 						});
 
-						await prisma.modelReferenceCandidate.create({
-							data: {
-								model_id: input.modelId,
-								pack_version: input.packVersion,
-								shot_code: shot.shot_code,
-								candidate_index: assignedCandidateIndex,
-								seed: asset.seed,
-								prompt_text: shot.prompt,
-								image_gcs_uri: gcsUri,
-								provider: response.provider,
-								provider_model_id: response.provider_model_id,
-								realism_score: score.realism_score,
-								clarity_score: score.clarity_score,
-								consistency_score: score.consistency_score,
-								composite_score: score.composite_score,
-								qa_notes: score.qa_notes,
-								status: "CANDIDATE"
-							}
-						});
+						const candidateData = {
+							model_id: input.modelId,
+							pack_version: input.packVersion,
+							shot_code: shot.shot_code,
+							candidate_index: assignedCandidateIndex,
+							seed: asset.seed,
+							prompt_text: shot.prompt,
+							image_gcs_uri: gcsUri,
+							provider: response.provider,
+							provider_model_id: response.provider_model_id,
+							realism_score: score.realism_score,
+							clarity_score: score.clarity_score,
+							consistency_score: score.consistency_score,
+							composite_score: score.composite_score,
+							qa_notes: score.qa_notes
+						};
+
+						if (replacementForAsset) {
+							await prisma.modelReferenceCandidate.update({
+								where: { id: replacementForAsset.id },
+								data: candidateData
+							});
+							await syncCanonicalReferenceForCandidate({
+								modelId: input.modelId,
+								packVersion: input.packVersion,
+								candidateId: replacementForAsset.id,
+								seed: candidateData.seed,
+								promptText: candidateData.prompt_text,
+								imageGcsUri: candidateData.image_gcs_uri,
+								qaNotes: candidateData.qa_notes
+							});
+						} else {
+							await prisma.modelReferenceCandidate.create({
+								data: {
+									...candidateData,
+									status: "CANDIDATE"
+								}
+							});
+						}
 
 						persistedCandidates += 1;
 					} catch (candidateError) {
@@ -721,6 +873,10 @@ async function generateCanonicalPackInternal(input: {
 				completedShots += 1;
 			} catch (shotError) {
 				const shotMsg = shotError instanceof Error ? shotError.message : "Unknown shot error";
+				const shotRequestId = extractProviderRequestId(shotError);
+				if (shotRequestId) {
+					lastErrorRequestId = shotRequestId;
+				}
 				shotErrors.push(`Shot ${shot.shot_code}: ${shotMsg}`);
 				log({
 					level: "warn",
@@ -733,7 +889,8 @@ async function generateCanonicalPackInternal(input: {
 					metadata: {
 						shot_code: shot.shot_code,
 						pack_version: input.packVersion,
-						shot_index: shotIndex
+						shot_index: shotIndex,
+						error_request_id: shotRequestId
 					}
 				});
 
@@ -761,7 +918,8 @@ async function generateCanonicalPackInternal(input: {
 				completedShots,
 				totalShots,
 				failedShots: shotErrors.length,
-				error: updateError
+				error: updateError,
+				errorRequestId: updateError ? lastErrorRequestId : undefined
 			});
 		}
 
@@ -786,7 +944,8 @@ async function generateCanonicalPackInternal(input: {
 			completedShots,
 			totalShots,
 			failedShots: shotErrors.length,
-			error: finalError
+			error: finalError,
+			errorRequestId: finalError ? lastErrorRequestId : undefined
 		});
 
 		if (!persisted) {
@@ -824,6 +983,7 @@ async function generateCanonicalPackInternal(input: {
 		});
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : "Unknown canonical generation error";
+		const errorRequestId = extractProviderRequestId(error) ?? lastErrorRequestId;
 		const persisted = await updateCanonicalGenerationState({
 			modelId: input.modelId,
 			jobId: input.jobId,
@@ -836,7 +996,8 @@ async function generateCanonicalPackInternal(input: {
 			completedShots,
 			totalShots,
 			failedShots: Math.max(totalShots - completedShots, 1),
-			error: errorMessage
+			error: errorMessage,
+			errorRequestId
 		});
 
 		if (!persisted) {
@@ -867,7 +1028,8 @@ async function generateCanonicalPackInternal(input: {
 			metadata: {
 				pack_version: input.packVersion,
 				job_id: input.jobId,
-				generation_mode: input.generationMode
+				generation_mode: input.generationMode,
+				error_request_id: errorRequestId
 			}
 		});
 	}
@@ -888,57 +1050,34 @@ export async function getCanonicalPackSummary(input: { modelId: string; packVers
 
 	const onboardingState = asRecord(model.onboarding_state) ?? {};
 	const generationState = readCanonicalGenerationState(onboardingState);
-	let effectiveStatus = model.canonical_pack_status;
-	let effectiveError = typeof onboardingState.canonical_pack_error === "string" ? onboardingState.canonical_pack_error : null;
-	let effectiveGenerationState = generationState;
-	const staleGeneration = effectiveStatus === "GENERATING" && isCanonicalGenerationStateStale(generationState);
-
-	if (staleGeneration) {
-		const nowIso = new Date().toISOString();
-		const staleError = `Canonical generation timed out after ${Math.round(CANONICAL_JOB_STALE_MS / 60_000)} minutes without heartbeat. Retry generation.`;
-		const failedGenerationState: CanonicalGenerationState = {
-			...generationState,
-			status: "FAILED",
-			heartbeat_at: nowIso,
-			completed_at: nowIso,
-			failed_shots: Math.max(generationState?.failed_shots ?? 0, 1)
-		};
-
-		const staleTakeover = await prisma.aiModel.updateMany({
-			where: {
-				id: input.modelId,
-				canonical_pack_status: "GENERATING"
-			},
-			data: {
-				canonical_pack_status: "FAILED",
-				onboarding_state: {
-					...onboardingState,
-					canonical_pack_error: staleError,
-					canonical_pack_generation: failedGenerationState
-				}
-			}
-		});
-
-		if (staleTakeover.count > 0) {
-			effectiveStatus = "FAILED";
-			effectiveError = staleError;
-			effectiveGenerationState = failedGenerationState;
-		}
-	}
 
 	const latestCandidatePack = await latestPackVersion(input.modelId);
 	const packVersion = inferPackVersion({
 		requestedPackVersion: input.packVersion,
 		activePackVersion: model.active_canonical_pack_version,
 		latestCandidatePackVersion: latestCandidatePack,
-		generationPackVersion: effectiveGenerationState?.pack_version
+		generationPackVersion: generationState?.pack_version
 	});
+	const storedPackState = readCanonicalPackState(onboardingState, packVersion);
+	let effectiveGenerationState = generationState?.pack_version === packVersion ? generationState : storedPackState;
+	let effectiveStatus =
+		generationState?.pack_version === packVersion ? model.canonical_pack_status : effectiveGenerationState?.status ?? model.canonical_pack_status;
+	let effectiveError =
+		generationState?.pack_version === packVersion
+			? typeof onboardingState.canonical_pack_error === "string"
+				? onboardingState.canonical_pack_error
+				: null
+			: effectiveGenerationState?.error ?? null;
+	let effectiveErrorRequestId = effectiveGenerationState?.error_request_id;
+	const staleGeneration =
+		generationState?.pack_version === packVersion && effectiveStatus === "GENERATING" && isCanonicalGenerationStateStale(generationState);
 
 	if (!packVersion || packVersion <= 0) {
 		return {
 			pack_version: 0,
 			status: effectiveStatus,
 			error: effectiveError,
+			error_request_id: effectiveErrorRequestId,
 			shots: REQUIRED_CANONICAL_SHOT_CODES.map(shot => ({
 				shot_code: shot,
 				recommended_candidate_id: undefined,
@@ -978,20 +1117,256 @@ export async function getCanonicalPackSummary(input: { modelId: string; packVers
 	});
 	const completedShots = grouped.filter(shot => shot.candidates.length > 0).length;
 	const totalShots = REQUIRED_CANONICAL_SHOT_CODES.length;
+	const completedShotCodes = new Set(
+		grouped.filter(shot => shot.candidates.length > 0).map(shot => shot.shot_code as CanonicalShotCode)
+	);
+	const initialGenerationProgressMatchesPack = effectiveGenerationState?.pack_version === packVersion;
+	const initialTrackedShotCodes = initialGenerationProgressMatchesPack ? resolveTrackedCanonicalShotCodes(effectiveGenerationState) : [];
+
+	if (staleGeneration) {
+		const staleRecovery = buildCanonicalStaleRecovery({
+			generationState,
+			completedShotCodes,
+			fallbackTotalShots: totalShots
+		});
+
+		if (staleRecovery) {
+			const staleTakeover = await prisma.aiModel.updateMany({
+				where: {
+					id: input.modelId,
+					canonical_pack_status: "GENERATING"
+				},
+				data: {
+					canonical_pack_status: staleRecovery.status,
+					onboarding_state: {
+						...onboardingState,
+						canonical_pack_error: staleRecovery.error,
+						canonical_pack_generation: staleRecovery.generationState,
+						canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, packVersion, {
+							...staleRecovery.generationState,
+							error: staleRecovery.error
+						})
+					}
+				}
+			});
+
+			if (staleTakeover.count > 0) {
+				effectiveStatus = staleRecovery.status;
+				effectiveError = staleRecovery.error;
+				effectiveGenerationState = staleRecovery.generationState;
+				effectiveErrorRequestId = staleRecovery.generationState?.error_request_id;
+			}
+		}
+	}
+
 	const generationProgressMatchesPack = effectiveGenerationState?.pack_version === packVersion;
+	const trackedShotCodes = generationProgressMatchesPack ? resolveTrackedCanonicalShotCodes(effectiveGenerationState) : [];
+	const completedTrackedShotCodes = trackedShotCodes.filter(shotCode => completedShotCodes.has(shotCode));
+	const missingTrackedShotCodes = trackedShotCodes.filter(shotCode => !completedShotCodes.has(shotCode));
 	const completedFromState = generationProgressMatchesPack ? effectiveGenerationState?.completed_shots : undefined;
 	const totalFromState = generationProgressMatchesPack ? effectiveGenerationState?.total_shots : undefined;
+	const resumeAvailable =
+		generationProgressMatchesPack &&
+		effectiveStatus !== "GENERATING" &&
+		effectiveStatus !== "APPROVED" &&
+		missingTrackedShotCodes.length > 0;
+	const generationSummary =
+		generationProgressMatchesPack && effectiveGenerationState
+			? {
+					mode: effectiveGenerationState.generation_mode,
+					provider: effectiveGenerationState.provider,
+					provider_model_id: effectiveGenerationState.provider_model_id,
+					candidates_per_shot: effectiveGenerationState.candidates_per_shot,
+					started_at: effectiveGenerationState.started_at,
+					heartbeat_at: effectiveGenerationState.heartbeat_at,
+					failed_shots: effectiveGenerationState.failed_shots,
+					shot_codes: trackedShotCodes.length > 0 ? trackedShotCodes : initialTrackedShotCodes,
+					resume_available: resumeAvailable,
+					completed_shot_codes: completedTrackedShotCodes,
+					missing_shot_codes: missingTrackedShotCodes
+			  }
+			: undefined;
 
 	return {
 		pack_version: packVersion,
 		status: effectiveStatus,
 		error: effectiveError,
+		error_request_id: effectiveErrorRequestId,
 		progress: {
 			completed_shots: Math.max(completedShots, completedFromState ?? 0),
 			total_shots: totalFromState && totalFromState > 0 ? totalFromState : totalShots,
 			generated_candidates: candidatesWithPreview.length
 		},
+		generation: generationSummary,
 		shots: grouped
+	};
+}
+
+export async function listCanonicalPackHistory(input: { modelId: string }) {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			canonical_pack_status: true,
+			active_canonical_pack_version: true,
+			onboarding_state: true
+		}
+	});
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const [candidates, canonicalReferences] = await Promise.all([
+		prisma.modelReferenceCandidate.findMany({
+			where: { model_id: input.modelId },
+			select: {
+				pack_version: true,
+				shot_code: true,
+				status: true,
+				created_at: true
+			}
+		}),
+		prisma.canonicalReference.findMany({
+			where: { model_id: input.modelId },
+			select: {
+				pack_version: true,
+				shot_code: true,
+				created_at: true
+			}
+		})
+	]);
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const generationState = readCanonicalGenerationState(onboardingState);
+	const packVersions = Array.from(
+		new Set(
+			[
+				...candidates.map(candidate => candidate.pack_version),
+				...canonicalReferences.map(reference => reference.pack_version),
+				model.active_canonical_pack_version,
+				generationState?.pack_version ?? 0,
+				...Object.keys(readCanonicalPackStateMap(onboardingState)).map(value => Number(value))
+			].filter(packVersion => typeof packVersion === "number" && packVersion > 0)
+		)
+	).sort((a, b) => b - a);
+
+	return packVersions.map(packVersion => {
+		const packCandidates = candidates.filter(candidate => candidate.pack_version === packVersion);
+		const packReferences = canonicalReferences.filter(reference => reference.pack_version === packVersion);
+		const generatedShotCodes = Array.from(
+			new Set(
+				packCandidates
+					.map(candidate => normalizeCanonicalShotCode(candidate.shot_code))
+					.filter((shotCode): shotCode is CanonicalShotCode => Boolean(shotCode))
+			)
+		);
+		const selectedShots = packCandidates.filter(candidate => candidate.status === "SELECTED").length;
+		const hasFrontAnchor =
+			packCandidates.some(candidate => candidate.status === "SELECTED" && candidate.shot_code === FRONT_CANONICAL_SHOT_CODE) ||
+			packReferences.some(reference => reference.shot_code === FRONT_CANONICAL_SHOT_CODE);
+		const lastUpdatedAt = [...packCandidates.map(candidate => candidate.created_at), ...packReferences.map(reference => reference.created_at)]
+			.sort((a, b) => b.getTime() - a.getTime())[0]
+			?.toISOString();
+		const packState = generationState?.pack_version === packVersion ? generationState : readCanonicalPackState(onboardingState, packVersion);
+
+		const status =
+			generationState?.pack_version === packVersion
+				? model.canonical_pack_status
+				: packState?.status
+					? packState.status
+				: packReferences.length >= REQUIRED_CANONICAL_SHOT_CODES.length
+					? "APPROVED"
+					: generatedShotCodes.length > 0 || packReferences.length > 0
+						? "READY"
+						: "NOT_STARTED";
+
+		return {
+			pack_version: packVersion,
+			status,
+			is_active: model.active_canonical_pack_version === packVersion,
+			generated_shots: generatedShotCodes.length,
+			generated_candidates: packCandidates.length,
+			selected_shots: selectedShots,
+			has_front_anchor: hasFrontAnchor,
+			last_updated_at: lastUpdatedAt ?? null
+		};
+	});
+}
+
+export async function stopCanonicalPackGeneration(input: { modelId: string; stoppedBy: string }): Promise<{ pack_version: number; status: "READY" | "FAILED" }> {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			canonical_pack_status: true,
+			onboarding_state: true
+		}
+	});
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const generationState = readCanonicalGenerationState(onboardingState);
+	if (model.canonical_pack_status !== "GENERATING" || !generationState?.job_id || !generationState.pack_version) {
+		throw new ApiError(409, "CONFLICT", "Reference generation is not currently running.");
+	}
+
+	const trackedShotCodes = resolveTrackedCanonicalShotCodes(generationState);
+	const completedShotCodes = await listCompletedCanonicalShotCodes({
+		modelId: input.modelId,
+		packVersion: generationState.pack_version,
+		shotCodes: trackedShotCodes
+	});
+	const completedShots = trackedShotCodes.filter(shotCode => completedShotCodes.has(shotCode)).length;
+	const totalShots = generationState.total_shots ?? trackedShotCodes.length;
+	const nextStatus: "READY" | "FAILED" = completedShots > 0 ? "READY" : "FAILED";
+	const error =
+		completedShots > 0
+			? `Generation paused by user. ${completedShots}/${Math.max(totalShots, 1)} angles are already ready. Resume generation to continue from this set.`
+			: "Generation stopped before any angles were saved. Resume generation to continue from this set.";
+	const nowIso = new Date().toISOString();
+	const stopToken = `stopped-${randomUUID()}`;
+	const stoppedGenerationState: CanonicalGenerationState = {
+		...generationState,
+		job_id: stopToken,
+		status: nextStatus,
+		error,
+		heartbeat_at: nowIso,
+		completed_at: nowIso,
+		completed_shots: completedShots,
+		total_shots: totalShots,
+		failed_shots: Math.max(totalShots - completedShots, 0)
+	};
+
+	await prisma.aiModel.update({
+		where: { id: input.modelId },
+		data: {
+			canonical_pack_status: nextStatus,
+			onboarding_state: {
+				...onboardingState,
+				canonical_pack_error: error,
+				canonical_pack_generation: stoppedGenerationState,
+				canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, generationState.pack_version, stoppedGenerationState)
+			}
+		}
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "canonical_pack_generation_stopped",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.stoppedBy,
+		metadata: {
+			pack_version: generationState.pack_version,
+			completed_shots: completedShots,
+			total_shots: totalShots
+		}
+	});
+
+	return {
+		pack_version: generationState.pack_version,
+		status: nextStatus
 	};
 }
 
@@ -1004,7 +1379,8 @@ export async function approveCanonicalPack(input: { modelId: string; packVersion
 			id: true,
 			status: true,
 			body_profile: true,
-			face_profile: true
+			face_profile: true,
+			onboarding_state: true
 		}
 	});
 
@@ -1033,6 +1409,20 @@ export async function approveCanonicalPack(input: { modelId: string; packVersion
 	const selectedIds = new Set(input.selections.map(item => item.candidate_id));
 	const selectedCandidates = candidates.filter(item => selectedIds.has(item.id));
 	const selectedCanonicalCount = selectedCandidates.length;
+	const nowIso = new Date().toISOString();
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const currentGenerationState = readCanonicalGenerationState(onboardingState);
+	const approvedPackState: CanonicalGenerationState = {
+		...(readCanonicalPackState(onboardingState, input.packVersion) ?? currentGenerationState ?? {}),
+		pack_version: input.packVersion,
+		status: "APPROVED",
+		error: null,
+		heartbeat_at: nowIso,
+		completed_at: nowIso,
+		completed_shots: REQUIRED_CANONICAL_SHOT_CODES.length,
+		total_shots: REQUIRED_CANONICAL_SHOT_CODES.length,
+		failed_shots: 0
+	};
 
 	await prisma.$transaction(async tx => {
 		await tx.modelReferenceCandidate.updateMany({
@@ -1098,7 +1488,13 @@ export async function approveCanonicalPack(input: { modelId: string; packVersion
 			data: {
 				canonical_pack_status: "APPROVED",
 				active_canonical_pack_version: input.packVersion,
-				status: nextStatus
+				status: nextStatus,
+				onboarding_state: {
+					...onboardingState,
+					canonical_pack_error: null,
+					canonical_pack_generation: currentGenerationState?.pack_version === input.packVersion ? approvedPackState : currentGenerationState,
+					canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, input.packVersion, approvedPackState)
+				}
 			}
 		});
 	});
@@ -1193,6 +1589,16 @@ export async function approveCanonicalFrontCandidate(input: { modelId: string; p
 		});
 
 		const onboardingState = asRecord(model.onboarding_state) ?? {};
+		const currentGenerationState = readCanonicalGenerationState(onboardingState);
+		const nowIso = new Date().toISOString();
+		const readyPackState: CanonicalGenerationState = {
+			...(readCanonicalPackState(onboardingState, input.packVersion) ?? currentGenerationState ?? {}),
+			pack_version: input.packVersion,
+			status: "READY",
+			error: null,
+			heartbeat_at: nowIso,
+			completed_at: nowIso
+		};
 		await tx.aiModel.update({
 			where: { id: input.modelId },
 			data: {
@@ -1200,7 +1606,9 @@ export async function approveCanonicalFrontCandidate(input: { modelId: string; p
 				onboarding_state: {
 					...onboardingState,
 					canonical_pack_error: null,
-					canonical_pack_front_approved_at: new Date().toISOString()
+					canonical_pack_front_approved_at: nowIso,
+					canonical_pack_generation: currentGenerationState?.pack_version === input.packVersion ? readyPackState : currentGenerationState,
+					canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, input.packVersion, readyPackState)
 				}
 			}
 		});
@@ -1310,6 +1718,114 @@ async function nextCandidateIndexForShot(modelId: string, packVersion: number, s
 	return (aggregate._max.candidate_index ?? 0) + 1;
 }
 
+async function findCanonicalCandidateReplacementTarget(input: {
+	modelId: string;
+	packVersion: number;
+	shotCode: string;
+	candidateId?: string;
+	candidateIndex?: number;
+}): Promise<{ id: string; candidate_index: number } | null> {
+	if (input.candidateId) {
+		const candidate = await prisma.modelReferenceCandidate.findFirst({
+			where: {
+				id: input.candidateId,
+				model_id: input.modelId,
+				pack_version: input.packVersion,
+				shot_code: input.shotCode
+			},
+			select: {
+				id: true,
+				candidate_index: true
+			}
+		});
+
+		if (!candidate) {
+			throw new ApiError(
+				400,
+				"VALIDATION_ERROR",
+				"This reference option could not be found in the current set. Refresh the set and try again."
+			);
+		}
+
+		return candidate;
+	}
+
+	if (!input.candidateIndex) {
+		return null;
+	}
+
+	return (
+		(await prisma.modelReferenceCandidate.findFirst({
+			where: {
+				model_id: input.modelId,
+				pack_version: input.packVersion,
+				shot_code: input.shotCode,
+				candidate_index: input.candidateIndex
+			},
+			orderBy: {
+				created_at: "desc"
+			},
+			select: {
+				id: true,
+				candidate_index: true
+			}
+		})) ?? null
+	);
+}
+
+async function syncCanonicalReferenceForCandidate(input: {
+	modelId: string;
+	packVersion: number;
+	candidateId: string;
+	seed: number;
+	promptText: string;
+	imageGcsUri: string;
+	qaNotes?: string | null;
+}): Promise<void> {
+	await prisma.canonicalReference.updateMany({
+		where: {
+			model_id: input.modelId,
+			pack_version: input.packVersion,
+			source_candidate_id: input.candidateId
+		},
+		data: {
+			seed: input.seed,
+			prompt_text: input.promptText,
+			reference_image_url: input.imageGcsUri,
+			notes: input.qaNotes ?? null
+		}
+	});
+}
+
+async function listCompletedCanonicalShotCodes(input: {
+	modelId: string;
+	packVersion: number;
+	shotCodes: CanonicalShotCode[];
+}): Promise<Set<CanonicalShotCode>> {
+	if (input.shotCodes.length === 0) {
+		return new Set<CanonicalShotCode>();
+	}
+
+	const existingCandidates = await prisma.modelReferenceCandidate.findMany({
+		where: {
+			model_id: input.modelId,
+			pack_version: input.packVersion,
+			shot_code: {
+				in: input.shotCodes
+			}
+		},
+		select: {
+			shot_code: true
+		}
+	});
+
+	return new Set(
+		existingCandidates
+			.map(candidate => normalizeCanonicalShotCode(candidate.shot_code))
+			.filter((shotCode): shotCode is CanonicalShotCode => Boolean(shotCode))
+	);
+}
+
 async function safeScoreCanonicalCandidate(input: { imageUrl: string; shotCode: string; shotPrompt: string; referenceImageUrls?: string[] }) {
 	try {
 		return await withTimeout(scoreCanonicalCandidate(input), 60_000, `Scoring timed out for ${input.shotCode}`);
@@ -1342,6 +1858,71 @@ function inferPackVersion(input: { requestedPackVersion?: number; activePackVers
 
 	const inferred = Math.max(input.activePackVersion, input.latestCandidatePackVersion, input.generationPackVersion ?? 0);
 	return inferred > 0 ? inferred : 0;
+}
+
+function normalizeRequestedCanonicalShotCodes(shotCodes: CanonicalShotCode[] | undefined): CanonicalShotCode[] {
+	if (!Array.isArray(shotCodes) || shotCodes.length === 0) {
+		return [];
+	}
+
+	return Array.from(new Set(shotCodes.filter((shotCode): shotCode is CanonicalShotCode => REQUIRED_CANONICAL_SHOT_CODES.includes(shotCode))));
+}
+
+function resolveTrackedCanonicalShotCodes(state: CanonicalGenerationState | null | undefined): CanonicalShotCode[] {
+	if (!state) return [];
+	if (state.shot_codes && state.shot_codes.length > 0) {
+		return state.shot_codes;
+	}
+	if (state.generation_mode) {
+		return resolveShotCodesForGenerationMode(state.generation_mode);
+	}
+	return [];
+}
+
+function buildCanonicalStaleRecovery(input: {
+	generationState: CanonicalGenerationState | null;
+	completedShotCodes: Set<CanonicalShotCode>;
+	fallbackTotalShots: number;
+}): { status: "READY" | "FAILED"; error: string | null; generationState: CanonicalGenerationState } | null {
+	if (!input.generationState) {
+		return null;
+	}
+
+	const trackedShotCodes = resolveTrackedCanonicalShotCodes(input.generationState);
+	const totalTrackedShots = trackedShotCodes.length || input.generationState.total_shots || input.fallbackTotalShots;
+	const completedTrackedShotCodes = trackedShotCodes.filter(shotCode => input.completedShotCodes.has(shotCode));
+	const completedTrackedCount = trackedShotCodes.length > 0 ? completedTrackedShotCodes.length : Math.min(input.completedShotCodes.size, totalTrackedShots);
+	const missingTrackedCount = Math.max(totalTrackedShots - completedTrackedCount, 0);
+	const nowIso = new Date().toISOString();
+
+	let status: "READY" | "FAILED";
+	let error: string | null;
+	if (missingTrackedCount === 0 && completedTrackedCount > 0) {
+		status = "READY";
+		error = null;
+	} else if (completedTrackedCount > 0) {
+		status = "READY";
+		error = `Generation paused after timing out. ${completedTrackedCount}/${totalTrackedShots} requested angles are already ready. Resume generation to continue without losing saved options.`;
+	} else {
+		status = "FAILED";
+		error = `Canonical generation timed out after ${Math.round(CANONICAL_JOB_STALE_MS / 60_000)} minutes without heartbeat. Resume generation to continue from this set.`;
+	}
+
+	return {
+		status,
+		error,
+		generationState: {
+			...input.generationState,
+			status,
+			error,
+			heartbeat_at: nowIso,
+			completed_at: nowIso,
+			completed_shots: completedTrackedCount,
+			total_shots: totalTrackedShots,
+			failed_shots: missingTrackedCount,
+			shot_codes: trackedShotCodes.length > 0 ? trackedShotCodes : input.generationState.shot_codes
+		}
+	};
 }
 
 function buildCanonicalFailureMessage(input: { completedShots: number; totalShots: number; shotErrors: string[] }): string | null {
@@ -1385,6 +1966,9 @@ async function updateCanonicalGenerationState(input: {
 	totalShots: number;
 	failedShots: number;
 	error: string | null;
+	errorRequestId?: string;
+	candidatesPerShot?: number;
+	referencePool?: CanonicalConditioningReference[];
 }): Promise<boolean> {
 	const model = await prisma.aiModel.findUnique({
 		where: { id: input.modelId },
@@ -1407,15 +1991,19 @@ async function updateCanonicalGenerationState(input: {
 		pack_version: input.packVersion,
 		provider: input.provider,
 		provider_model_id: input.providerModelId?.trim() || existingGeneration?.provider_model_id,
+		error_request_id: input.error ? input.errorRequestId?.trim() || undefined : undefined,
 		generation_mode: input.generationMode,
 		status: input.status,
+		error: input.error,
 		started_at: existingGeneration?.started_at ?? nowIso,
 		heartbeat_at: nowIso,
 		completed_at: input.status === "GENERATING" ? undefined : nowIso,
 		completed_shots: input.completedShots,
 		total_shots: input.totalShots,
 		failed_shots: input.failedShots,
-		shot_codes: input.shotCodes
+		candidates_per_shot: input.candidatesPerShot ?? existingGeneration?.candidates_per_shot,
+		shot_codes: input.shotCodes,
+		reference_pool: input.referencePool ?? existingGeneration?.reference_pool
 	};
 
 	await prisma.aiModel.update({
@@ -1425,7 +2013,8 @@ async function updateCanonicalGenerationState(input: {
 			onboarding_state: {
 				...onboardingState,
 				canonical_pack_error: input.error,
-				canonical_pack_generation: nextGeneration
+				canonical_pack_generation: nextGeneration,
+				canonical_pack_versions: upsertCanonicalPackStateMap(onboardingState, input.packVersion, nextGeneration)
 			}
 		}
 	});
@@ -1434,7 +2023,11 @@ async function updateCanonicalGenerationState(input: {
 }
 
 function readCanonicalGenerationState(onboardingState: Record<string, unknown>): CanonicalGenerationState | null {
-	const raw = asRecord(onboardingState.canonical_pack_generation);
+	return parseCanonicalGenerationState(onboardingState.canonical_pack_generation);
+}
+
+function parseCanonicalGenerationState(value: unknown): CanonicalGenerationState | null {
+	const raw = asRecord(value);
 	if (!raw) return null;
 
 	return {
@@ -1442,15 +2035,71 @@ function readCanonicalGenerationState(onboardingState: Record<string, unknown>):
 		pack_version: readOptionalPositiveInt(raw.pack_version),
 		provider: asImageModelProvider(raw.provider),
 		provider_model_id: readOptionalString(raw.provider_model_id),
+		error_request_id: readOptionalString(raw.error_request_id),
 		generation_mode: asCanonicalGenerationMode(raw.generation_mode),
 		status: readCanonicalStatus(raw.status),
+		error: typeof raw.error === "string" ? raw.error : raw.error === null ? null : undefined,
 		started_at: readOptionalString(raw.started_at),
 		heartbeat_at: readOptionalString(raw.heartbeat_at),
 		completed_at: readOptionalString(raw.completed_at),
 		completed_shots: readOptionalNonNegativeInt(raw.completed_shots),
 		total_shots: readOptionalPositiveInt(raw.total_shots),
 		failed_shots: readOptionalNonNegativeInt(raw.failed_shots),
-		shot_codes: readCanonicalShotCodes(raw.shot_codes)
+		candidates_per_shot: readOptionalPositiveInt(raw.candidates_per_shot),
+		shot_codes: readCanonicalShotCodes(raw.shot_codes),
+		reference_pool: readCanonicalConditioningReferencePool(raw.reference_pool)
+	};
+}
+
+function readCanonicalPackStateMap(onboardingState: Record<string, unknown>): Record<string, CanonicalGenerationState> {
+	const raw = asRecord(onboardingState.canonical_pack_versions);
+	if (!raw) {
+		return {};
+	}
+
+	const packStates: Record<string, CanonicalGenerationState> = {};
+	for (const [packVersion, state] of Object.entries(raw)) {
+		const normalizedPackVersion = Number(packVersion);
+		if (!Number.isInteger(normalizedPackVersion) || normalizedPackVersion <= 0) {
+			continue;
+		}
+
+		const parsed = parseCanonicalGenerationState(state);
+		if (!parsed) {
+			continue;
+		}
+
+		packStates[String(normalizedPackVersion)] = {
+			...parsed,
+			pack_version: normalizedPackVersion
+		};
+	}
+
+	return packStates;
+}
+
+function readCanonicalPackState(onboardingState: Record<string, unknown>, packVersion: number | undefined): CanonicalGenerationState | null {
+	if (!packVersion || packVersion <= 0) {
+		return null;
+	}
+
+	const packStates = readCanonicalPackStateMap(onboardingState);
+	return packStates[String(packVersion)] ?? null;
+}
+
+function upsertCanonicalPackStateMap(
+	onboardingState: Record<string, unknown>,
+	packVersion: number,
+	state: CanonicalGenerationState
+): Record<string, CanonicalGenerationState> {
+	const packStates = readCanonicalPackStateMap(onboardingState);
+	return {
+		...packStates,
+		[String(packVersion)]: {
+			...packStates[String(packVersion)],
+			...state,
+			pack_version: packVersion
+		}
 	};
 }
 
@@ -1486,8 +2135,46 @@ function readCanonicalShotCodes(value: unknown): CanonicalShotCode[] | undefined
 	return parsed.length > 0 ? Array.from(new Set(parsed)) : undefined;
 }
 
+function readCanonicalConditioningReferencePool(value: unknown): CanonicalConditioningReference[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+
+	const parsed = value
+		.map(item => {
+			const raw = asRecord(item);
+			if (!raw) return null;
+
+			const url = readOptionalString(raw.url);
+			const weight = raw.weight === "primary" || raw.weight === "secondary" ? raw.weight : undefined;
+			const sourceKind =
+				raw.source_kind === "selected_front_candidate" || raw.source_kind === "canonical_reference" || raw.source_kind === "uploaded_photo"
+					? raw.source_kind
+					: undefined;
+			if (!url || !weight || !sourceKind) return null;
+
+			const reference: CanonicalConditioningReference = {
+				url,
+				source: normalizeImageReferenceSource(raw.source),
+				title: readOptionalString(raw.title),
+				weight,
+				similarity_score: readOptionalScore(raw.similarity_score),
+				source_kind: sourceKind,
+				canonical_shot_code: normalizeCanonicalShotCode(readOptionalString(raw.canonical_shot_code) ?? ""),
+				view_angle: readPhotoReferenceViewAngle(raw.view_angle),
+				framing: readPhotoReferenceFraming(raw.framing),
+				expression: readPhotoReferenceExpression(raw.expression),
+				identity_anchor_score: readOptionalScore(raw.identity_anchor_score),
+				sharpness_score: readOptionalScore(raw.sharpness_score)
+			};
+
+			return reference;
+		})
+		.filter((item): item is CanonicalConditioningReference => Boolean(item));
+
+	return parsed.length > 0 ? parsed : undefined;
+}
+
 function readCanonicalStatus(value: unknown): CanonicalGenerationState["status"] | undefined {
-	if (value === "GENERATING" || value === "READY" || value === "FAILED") {
+	if (value === "GENERATING" || value === "READY" || value === "FAILED" || value === "APPROVED") {
 		return value;
 	}
 	return undefined;
@@ -1505,9 +2192,66 @@ function readOptionalNonNegativeInt(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+function readOptionalScore(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return clamp01(value);
+	if (typeof value === "string") {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) return clamp01(parsed);
+	}
+	return undefined;
+}
+
+function readPhotoReferenceViewAngle(value: unknown): PhotoReferenceViewAngle | undefined {
+	if (value === "frontal" || value === "left_45" || value === "right_45" || value === "left_profile" || value === "right_profile" || value === "unknown") {
+		return value;
+	}
+	return undefined;
+}
+
+function readPhotoReferenceFraming(value: unknown): PhotoReferenceFraming | undefined {
+	if (value === "closeup" || value === "head_shoulders" || value === "half_body" || value === "full_body" || value === "unknown") {
+		return value;
+	}
+	return undefined;
+}
+
+function readPhotoReferenceExpression(value: unknown): PhotoReferenceExpression | undefined {
+	if (value === "neutral" || value === "soft_smile" || value === "serious" || value === "other") {
+		return value;
+	}
+	return undefined;
+}
+
+function normalizeImageReferenceSource(value: unknown): ImageReferenceInput["source"] | undefined {
+	if (value === "external_url" || value === "pinterest_upload" || value === "pinterest_url") {
+		return value;
+	}
+	return undefined;
+}
+
 function isRateLimitErrorMessage(message: string): boolean {
 	const lower = message.toLowerCase();
 	return lower.includes("429") || lower.includes("rate") || lower.includes("quota");
+}
+
+function extractProviderRequestId(error: unknown): string | undefined {
+	if (!(error instanceof ApiError)) return undefined;
+
+	const details = asRecord(error.details);
+	const directRequestId = readOptionalString(details?.request_id);
+	if (directRequestId) {
+		return directRequestId;
+	}
+
+	const attempts = Array.isArray(details?.attempts) ? details.attempts : [];
+	for (const attempt of attempts) {
+		const requestId = readOptionalString(asRecord(attempt)?.request_id);
+		if (requestId) {
+			return requestId;
+		}
+	}
+
+	return undefined;
 }
 
 function isRetryableCanonicalError(error: unknown): boolean {

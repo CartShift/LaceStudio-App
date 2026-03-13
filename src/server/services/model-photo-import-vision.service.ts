@@ -10,7 +10,7 @@ import {
 	socialTracksSchema,
 } from "@/server/schemas/model-workflow";
 
-type PhotoImportVisionProvider = "zai_vision" | "gemini_fallback" | "heuristic";
+type PhotoImportVisionProvider = "zai_vision" | "openai_vision" | "gemini_fallback" | "heuristic";
 
 export type PhotoImportVisionReference = {
 	reference_id: string;
@@ -72,7 +72,24 @@ type GeminiGenerateContentPayload = {
 	};
 };
 
+type OpenAiChatCompletionPayload = {
+	choices?: Array<{
+		message?: {
+			content?:
+				| string
+				| Array<{
+						type?: string;
+						text?: string;
+				  }>;
+		};
+	}>;
+	error?: {
+		message?: string;
+	};
+};
+
 const ZAI_TIMEOUT_MS = 60_000;
+const OPENAI_TIMEOUT_MS = 60_000;
 const GEMINI_TIMEOUT_MS = 90_000;
 const MAX_GEMINI_REFERENCE_BYTES = 4 * 1024 * 1024;
 const ALLOWED_REFERENCE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -93,6 +110,9 @@ export async function analyzeModelPhotosWithVision(input: {
 
 	const zai = await tryZaiVision(normalizedInput);
 	if (zai) return zai;
+
+	const openai = await tryOpenAiVision(normalizedInput);
+	if (openai) return openai;
 
 	const gemini = await tryGeminiFallback(normalizedInput);
 	if (gemini) return gemini;
@@ -166,6 +186,77 @@ async function tryZaiVision(input: PhotoImportVisionInput): Promise<PhotoImportV
 
 		return {
 			provider: "zai_vision",
+			suggestion,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function tryOpenAiVision(input: PhotoImportVisionInput): Promise<PhotoImportVisionResult | null> {
+	let env: ReturnType<typeof getEnv>;
+	try {
+		env = getEnv();
+	} catch {
+		return null;
+	}
+
+	if (!env.OPENAI_API_KEY || !env.OPENAI_VISION_MODEL) {
+		return null;
+	}
+
+	const imageUrls = await resolveOpenAiInputUrls(input.references.slice(0, 8));
+	if (imageUrls.length === 0) {
+		return null;
+	}
+
+	try {
+		const response = await fetchWithTimeout(
+			"https://api.openai.com/v1/chat/completions",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+				},
+				body: JSON.stringify({
+					model: env.OPENAI_VISION_MODEL,
+					messages: [
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: buildVisionPrompt(input),
+								},
+								...imageUrls.map(url => ({
+									type: "image_url" as const,
+									image_url: {
+										url,
+										detail: "high" as const,
+									},
+								})),
+							],
+						},
+					],
+				}),
+			},
+			OPENAI_TIMEOUT_MS,
+		);
+
+		if (!response.ok) {
+			return null;
+		}
+
+		const payload = (await response.json()) as OpenAiChatCompletionPayload;
+		const text = extractOpenAiMessageText(payload);
+		if (!text) return null;
+
+		const suggestion = normalizeSuggestionFromText(text, input.references, input.currentModelData);
+		if (!suggestion) return null;
+
+		return {
+			provider: "openai_vision",
 			suggestion,
 		};
 	} catch {
@@ -621,6 +712,25 @@ function extractGeminiText(payload: GeminiGenerateContentPayload): string | null
 	return null;
 }
 
+function extractOpenAiMessageText(payload: OpenAiChatCompletionPayload): string | null {
+	for (const choice of payload.choices ?? []) {
+		const content = choice.message?.content;
+		if (typeof content === "string" && content.trim().length > 0) {
+			return content.trim();
+		}
+
+		if (Array.isArray(content)) {
+			for (const part of content) {
+				if (typeof part.text === "string" && part.text.trim().length > 0) {
+					return part.text.trim();
+				}
+			}
+		}
+	}
+
+	return null;
+}
+
 function parseJsonObjectFromText(text: string): Record<string, unknown> | null {
 	const trimmed = text.trim();
 	const direct = parseJsonObject(trimmed);
@@ -722,6 +832,31 @@ async function resolveGeminiInlineParts(references: PhotoImportVisionReference[]
 	}
 
 	return parts;
+}
+
+async function resolveOpenAiInputUrls(references: PhotoImportVisionReference[]): Promise<string[]> {
+	const urls: string[] = [];
+
+	for (const reference of references) {
+		const rawUrl = reference.url.trim();
+		if (!rawUrl) continue;
+		if (rawUrl.startsWith("data:image/")) {
+			urls.push(rawUrl);
+			continue;
+		}
+
+		const resolved = await resolveReferenceImage(rawUrl);
+		if (resolved) {
+			urls.push(`data:${resolved.mime_type};base64,${resolved.data}`);
+			continue;
+		}
+
+		if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+			urls.push(rawUrl);
+		}
+	}
+
+	return urls;
 }
 
 async function resolveReferenceImage(url: string): Promise<{ mime_type: string; data: string } | null> {

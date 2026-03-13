@@ -1,18 +1,5 @@
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/cn";
 
 export type TableShellColumn<T> = {
@@ -41,7 +28,7 @@ export function TableShell<T>({
 	rowKey,
 	emptyMessage = "No results.",
 	actions,
-	className,
+	className
 }: {
 	title: string;
 	description?: string;
@@ -74,7 +61,7 @@ export function TableShell<T>({
 						{keyedRows.map(({ id, row }) => (
 							<article
 								key={id}
-								className="rounded-[1.25rem] border border-border/55 bg-[linear-gradient(160deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--card),transparent_0%))] p-4 shadow-[var(--shadow-inner)]">
+								className="rounded-2xl border border-border/55 bg-[linear-gradient(160deg,color-mix(in_oklab,var(--card),white_10%),color-mix(in_oklab,var(--card),transparent_0%))] p-4 shadow-[var(--shadow-inner)]">
 								<div className="space-y-3">
 									{columns.map((column, index) => (
 										<div key={`${id}-${column.key}`} className={cn("space-y-1.5", index > 0 && "border-t border-border/45 pt-3")}>
@@ -93,7 +80,7 @@ export function TableShell<T>({
 						))}
 					</div>
 				) : (
-					<div className="rounded-[1.25rem] border border-dashed border-border/60 bg-background/30 px-4 py-10 text-center">
+					<div className="rounded-2xl border border-dashed border-border/60 bg-background/30 px-4 py-10 text-center">
 						<div className="mx-auto max-w-sm">
 							<p className="font-display text-lg font-semibold tracking-[-0.03em] text-foreground">No results</p>
 							<p className="mt-2 text-sm leading-relaxed text-muted-foreground">{emptyMessage}</p>

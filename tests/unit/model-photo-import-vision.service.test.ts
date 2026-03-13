@@ -191,6 +191,55 @@ describe("model-photo-import-vision.service", () => {
 		expect(promptText).toContain('"height_cm":169');
 	});
 
+	it("falls back to OpenAI vision when Z.AI fails", async () => {
+		getEnvMock.mockReturnValue({
+			OPENAI_API_KEY: "openai-key",
+			OPENAI_VISION_MODEL: "gpt-4.1-mini",
+			ZAI_API_BASE_URL: "https://api.z.ai/api/paas/v4",
+			ZAI_API_KEY: "zai-key",
+			ZAI_VISION_MODEL: "glm-4.6v",
+			NANO_BANANA_API_URL: undefined,
+			NANO_BANANA_API_KEY: undefined,
+			NANO_BANANA_MODEL: "gemini-3.1-flash-image-preview",
+		});
+
+		const outputJson = JSON.stringify(buildSuggestionJson());
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response("zai failed", { status: 500 }))
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						choices: [
+							{
+								message: {
+									content: outputJson,
+								},
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const result = await analyzeModelPhotosWithVision({
+			modelName: "Ava",
+			references: [
+				{
+					reference_id: "11111111-1111-4111-8111-111111111111",
+					url: sampleDataUrl(),
+				},
+			],
+		});
+
+		expect(result.provider).toBe("openai_vision");
+		expect(result.suggestion.image_reviews[0]?.view_angle).toBe("frontal");
+		expect(result.suggestion.image_reviews[0]?.identity_anchor_score).toBe(0.95);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock.mock.calls[1]?.[0]).toBe("https://api.openai.com/v1/chat/completions");
+	});
+
 	it("falls back to heuristic when Z.AI fails and Gemini cannot recover", async () => {
 		getEnvMock.mockReturnValue({
 			ZAI_API_BASE_URL: "https://api.z.ai/api/paas/v4",
@@ -373,4 +422,10 @@ function buildSuggestionJson(overrides?: Partial<Record<string, unknown>>) {
 		...base,
 		...(overrides ?? {}),
 	};
+}
+
+function sampleDataUrl(): string {
+	const pngBase64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+6m0AAAAASUVORK5CYII=";
+	return `data:image/png;base64,${pngBase64}`;
 }

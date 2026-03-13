@@ -41,7 +41,8 @@ export const modelUpdateSchema = z.object({
 
 export const campaignCreateSchema = z.object({
   name: z.string().max(200).optional(),
-  model_id: uuidSchema,
+  model_id: uuidSchema.optional(),
+  model_ids: z.array(uuidSchema).min(1).max(24).optional(),
   product_asset_url: z.string().url().optional(),
   batch_size: z.int().min(1).max(12).default(8),
   resolution_width: z.int().default(1024),
@@ -51,6 +52,37 @@ export const campaignCreateSchema = z.object({
   negative_prompt: z.string().optional(),
   image_model: imageModelConfigSchema.optional(),
   creative_controls: creativeControlsSchema.optional(),
+}).superRefine((value, context) => {
+  const modelIds = value.model_ids?.length ? value.model_ids : value.model_id ? [value.model_id] : [];
+
+  if (modelIds.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["model_ids"],
+      message: "Select at least one model.",
+    });
+  }
+
+  if (new Set(modelIds).size !== modelIds.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["model_ids"],
+      message: "Each model can only be selected once.",
+    });
+  }
+});
+
+export const campaignDuplicateSchema = z.object({
+  name: z.string().max(200).optional(),
+  model_ids: z.array(uuidSchema).min(1).max(24),
+}).superRefine((value, context) => {
+  if (new Set(value.model_ids).size !== value.model_ids.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["model_ids"],
+      message: "Each model can only be selected once.",
+    });
+  }
 });
 
 export const generateCampaignSchema = z

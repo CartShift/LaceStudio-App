@@ -148,6 +148,29 @@ describe("POST /api/campaigns/[id]/generate (demo mode)", () => {
       "22222222-2222-4222-8222-222222222222",
     );
   });
+
+  it("reports when matching video generation is planned for the run", async () => {
+    mocks.getCampaignMock.mockReturnValue(createDemoCampaign());
+
+    const response = await runGenerateRequest({
+      prompt_text: "Anchor prompt",
+      generation_mode: "anchor",
+      creative_controls_override: {
+        video: {
+          enabled: true,
+          generation_scope: "all_images",
+          duration_seconds: 6,
+        },
+      },
+    });
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      video_generation_planned: true,
+      video_generation_scope: "all_images",
+      video_generation_duration_seconds: 6,
+    });
+  });
 });
 
 describe("buildModelIdentityReferences", () => {

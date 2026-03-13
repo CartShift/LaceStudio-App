@@ -1,16 +1,16 @@
+import { buildCampaignVideoPrompt } from "@/lib/campaign-video";
 import { ApiError } from "@/lib/http";
 import { prisma } from "@/lib/prisma";
 import { toInputJson } from "@/lib/prisma-json";
 import { getEnv } from "@/lib/env";
 import { getVideoGenerationProvider } from "@/server/providers";
+import { creativeControlsSchema } from "@/server/schemas/creative";
+import { resolveCampaignVideoSettings } from "@/server/services/campaign-video-plan";
 import { resolvePublishingAssetPreviewUrl } from "@/server/services/publishing-assets";
 import { createSignedReadUrlForGcsUri } from "@/server/services/storage/gcs-storage";
 import type { ReelVariantSummary, VideoGenerationJob as VideoGenerationJobDto } from "@/types/domain";
 
 type PersistedVideoJob = Awaited<ReturnType<typeof prisma.videoGenerationJob.findUniqueOrThrow>>;
-
-const DEFAULT_REEL_PROMPT =
-  "Create a polished 9:16 Instagram Reel from this approved asset with subtle motion, original-audio pacing, premium fashion energy, and a clean loop-friendly finish.";
 
 export async function createReelVariantJob(input: {
   assetId: string;
@@ -18,12 +18,15 @@ export async function createReelVariantJob(input: {
   promptText?: string;
   durationSeconds?: number;
   sourceVariantId?: string;
+  allowPendingAsset?: boolean;
 }): Promise<VideoGenerationJobDto> {
   const asset = await prisma.asset.findUnique({
     where: { id: input.assetId },
     include: {
       campaign: {
-        include: {
+        select: {
+          prompt_text: true,
+          creative_controls: true,
           model: {
             select: {
               name: true,
@@ -35,8 +38,16 @@ export async function createReelVariantJob(input: {
     },
   });
 
-  if (!asset || asset.status !== "APPROVED") {
-    throw new ApiError(404, "NOT_FOUND", "Approved asset not found.");
+  const assetEligibleForVideo =
+    asset &&
+    (input.allowPendingAsset ? asset.status !== "REJECTED" : asset.status === "APPROVED");
+
+  if (!assetEligibleForVideo || !asset) {
+    throw new ApiError(
+      404,
+      "NOT_FOUND",
+      input.allowPendingAsset ? "Asset not found or unavailable for video generation." : "Approved asset not found.",
+    );
   }
 
   const sourceVariant =
@@ -49,9 +60,17 @@ export async function createReelVariantJob(input: {
   const sourceUrl = await resolveMediaSourceUrl(
     sourceVariant?.preview_image_gcs_uri ?? sourceVariant?.gcs_uri ?? asset.approved_gcs_uri ?? asset.raw_gcs_uri,
   );
+  const campaignControls = asset.campaign.creative_controls
+    ? creativeControlsSchema.parse(asset.campaign.creative_controls)
+    : null;
+  const videoSettings = resolveCampaignVideoSettings(campaignControls);
   const promptText =
     input.promptText?.trim() ||
-    `Model ${asset.campaign.model.name}: ${DEFAULT_REEL_PROMPT}`;
+    buildCampaignVideoPrompt({
+      campaignPromptText: asset.campaign.prompt_text,
+      motionPromptText: videoSettings.prompt_text,
+      modelName: asset.campaign.model.name,
+    });
   const provider = getVideoGenerationProvider();
   const providerResult = await provider.createVideo({
     imageUrl: sourceUrl,
@@ -174,6 +193,47 @@ export async function getVideoGenerationJob(jobId: string): Promise<VideoGenerat
   });
 
   return serializeVideoGenerationJob(job);
+}
+
+export async function queueVideoJobsForAssets(input: {
+  assetIds: string[];
+  userId: string;
+  promptText?: string | null;
+  durationSeconds: number;
+  allowPendingAssets?: boolean;
+}): Promise<{
+  created: number;
+  failed: number;
+  jobIds: string[];
+  errors: string[];
+}> {
+  const jobs = await Promise.allSettled(
+    input.assetIds.map((assetId) =>
+      createReelVariantJob({
+        assetId,
+        userId: input.userId,
+        promptText: input.promptText ?? undefined,
+        durationSeconds: input.durationSeconds,
+        allowPendingAsset: input.allowPendingAssets,
+      }),
+    ),
+  );
+
+  const createdJobs = jobs.filter(
+    (job): job is PromiseFulfilledResult<VideoGenerationJobDto> => job.status === "fulfilled",
+  );
+  const failedJobs = jobs.filter(
+    (job): job is PromiseRejectedResult => job.status === "rejected",
+  );
+
+  return {
+    created: createdJobs.length,
+    failed: failedJobs.length,
+    jobIds: createdJobs.map((job) => job.value.id),
+    errors: failedJobs.map((job) =>
+      job.reason instanceof Error ? job.reason.message : "Unknown video generation error",
+    ),
+  };
 }
 
 async function finalizeVideoJob(jobId: string, result: { outputUrl?: string | null; previewImageUrl?: string | null }) {

@@ -56,15 +56,6 @@ export function StepCelebration({ message, emoji = "🎉", show, onDone, duratio
 				<span className="text-4xl">{emoji}</span>
 				<p className="text-sm font-semibold text-[var(--status-success)]">{message}</p>
 			</div>
-
-			{/* CSS animation keyframe injected inline */}
-			<style>{`
-        @keyframes celebration-particle {
-          0% { transform: scale(0) translateY(0); opacity: 1; }
-          50% { opacity: 1; }
-          100% { transform: scale(1.5) translateY(-60px) translateX(var(--celebration-drift-x, 24px)); opacity: 0; }
-        }
-      `}</style>
 		</div>
 	);
 }

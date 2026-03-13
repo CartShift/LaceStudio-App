@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { CreativeControls, CreativeIssueTag, ImageModelProvider } from "@/server/schemas/creative";
+import { buildDuplicateCampaignName, adaptPromptTextForTargetModel } from "@/server/services/campaign-linked-sets";
 import { createDefaultCreativeControls, estimateIdentityDriftScore, mergeCreativeControls, shouldAlertIdentityDrift } from "@/server/services/creative-controls";
+import { buildPrompt } from "@/server/services/prompt-builder";
 
 type ModelStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
 type CanonicalPackStatus = "NOT_STARTED" | "GENERATING" | "READY" | "APPROVED" | "FAILED";
@@ -99,11 +101,14 @@ type DemoCampaign = {
 	id: string;
 	name: string;
 	model_id: string;
+	campaign_group_id: string | null;
+	source_campaign_id: string | null;
 	preset_version_id: string;
 	pose_pack_id: string | null;
 	image_model_provider: ImageModelProvider;
 	image_model_id: string | null;
 	creative_controls: CreativeControls;
+	reference_board_version: number;
 	anchor_asset_id: string | null;
 	product_asset_url: string | null;
 	status: CampaignStatus;
@@ -1019,11 +1024,19 @@ export const demoStore = {
 
 	listCampaigns(filters?: { model_id?: string; status?: CampaignStatus }) {
 		const store = getStore();
+		const linkedCountByGroup = new Map<string, number>();
+
+		for (const campaign of store.campaigns) {
+			if (!campaign.campaign_group_id) continue;
+			linkedCountByGroup.set(campaign.campaign_group_id, (linkedCountByGroup.get(campaign.campaign_group_id) ?? 0) + 1);
+		}
+
 		return store.campaigns
 			.filter(campaign => !filters?.model_id || campaign.model_id === filters.model_id)
 			.filter(campaign => !filters?.status || campaign.status === filters.status)
 			.map(campaign => ({
 				...campaign,
+				linked_campaign_count: campaign.campaign_group_id ? linkedCountByGroup.get(campaign.campaign_group_id) ?? 1 : 1,
 				model: store.models.find(model => model.id === campaign.model_id) ?? null,
 				assets: store.assets.filter(asset => asset.campaign_id === campaign.id),
 				generation_jobs: store.generationJobs.filter(job => job.campaign_id === campaign.id)
@@ -1039,6 +1052,8 @@ export const demoStore = {
 	createCampaign(input: {
 		name: string;
 		model_id: string;
+		campaign_group_id?: string | null;
+		source_campaign_id?: string | null;
 		product_asset_url?: string;
 		batch_size: number;
 		resolution_width: number;
@@ -1088,11 +1103,14 @@ export const demoStore = {
 			id: randomUUID(),
 			name: input.name,
 			model_id: input.model_id,
+			campaign_group_id: input.campaign_group_id ?? null,
+			source_campaign_id: input.source_campaign_id ?? null,
 			preset_version_id: presetVersionId,
 			pose_pack_id: null,
 			image_model_provider: input.image_model_provider,
 			image_model_id: input.image_model_id ?? null,
 			creative_controls: input.creative_controls ?? createDefaultCreativeControls(),
+			reference_board_version: input.creative_controls?.reference_board.active_version ?? 1,
 			anchor_asset_id: null,
 			product_asset_url: input.product_asset_url ?? null,
 			status: "DRAFT",
@@ -1119,13 +1137,102 @@ export const demoStore = {
 		const campaign = store.campaigns.find(item => item.id === id);
 		if (!campaign) return null;
 
+		const linkedCampaigns = campaign.campaign_group_id
+			? store.campaigns
+					.filter(item => item.campaign_group_id === campaign.campaign_group_id)
+					.map(item => ({
+						id: item.id,
+						name: item.name,
+						status: item.status,
+						source_campaign_id: item.source_campaign_id,
+						model: store.models.find(model => model.id === item.model_id) ?? null
+					}))
+					.sort((left, right) => left.name.localeCompare(right.name))
+			: [];
+
 		return {
 			...campaign,
 			assets: store.assets.filter(asset => asset.campaign_id === id).sort((a, b) => a.sequence_number - b.sequence_number),
 			generation_jobs: store.generationJobs.filter(job => job.campaign_id === id).sort((a, b) => new Date(b.dispatched_at).getTime() - new Date(a.dispatched_at).getTime()),
 			refinement_states: store.assetRefinementStates.filter(state => state.campaign_id === id).sort((a, b) => b.state_index - a.state_index),
+			linked_campaigns: linkedCampaigns,
 			model: store.models.find(model => model.id === campaign.model_id) ?? null,
 			preset_version: store.presetVersions.find(version => version.id === campaign.preset_version_id) ?? null
+		};
+	},
+
+	duplicateCampaigns(input: {
+		sourceCampaignId: string;
+		modelIds: string[];
+		name?: string;
+		userId: string;
+	}) {
+		const store = getStore();
+		const sourceCampaign = store.campaigns.find(item => item.id === input.sourceCampaignId);
+		if (!sourceCampaign) return null;
+
+		const sourceModel = store.models.find(model => model.id === sourceCampaign.model_id) ?? null;
+		const targetModels = input.modelIds
+			.map(modelId => store.models.find(model => model.id === modelId) ?? null)
+			.filter((model): model is DemoModel => Boolean(model));
+
+		if (targetModels.length !== input.modelIds.length) {
+			return null;
+		}
+
+		const campaignGroupId = sourceCampaign.campaign_group_id ?? sourceCampaign.id;
+		sourceCampaign.campaign_group_id = campaignGroupId;
+		sourceCampaign.updated_at = now();
+
+		const sourcePresetVersion = store.presetVersions.find(version => version.id === sourceCampaign.preset_version_id) ?? null;
+		const sourcePreset = sourcePresetVersion ? store.presets.find(preset => preset.id === sourcePresetVersion.preset_id) ?? null : null;
+		const moodTag = sourcePreset?.mood_tag ?? this.getDefaultCampaignMoodTag();
+		const creativeControls = sourceCampaign.creative_controls ?? createDefaultCreativeControls();
+
+		const createdCampaigns = targetModels.map(targetModel => {
+			const fallbackPrompt = buildPrompt({
+				modelName: targetModel.name,
+				moodTag,
+				customPromptAdditions: sourceCampaign.custom_prompt_additions ?? undefined,
+				negativePrompt: sourceCampaign.negative_prompt ?? undefined,
+				creativeControls,
+			});
+
+			return this.createCampaign({
+				name: buildDuplicateCampaignName({
+					sourceName: sourceCampaign.name,
+					sourceModelName: sourceModel?.name,
+					targetModelName: targetModel.name,
+					targetCount: targetModels.length,
+					overrideName: input.name,
+				}),
+				model_id: targetModel.id,
+				campaign_group_id: campaignGroupId,
+				source_campaign_id: sourceCampaign.id,
+				product_asset_url: sourceCampaign.product_asset_url ?? undefined,
+				batch_size: sourceCampaign.batch_size,
+				resolution_width: sourceCampaign.resolution_width,
+				resolution_height: sourceCampaign.resolution_height,
+				upscale: sourceCampaign.upscale,
+				negative_prompt: sourceCampaign.negative_prompt ?? fallbackPrompt.negativePrompt,
+				custom_prompt_additions: sourceCampaign.custom_prompt_additions ?? undefined,
+				prompt_text: adaptPromptTextForTargetModel({
+					sourcePromptText: sourceCampaign.prompt_text,
+					sourceModelName: sourceModel?.name,
+					targetModelName: targetModel.name,
+					fallbackPromptText: fallbackPrompt.promptText,
+				}),
+				image_model_provider: sourceCampaign.image_model_provider,
+				image_model_id: sourceCampaign.image_model_id ?? undefined,
+				creative_controls: creativeControls,
+				userId: input.userId,
+			});
+		});
+
+		return {
+			primary_campaign_id: createdCampaigns[0]?.id ?? null,
+			campaign_group_id: campaignGroupId,
+			campaigns: createdCampaigns,
 		};
 	},
 

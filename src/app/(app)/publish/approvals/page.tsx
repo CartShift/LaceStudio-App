@@ -537,7 +537,7 @@ export default function PublishingApprovalsPage() {
 							<Button size="sm" onClick={() => void approveItem(item.id)} disabled={workingIds[item.id]}>
 								{workingIds[item.id] ? "Saving..." : "Approve"}
 							</Button>
-							<Button size="sm" variant="danger" onClick={() => void rejectItem(item.id)} disabled={workingIds[item.id] || !(reasons[item.id]?.trim())}>
+							<Button size="sm" variant="destructive" onClick={() => void rejectItem(item.id)} disabled={workingIds[item.id] || !(reasons[item.id]?.trim())}>
 								{workingIds[item.id] ? "Saving..." : "Reject"}
 							</Button>
 						</div>
@@ -662,8 +662,8 @@ export default function PublishingApprovalsPage() {
 			</FilterShell>
 
 			{queueQuery.isLoading ? <StateBlock title="Loading approval queue..." /> : null}
-			{queueQuery.error instanceof Error ? <StateBlock tone="error" title="Couldn't load the queue" description={queueQuery.error.message} /> : null}
-			{error ? <StateBlock tone="error" title="Action failed" description={error} /> : null}
+			{queueQuery.error instanceof Error ? <StateBlock tone="danger" title="Couldn't load the queue" description={queueQuery.error.message} /> : null}
+			{error ? <StateBlock tone="danger" title="Action failed" description={error} /> : null}
 
 			<div className="rounded-lg border border-border bg-card p-3">
 				<div className="flex flex-wrap items-end gap-3">
@@ -681,7 +681,7 @@ export default function PublishingApprovalsPage() {
 					<Button size="sm" onClick={() => void executeBulkApprove(selectedPendingIds)} disabled={bulkActionDisabled}>
 						Approve selected
 					</Button>
-					<Button size="sm" variant="danger" onClick={() => void executeBulkReject(selectedPendingIds, bulkRejectReason)} disabled={bulkActionDisabled || !bulkRejectReason.trim()}>
+					<Button size="sm" variant="destructive" onClick={() => void executeBulkReject(selectedPendingIds, bulkRejectReason)} disabled={bulkActionDisabled || !bulkRejectReason.trim()}>
 						Reject selected
 					</Button>
 				</div>

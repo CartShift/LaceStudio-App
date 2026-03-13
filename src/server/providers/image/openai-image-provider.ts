@@ -61,6 +61,10 @@ export class OpenAiImageProvider implements ImageProvider {
       failedCount: prioritizedReferences.length - resolvedReferences.length,
     });
 
+    // OpenAI models like gpt-image-1 and dall-e-3 strictly limit to 5 images per minute on lower tiers.
+    // Cap the batch size here so we don't immediately fail campaigns that request 8 or more.
+    const safeBatchSize = Math.min(input.batch_size, 5);
+
     let endpoint: "images/generations" | "images/edits" = "images/generations";
     let response: Response;
     let editFallbackStatus: number | undefined;
@@ -76,7 +80,7 @@ export class OpenAiImageProvider implements ImageProvider {
         model,
         prompt,
         size,
-        batchSize: input.batch_size,
+        batchSize: safeBatchSize,
         references: resolvedReferences,
         inputFidelity: "high",
       });
@@ -90,7 +94,7 @@ export class OpenAiImageProvider implements ImageProvider {
           model,
           prompt,
           size,
-          batchSize: input.batch_size,
+          batchSize: safeBatchSize,
           references: resolvedReferences,
         });
 
@@ -107,7 +111,7 @@ export class OpenAiImageProvider implements ImageProvider {
             model,
             prompt,
             size,
-            batchSize: input.batch_size,
+            batchSize: safeBatchSize,
           });
 
           if (retryAsGeneration.ok) {
@@ -130,7 +134,7 @@ export class OpenAiImageProvider implements ImageProvider {
         model,
         prompt,
         size,
-        batchSize: input.batch_size,
+        batchSize: safeBatchSize,
       });
     }
 

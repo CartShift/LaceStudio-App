@@ -22,6 +22,7 @@ type Campaign = {
 	id: string;
 	name: string;
 	status: CampaignStatus;
+	linked_campaign_count?: number;
 	model?: { id: string; name: string } | null;
 };
 
@@ -61,7 +62,14 @@ export default function CampaignsPage() {
 		{
 			key: "name",
 			header: "Campaign",
-			cell: item => <p className="font-medium">{item.name}</p>
+			cell: item => (
+				<div className="space-y-1">
+					<p className="font-medium">{item.name}</p>
+					{(item.linked_campaign_count ?? 1) > 1 ? (
+						<p className="text-xs text-muted-foreground">{item.linked_campaign_count} linked workspaces</p>
+					) : null}
+				</div>
+			)
 		},
 		{
 			key: "model",
@@ -135,7 +143,7 @@ export default function CampaignsPage() {
 			</FilterShell>
 
 			{campaignsQuery.isLoading ? <StateBlock title="Loading campaigns…" /> : null}
-			{campaignsQuery.error instanceof Error ? <StateBlock tone="error" title="Couldn't load campaigns" description={campaignsQuery.error.message} /> : null}
+			{campaignsQuery.error instanceof Error ? <StateBlock tone="danger" title="Couldn't load campaigns" description={campaignsQuery.error.message} /> : null}
 			<TableShell
 				title="Campaign Queue"
 				description="Campaign status across production."

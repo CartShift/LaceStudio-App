@@ -390,7 +390,7 @@ export default function CampaignReviewPage() {
 					<Button type="button" onClick={() => void applyBulk("approve")} disabled={working}>
 						Approve Selected
 					</Button>
-					<Button type="button" variant="danger" onClick={() => void applyBulk("reject")} disabled={working}>
+					<Button type="button" variant="destructive" onClick={() => void applyBulk("reject")} disabled={working}>
 						Reject Selected
 					</Button>
 					<Button type="button" variant="secondary" onClick={() => void applyBulk("flag")} disabled={working}>
@@ -503,7 +503,7 @@ export default function CampaignReviewPage() {
 									<Button onClick={() => void moderate(asset.id, "approve")} disabled={working}>
 										Approve
 									</Button>
-									<Button variant="danger" onClick={() => void moderate(asset.id, "reject")} disabled={working}>
+									<Button variant="destructive" onClick={() => void moderate(asset.id, "reject")} disabled={working}>
 										Reject
 									</Button>
 									<Button variant="secondary" onClick={() => void moderate(asset.id, "flag")} disabled={working}>
@@ -520,7 +520,7 @@ export default function CampaignReviewPage() {
 			)}
 
 			{info ? <StateBlock tone="success" title="Review Updated" description={info} /> : null}
-			{error ? <StateBlock tone="error" title="Review Failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Review Failed" description={error} /> : null}
 		</div>
 	);
 }

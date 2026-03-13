@@ -1,4 +1,7 @@
+"use client";
+
 import React from "react";
+import { ImageGenerationSurface } from "@/components/ui/image-generation-surface";
 
 const ExpandIcon = () => (
 	<svg viewBox="0 0 24 24" className="h-4 w-4 fill-none stroke-current" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -14,6 +17,11 @@ export type SquareImageThumbnailProps = {
 	alt: string;
 	placeholder?: React.ReactNode;
 	containerClassName?: string;
+	loading?: boolean;
+	loadingTitle?: React.ReactNode;
+	loadingDescription?: React.ReactNode;
+	loadingBadge?: React.ReactNode;
+	loadingVariant?: "default" | "compact";
 	onImageClick?: () => void;
 	expandButton?: { "aria-label": string; onExpand: () => void };
 };
@@ -23,22 +31,34 @@ export function SquareImageThumbnail({
 	alt,
 	placeholder = "Preview unavailable",
 	containerClassName = "",
+	loading = false,
+	loadingTitle,
+	loadingDescription,
+	loadingBadge,
+	loadingVariant,
 	onImageClick,
 	expandButton
 }: SquareImageThumbnailProps) {
 	const base = "group/image relative aspect-square w-full overflow-hidden rounded-md border border-border bg-muted/55";
 	const wrapperClassName = `${base} ${containerClassName}`.trim();
 
-	const content = src ? (
-		<>
-			{/* eslint-disable-next-line @next/next/no-img-element */}
-			<img src={src} alt={alt} className="h-full w-full object-cover" />
+	const content = (
+		<ImageGenerationSurface
+			src={src}
+			alt={alt}
+			placeholder={placeholder}
+			className={wrapperClassName}
+			loading={loading}
+			loadingTitle={loadingTitle}
+			loadingDescription={loadingDescription}
+			loadingBadge={loadingBadge}
+			loadingVariant={loadingVariant}>
 			{expandButton ? (
 				<span
 					role="button"
 					tabIndex={0}
 					aria-label={expandButton["aria-label"]}
-					className="absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-full border border-border/40 bg-card/65 text-foreground opacity-0 shadow-sm transition-all duration-200 group-hover/image:opacity-100 group-focus-within/image:opacity-100 focus-visible:opacity-100"
+					className="absolute right-2 top-2 z-20 inline-flex h-8 w-8 items-center justify-center rounded-full border border-border/40 bg-card/65 text-foreground opacity-0 shadow-sm transition-all duration-200 group-hover/image:opacity-100 group-focus-within/image:opacity-100 focus-visible:opacity-100"
 					onClick={e => {
 						e.stopPropagation();
 						expandButton.onExpand();
@@ -53,20 +73,20 @@ export function SquareImageThumbnail({
 					<ExpandIcon />
 				</span>
 			) : null}
-		</>
-	) : (
-		<div className="flex h-full items-center justify-center text-[11px] text-muted-foreground">{placeholder}</div>
+		</ImageGenerationSurface>
 	);
 
 	if (onImageClick && src) {
 		return (
-			<div className={wrapperClassName}>
-				<button type="button" className="h-full w-full" onClick={onImageClick} aria-label={alt}>
-					{content}
-				</button>
-			</div>
+			<button
+				type="button"
+				className="block w-full appearance-none border-0 bg-transparent p-0 text-left"
+				onClick={onImageClick}
+				aria-label={alt}>
+				{content}
+			</button>
 		);
 	}
 
-	return <div className={wrapperClassName}>{content}</div>;
+	return content;
 }

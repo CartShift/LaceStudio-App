@@ -186,7 +186,7 @@ export default function PublishPage() {
 
       {priorityProfiles.length ? (
         <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
-          <EditorialCard className="rounded-[1.8rem] border border-border/70 bg-[linear-gradient(145deg,color-mix(in_oklab,var(--background),white_4%),color-mix(in_oklab,var(--accent),transparent_50%))] p-5 md:p-6">
+          <EditorialCard className="rounded-4xl border border-border/70 bg-[linear-gradient(145deg,color-mix(in_oklab,var(--background),white_4%),color-mix(in_oklab,var(--accent),transparent_50%))] p-5 md:p-6">
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
                 <AlertTriangle className="h-4 w-4" />
@@ -194,7 +194,7 @@ export default function PublishPage() {
               </div>
               <div className="grid gap-3">
                 {priorityProfiles.map((profile) => (
-                  <div key={profile.id} className="rounded-[1.25rem] border border-border/70 bg-background/75 p-4">
+                  <div key={profile.id} className="rounded-xl border border-border/70 bg-background/75 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="space-y-1">
                         <div className="flex flex-wrap items-center gap-2">
@@ -218,7 +218,7 @@ export default function PublishPage() {
             </div>
           </EditorialCard>
 
-          <EditorialCard className="rounded-[1.8rem] border border-border/70 bg-[linear-gradient(155deg,color-mix(in_oklab,var(--background),white_4%),color-mix(in_oklab,var(--primary),transparent_92%))] p-5 md:p-6">
+          <EditorialCard className="rounded-4xl border border-border/70 bg-[linear-gradient(155deg,color-mix(in_oklab,var(--background),white_4%),color-mix(in_oklab,var(--primary),transparent_92%))] p-5 md:p-6">
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
                 <Clock3 className="h-4 w-4" />
@@ -260,14 +260,14 @@ export default function PublishPage() {
 
       {profilesQuery.isLoading ? <StateBlock title="Loading Instagram publishing cockpit…" /> : null}
       {profilesQuery.error instanceof Error ? (
-        <StateBlock tone="error" title="Publishing cockpit failed to load" description={profilesQuery.error.message} />
+        <StateBlock tone="danger" title="Publishing cockpit failed to load" description={profilesQuery.error.message} />
       ) : null}
 
       <div className="grid gap-4 xl:grid-cols-2">
         {rankedProfiles.map((profile, index) => (
           <EditorialCard
             key={profile.id}
-            className={`relative overflow-hidden rounded-[1.85rem] border border-border/70 p-0 ${index % 2 === 0 ? "bg-[radial-gradient(circle_at_top_left,color-mix(in_oklab,var(--primary),transparent_88%),transparent_42%),linear-gradient(180deg,color-mix(in_oklab,var(--background),white_2%),transparent)]" : "bg-[radial-gradient(circle_at_top_right,color-mix(in_oklab,var(--accent),transparent_80%),transparent_38%),linear-gradient(180deg,color-mix(in_oklab,var(--background),white_2%),transparent)]"}`}
+            className={`relative overflow-hidden rounded-4xl border border-border/70 p-0 ${index % 2 === 0 ? "bg-[radial-gradient(circle_at_top_left,color-mix(in_oklab,var(--primary),transparent_88%),transparent_42%),linear-gradient(180deg,color-mix(in_oklab,var(--background),white_2%),transparent)]" : "bg-[radial-gradient(circle_at_top_right,color-mix(in_oklab,var(--accent),transparent_80%),transparent_38%),linear-gradient(180deg,color-mix(in_oklab,var(--background),white_2%),transparent)]"}`}
           >
             <div className="space-y-5 p-5 md:p-6">
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -317,7 +317,7 @@ export default function PublishPage() {
               </div>
 
               <div className="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
-                <div className="space-y-4 rounded-[1.4rem] border border-border/70 bg-background/75 p-4">
+                <div className="space-y-4 rounded-2xl border border-border/70 bg-background/75 p-4">
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">Health</p>
@@ -366,7 +366,7 @@ export default function PublishPage() {
                   )}
                 </div>
 
-                <div className="space-y-4 rounded-[1.4rem] border border-border/70 bg-background/75 p-4">
+                <div className="space-y-4 rounded-2xl border border-border/70 bg-background/75 p-4">
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">Next posts</p>
@@ -377,7 +377,7 @@ export default function PublishPage() {
                   <div className="space-y-3">
                     {profile.next_posts.length > 0 ? (
                       profile.next_posts.map((item) => (
-                        <div key={item.id} className="rounded-[1.2rem] border border-border/70 bg-muted/35 p-3">
+                        <div key={item.id} className="rounded-xl border border-border/70 bg-muted/35 p-3">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <div>
                               <p className="font-medium">{item.pillar_key?.replaceAll("_", " ") ?? "Open slot"}</p>
@@ -393,7 +393,7 @@ export default function PublishPage() {
                         </div>
                       ))
                     ) : (
-                      <p className="rounded-[1.2rem] border border-dashed border-border/70 bg-muted/20 p-4 text-sm text-muted-foreground">
+                      <p className="rounded-xl border border-dashed border-border/70 bg-muted/20 p-4 text-sm text-muted-foreground">
                         No recommendations are ready yet. Open the profile workspace to refine the strategy and generate the next queue.
                       </p>
                     )}
@@ -401,7 +401,7 @@ export default function PublishPage() {
                 </div>
               </div>
 
-              <div className="rounded-[1.4rem] border border-border/70 bg-background/75 p-4">
+              <div className="rounded-2xl border border-border/70 bg-background/75 p-4">
                 <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">Last post performance</p>
                 {profile.last_post ? (
                   <div className="mt-3 grid gap-3 sm:grid-cols-3">
@@ -438,7 +438,7 @@ function SignalStat({
   tone: "neutral" | "success" | "warning" | "danger";
 }) {
   return (
-    <div className="rounded-[1.35rem] border border-border/70 bg-background/70 p-4">
+    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
       <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">{label}</p>
       <p className={`mt-2 font-display text-3xl tracking-[-0.05em] ${tone === "danger" ? "text-destructive" : ""}`}>{value}</p>
     </div>
@@ -467,7 +467,7 @@ function MetricTile({
   tone?: "neutral" | "danger";
 }) {
   return (
-    <div className="rounded-[1.15rem] border border-border/70 bg-muted/25 p-3">
+    <div className="rounded-xl border border-border/70 bg-muted/25 p-3">
       <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">{label}</p>
       <p className={`mt-2 text-2xl font-semibold tracking-[-0.05em] ${tone === "danger" ? "text-destructive" : ""}`}>{value}</p>
       <p className="mt-1 text-xs text-muted-foreground">{hint}</p>

@@ -517,7 +517,7 @@ export function ModelWizard() {
 					</EditorialCard>
 				) : null}
 
-				{error ? <StateBlock tone="error" title="We couldn't start setup" description={error} /> : null}
+				{error ? <StateBlock tone="danger" title="We couldn't start setup" description={error} /> : null}
 			</div>
 		);
 	}
@@ -546,7 +546,7 @@ export function ModelWizard() {
 
 			{saveError ? (
 				<StateBlock
-					tone="error"
+					tone="danger"
 					title="Auto-save didn't finish"
 					description={saveError}
 					action={
@@ -556,7 +556,7 @@ export function ModelWizard() {
 					}
 				/>
 			) : null}
-			{error ? <StateBlock tone="error" title="Model setup issue" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Model setup issue" description={error} /> : null}
 			{loadingWorkflow ? <StateBlock title="Loading setup..." /> : null}
 
 			<ModelStepper activeStep={activeStep} completedSteps={completedSteps} onStepSelect={setActiveStep} />

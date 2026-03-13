@@ -136,12 +136,16 @@ export const canonicalPackGenerateSchema = z.object({
 	candidates_per_shot: z.int().min(1).max(5).default(3),
 	style: canonicalPackStyleSchema.default("strict_studio"),
 	generation_mode: canonicalGenerationModeSchema.default("front_only"),
-	pack_version: z.coerce.number().int().positive().optional()
+	pack_version: z.coerce.number().int().positive().optional(),
+	shot_codes: z.array(canonicalShotCodeSchema).min(1).max(8).optional(),
+	candidate_id: z.uuid().optional(),
+	regenerate_existing: z.boolean().default(false)
 });
 
 export const canonicalPackUploadSchema = z.object({
 	image_data_url: z.string().regex(/^data:image\/[a-zA-Z0-9.+-]+;base64,/),
 	shot_code: canonicalShotCodeSchema,
+	candidate_id: z.uuid().optional(),
 	candidate_index: z.coerce.number().int().positive().optional(),
 	pack_version: z.coerce.number().int().positive().optional()
 });

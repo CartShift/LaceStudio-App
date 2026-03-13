@@ -16,14 +16,10 @@ const buttonVariants = cva(
 					"ds-pill border-border bg-[linear-gradient(150deg,color-mix(in_oklab,var(--card),white_20%),color-mix(in_oklab,var(--card),transparent_0%))] text-foreground shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_36%)] hover:-translate-y-0.5 hover:border-[color:color-mix(in_oklab,var(--primary),transparent_68%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_56%)]",
 				outline:
 					"border-[color:color-mix(in_oklab,var(--foreground),transparent_86%)] bg-[color:color-mix(in_oklab,var(--background),transparent_22%)] text-foreground shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_28%)] hover:-translate-y-0.5 hover:border-[color:color-mix(in_oklab,var(--primary),transparent_58%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_74%)]",
-				ghost:
-					"border-transparent bg-transparent text-muted-foreground hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_72%)] hover:text-foreground",
+				ghost: "border-transparent bg-transparent text-muted-foreground hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_72%)] hover:text-foreground",
 				link: "h-auto rounded-none border-transparent px-0 py-0 text-primary shadow-none hover:text-[color:color-mix(in_oklab,var(--primary),black_12%)] hover:underline",
-				soft:
-					"border-[color:color-mix(in_oklab,var(--foreground),transparent_88%)] bg-[color:color-mix(in_oklab,var(--accent),transparent_84%)] text-foreground shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_34%)] hover:border-[color:color-mix(in_oklab,var(--primary),transparent_72%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_68%)]",
+				soft: "border-[color:color-mix(in_oklab,var(--foreground),transparent_88%)] bg-[color:color-mix(in_oklab,var(--accent),transparent_84%)] text-foreground shadow-[inset_0_1px_0_color-mix(in_oklab,var(--card),white_34%)] hover:border-[color:color-mix(in_oklab,var(--primary),transparent_72%)] hover:bg-[color:color-mix(in_oklab,var(--accent),transparent_68%)]",
 				destructive:
-					"border-transparent bg-[linear-gradient(140deg,color-mix(in_oklab,var(--destructive),white_8%),color-mix(in_oklab,var(--destructive),black_7%))] text-destructive-foreground shadow-[0_12px_26px_color-mix(in_oklab,var(--destructive),transparent_56%)] hover:-translate-y-0.5 hover:shadow-[0_16px_32px_color-mix(in_oklab,var(--destructive),transparent_48%)]",
-				danger:
 					"border-transparent bg-[linear-gradient(140deg,color-mix(in_oklab,var(--destructive),white_8%),color-mix(in_oklab,var(--destructive),black_7%))] text-destructive-foreground shadow-[0_12px_26px_color-mix(in_oklab,var(--destructive),transparent_56%)] hover:-translate-y-0.5 hover:shadow-[0_16px_32px_color-mix(in_oklab,var(--destructive),transparent_48%)]"
 			},
 			size: {

@@ -61,7 +61,7 @@ export type ModelPhotoImportSnapshot = {
 	started_at: string | null;
 	completed_at: string | null;
 	error: string | null;
-	analysis_provider: "zai_vision" | "gemini_fallback" | "heuristic" | null;
+	analysis_provider: "zai_vision" | "openai_vision" | "gemini_fallback" | "heuristic" | null;
 	counts: {
 		pending: number;
 		accepted: number;
@@ -351,7 +351,13 @@ export async function getModelPhotoImportSnapshot(input: { modelId: string }): P
 		started_at: photoState?.started_at ?? null,
 		completed_at: photoState?.completed_at ?? null,
 		error: photoState?.error ?? null,
-		analysis_provider: photoState?.provider === "zai_vision" || photoState?.provider === "gemini_fallback" || photoState?.provider === "heuristic" ? photoState.provider : null,
+		analysis_provider:
+			photoState?.provider === "zai_vision" ||
+			photoState?.provider === "openai_vision" ||
+			photoState?.provider === "gemini_fallback" ||
+			photoState?.provider === "heuristic"
+				? photoState.provider
+				: null,
 		counts: photoState?.counts ?? computedCounts,
 		options: {
 			keep_as_references: photoState?.keep_as_references ?? DEFAULT_PHOTO_IMPORT_OPTIONS.keep_as_references,
@@ -414,6 +420,8 @@ export async function reanalyzeModelPhotoImport(input: {
 		heartbeat_at: nowIso,
 		completed_at: undefined,
 		error: null,
+		latest_suggestion: null,
+		provider: null,
 		counts: {
 			pending: referenceCount,
 			accepted: 0,
@@ -831,7 +839,7 @@ async function updatePhotoImportState(input: {
 		total: number;
 	};
 	options?: Partial<PhotoImportState>;
-	provider?: string;
+	provider?: string | null;
 }) {
 	const model = await prisma.aiModel.findUnique({
 		where: { id: input.modelId },
@@ -852,9 +860,10 @@ async function updatePhotoImportState(input: {
 		heartbeat_at: input.heartbeat_at,
 		completed_at: input.completed_at ?? photoState.completed_at,
 		error: input.error ?? photoState.error ?? null,
-		latest_suggestion: input.latest_suggestion ?? photoState.latest_suggestion,
+		latest_suggestion:
+			Object.prototype.hasOwnProperty.call(input, "latest_suggestion") ? input.latest_suggestion : photoState.latest_suggestion,
 		counts: input.counts ?? photoState.counts,
-		provider: input.provider ?? photoState.provider
+		provider: Object.prototype.hasOwnProperty.call(input, "provider") ? input.provider ?? undefined : photoState.provider
 	};
 
 	await prisma.aiModel.update({
@@ -891,7 +900,10 @@ function readPhotoImportState(onboardingState: Record<string, unknown>): PhotoIm
 				: undefined,
 		canonical_model_id: typeof raw.canonical_model_id === "string" ? raw.canonical_model_id : undefined,
 		canonical_candidates_per_shot: readPositiveInt(raw.canonical_candidates_per_shot),
-		provider: raw.provider === "zai_vision" || raw.provider === "gemini_fallback" || raw.provider === "heuristic" ? raw.provider : undefined,
+		provider:
+			raw.provider === "zai_vision" || raw.provider === "openai_vision" || raw.provider === "gemini_fallback" || raw.provider === "heuristic"
+				? raw.provider
+				: undefined,
 		counts: countsRaw
 			? {
 					pending: readNonNegativeInt(countsRaw.pending) ?? 0,

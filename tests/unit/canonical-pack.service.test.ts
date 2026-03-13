@@ -4,7 +4,9 @@ import {
 	buildAllFailedCanonicalErrorMessage,
 	getCanonicalPackSummary,
 	resolveCanonicalGenerationProviderSelection,
-	startCanonicalPackGeneration
+	startCanonicalPackGeneration,
+	stopCanonicalPackGeneration,
+	uploadCandidateReference
 } from "@/server/services/canonical-pack.service";
 
 const { prismaMock } = vi.hoisted(() => ({
@@ -16,7 +18,14 @@ const { prismaMock } = vi.hoisted(() => ({
 		},
 		modelReferenceCandidate: {
 			aggregate: vi.fn(),
-			findMany: vi.fn()
+			findMany: vi.fn(),
+			findFirst: vi.fn(),
+			create: vi.fn(),
+			update: vi.fn()
+		},
+		canonicalReference: {
+			findMany: vi.fn(),
+			updateMany: vi.fn()
 		}
 	}
 }));
@@ -129,7 +138,7 @@ describe("canonical-pack.service", () => {
 		expect(summary.shots).toHaveLength(8);
 	});
 
-	it("marks stale generating state as failed when reading summary", async () => {
+	it("converts a stale partial generation into a resumable set", async () => {
 		const staleHeartbeat = new Date(Date.now() - 25 * 60 * 1000).toISOString();
 		prismaMock.aiModel.findUnique.mockResolvedValue({
 			canonical_pack_status: "GENERATING",
@@ -137,27 +146,42 @@ describe("canonical-pack.service", () => {
 			onboarding_state: {
 				canonical_pack_generation: {
 					job_id: "job-stale",
-					pack_version: 1,
+					pack_version: 2,
 					heartbeat_at: staleHeartbeat,
-					completed_shots: 0,
-					total_shots: 1,
+					completed_shots: 1,
+					total_shots: 2,
 					failed_shots: 0,
-					shot_codes: ["frontal_closeup"],
-					generation_mode: "front_only"
+					shot_codes: ["left45_closeup", "right45_closeup"],
+					generation_mode: "remaining",
+					provider: "openai"
 				}
 			}
 		});
 		prismaMock.aiModel.updateMany.mockResolvedValue({ count: 1 });
 		prismaMock.modelReferenceCandidate.aggregate.mockResolvedValue({
-			_max: { pack_version: 0 }
+			_max: { pack_version: 2 }
 		});
-		prismaMock.modelReferenceCandidate.findMany.mockResolvedValue([]);
+		prismaMock.modelReferenceCandidate.findMany.mockResolvedValue([
+			{
+				id: "cand-1",
+				model_id: "model-1",
+				pack_version: 2,
+				shot_code: "left45_closeup",
+				candidate_index: 1,
+				image_gcs_uri: "https://cdn.example.com/cand-1.png",
+				composite_score: "0.91"
+			}
+		]);
 
 		const summary = await getCanonicalPackSummary({ modelId: "model-1" });
 
 		expect(prismaMock.aiModel.updateMany).toHaveBeenCalledTimes(1);
-		expect(summary.status).toBe("FAILED");
-		expect(summary.error).toContain("timed out");
+		expect(summary.status).toBe("READY");
+		expect(summary.error).toContain("Resume generation");
+		expect(summary.progress?.completed_shots).toBe(1);
+		expect(summary.progress?.total_shots).toBe(2);
+		expect(summary.generation?.resume_available).toBe(true);
+		expect(summary.generation?.missing_shot_codes).toEqual(["right45_closeup"]);
 	});
 
 	it("rejects when generation is active but no reusable job metadata exists", async () => {
@@ -204,6 +228,30 @@ describe("canonical-pack.service", () => {
 		expect(summary.progress?.generated_candidates).toBe(0);
 	});
 
+	it("includes the last provider request id in canonical summaries", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			canonical_pack_status: "FAILED",
+			active_canonical_pack_version: 3,
+			onboarding_state: {
+				canonical_pack_error: "OpenAI image request failed: Billing hard limit has been reached.",
+				canonical_pack_generation: {
+					pack_version: 3,
+					error_request_id: "req_openai_123",
+					status: "FAILED",
+					provider: "openai",
+				},
+			},
+		});
+		prismaMock.modelReferenceCandidate.aggregate.mockResolvedValue({
+			_max: { pack_version: 3 }
+		});
+		prismaMock.modelReferenceCandidate.findMany.mockResolvedValue([]);
+
+		const summary = await getCanonicalPackSummary({ modelId: "model-1" });
+
+		expect(summary.error_request_id).toBe("req_openai_123");
+	});
+
 	it("allows canonical generation to start without any accepted references", async () => {
 		prismaMock.aiModel.findUnique.mockResolvedValue({
 			name: "Ava Prime",
@@ -232,6 +280,265 @@ describe("canonical-pack.service", () => {
 		).resolves.toMatchObject({
 			pack_version: 1
 		});
+	});
+
+	it("replaces an uploaded candidate in place when a candidate id is supplied", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			name: "Ava Prime",
+			body_profile: {},
+			face_profile: {},
+			imperfection_fingerprint: [],
+			canonical_pack_status: "READY",
+			active_canonical_pack_version: 3,
+			onboarding_state: {}
+		});
+		prismaMock.modelReferenceCandidate.findFirst.mockResolvedValue({
+			id: "cand-1",
+			candidate_index: 2
+		});
+		prismaMock.modelReferenceCandidate.update.mockResolvedValue({
+			id: "cand-1"
+		});
+		prismaMock.canonicalReference.updateMany.mockResolvedValue({ count: 1 });
+
+		const candidate = await uploadCandidateReference({
+			modelId: "model-1",
+			initiatedBy: "admin-1",
+			shotCode: "frontal_closeup",
+			imageDataUrl: "data:image/png;base64,AAAA",
+			candidateId: "cand-1",
+			packVersion: 3
+		});
+
+		expect(candidate).toEqual({ id: "cand-1" });
+		expect(prismaMock.modelReferenceCandidate.update).toHaveBeenCalledWith(
+			expect.objectContaining({
+				where: { id: "cand-1" },
+				data: expect.objectContaining({
+					candidate_index: 2,
+					shot_code: "frontal_closeup",
+					model_id: "model-1",
+					pack_version: 3
+				})
+			})
+		);
+		expect(prismaMock.modelReferenceCandidate.create).not.toHaveBeenCalled();
+		expect(prismaMock.canonicalReference.updateMany).toHaveBeenCalledWith(
+			expect.objectContaining({
+				where: expect.objectContaining({
+					model_id: "model-1",
+					pack_version: 3,
+					source_candidate_id: "cand-1"
+				})
+			})
+		);
+	});
+
+	it("reuses the current pack version when explicitly resuming front generation", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			name: "Ava Prime",
+			body_profile: {},
+			face_profile: {},
+			onboarding_state: {
+				canonical_pack_generation: {
+					pack_version: 4,
+					generation_mode: "front_only",
+					heartbeat_at: new Date(Date.now() - 25 * 60 * 1000).toISOString()
+				}
+			},
+			canonical_pack_status: "FAILED",
+			active_canonical_pack_version: 0,
+			updated_at: new Date().toISOString(),
+			canonical_references: [],
+			source_references: [],
+			model_versions: [{ id: "v1" }]
+		});
+		prismaMock.modelReferenceCandidate.aggregate.mockResolvedValue({
+			_max: { pack_version: 4 }
+		});
+		prismaMock.aiModel.updateMany.mockResolvedValue({ count: 1 });
+
+		await expect(
+			startCanonicalPackGeneration({
+				modelId: "model-1",
+				initiatedBy: "admin-1",
+				provider: "openai",
+				candidatesPerShot: 1,
+				generationMode: "front_only",
+				packVersion: 4
+			})
+		).resolves.toMatchObject({
+			pack_version: 4
+		});
+	});
+
+	it("resumes a historical pack with its stored provider, shot list, and reference pool", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			name: "Ava Prime",
+			body_profile: {},
+			face_profile: {},
+			onboarding_state: {
+				canonical_pack_versions: {
+					"5": {
+						pack_version: 5,
+						provider: "openai",
+						provider_model_id: "gpt-image-1",
+						generation_mode: "full",
+						status: "READY",
+						candidates_per_shot: 2,
+						shot_codes: ["left45_closeup", "right45_closeup"],
+						reference_pool: [
+							{
+								url: "https://cdn.example.com/front.png",
+								weight: "primary",
+								source_kind: "selected_front_candidate",
+								canonical_shot_code: "frontal_closeup"
+							}
+						]
+					}
+				}
+			},
+			canonical_pack_status: "READY",
+			active_canonical_pack_version: 0,
+			updated_at: new Date().toISOString(),
+			canonical_references: [],
+			source_references: [],
+			model_versions: [{ id: "v1" }]
+		});
+		prismaMock.modelReferenceCandidate.aggregate.mockResolvedValue({
+			_max: { pack_version: 0 }
+		});
+		prismaMock.aiModel.updateMany.mockResolvedValue({ count: 1 });
+
+		await expect(
+			startCanonicalPackGeneration({
+				modelId: "model-1",
+				initiatedBy: "admin-1",
+				provider: "nano_banana_2",
+				providerModelId: "gemini-3.1-flash-image-preview",
+				candidatesPerShot: 5,
+				packVersion: 5
+			})
+		).resolves.toMatchObject({
+			pack_version: 5
+		});
+
+		const updateManyInput = prismaMock.aiModel.updateMany.mock.calls[0]?.[0];
+		expect(updateManyInput?.data.onboarding_state.canonical_pack_generation).toMatchObject({
+			pack_version: 5,
+			provider: "openai",
+			provider_model_id: "gpt-image-1",
+			generation_mode: "full",
+			candidates_per_shot: 2,
+			shot_codes: ["left45_closeup", "right45_closeup"],
+			reference_pool: [
+				expect.objectContaining({
+					url: "https://cdn.example.com/front.png",
+					weight: "primary",
+					source_kind: "selected_front_candidate"
+				})
+			]
+		});
+	});
+
+	it("shows resume metadata for a historical pack from stored pack state", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			canonical_pack_status: "APPROVED",
+			active_canonical_pack_version: 6,
+			onboarding_state: {
+				canonical_pack_versions: {
+					"5": {
+						pack_version: 5,
+						status: "READY",
+						provider: "openai",
+						provider_model_id: "gpt-image-1",
+						generation_mode: "remaining",
+						candidates_per_shot: 2,
+						completed_shots: 1,
+						total_shots: 2,
+						failed_shots: 1,
+						shot_codes: ["left45_closeup", "right45_closeup"],
+						reference_pool: [
+							{
+								url: "https://cdn.example.com/front.png",
+								weight: "primary",
+								source_kind: "selected_front_candidate",
+								canonical_shot_code: "frontal_closeup"
+							}
+						]
+					}
+				}
+			}
+		});
+		prismaMock.modelReferenceCandidate.aggregate.mockResolvedValue({
+			_max: { pack_version: 6 }
+		});
+		prismaMock.modelReferenceCandidate.findMany.mockResolvedValue([
+			{
+				id: "cand-1",
+				model_id: "model-1",
+				pack_version: 5,
+				shot_code: "left45_closeup",
+				candidate_index: 1,
+				image_gcs_uri: "https://cdn.example.com/cand-1.png",
+				composite_score: "0.91"
+			}
+		]);
+
+		const summary = await getCanonicalPackSummary({ modelId: "model-1", packVersion: 5 });
+
+		expect(summary.status).toBe("READY");
+		expect(summary.generation?.provider).toBe("openai");
+		expect(summary.generation?.candidates_per_shot).toBe(2);
+		expect(summary.generation?.resume_available).toBe(true);
+		expect(summary.generation?.missing_shot_codes).toEqual(["right45_closeup"]);
+	});
+
+	it("stops canonical generation without discarding the current pack state", async () => {
+		prismaMock.aiModel.findUnique.mockResolvedValue({
+			canonical_pack_status: "GENERATING",
+			onboarding_state: {
+				canonical_pack_generation: {
+					job_id: "job-running",
+					pack_version: 7,
+					status: "GENERATING",
+					generation_mode: "remaining",
+					shot_codes: ["left45_closeup", "right45_closeup"],
+					total_shots: 2
+				}
+			}
+		});
+		prismaMock.modelReferenceCandidate.findMany.mockResolvedValue([
+			{
+				shot_code: "left45_closeup"
+			}
+		]);
+		prismaMock.aiModel.update.mockResolvedValue({});
+
+		const stopped = await stopCanonicalPackGeneration({
+			modelId: "model-1",
+			stoppedBy: "admin-1"
+		});
+
+		expect(stopped).toEqual({
+			pack_version: 7,
+			status: "READY"
+		});
+		expect(prismaMock.aiModel.update).toHaveBeenCalledWith(
+			expect.objectContaining({
+				data: expect.objectContaining({
+					canonical_pack_status: "READY",
+					onboarding_state: expect.objectContaining({
+						canonical_pack_versions: expect.objectContaining({
+							"7": expect.objectContaining({
+								pack_version: 7,
+								status: "READY"
+							})
+						})
+					})
+				})
+			})
+		);
 	});
 
 	it("reroutes zai glm canonical generation to nano when identity references are present", () => {

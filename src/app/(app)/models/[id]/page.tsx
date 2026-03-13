@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, usePathname } from "next/navigation";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, Upload } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -72,10 +72,24 @@ type CanonicalPackSummary = {
 	pack_version: number;
 	status: "NOT_STARTED" | "GENERATING" | "READY" | "APPROVED" | "FAILED";
 	error?: string | null;
+	error_request_id?: string | null;
 	progress?: {
 		completed_shots: number;
 		total_shots: number;
 		generated_candidates: number;
+	};
+	generation?: {
+		mode?: "front_only" | "remaining" | "full";
+		provider?: CanonicalProvider;
+		provider_model_id?: string;
+		candidates_per_shot?: number;
+		started_at?: string;
+		heartbeat_at?: string;
+		failed_shots?: number;
+		shot_codes?: string[];
+		resume_available?: boolean;
+		completed_shot_codes?: string[];
+		missing_shot_codes?: string[];
 	};
 	shots: Array<{
 		shot_code: string;
@@ -89,6 +103,17 @@ type CanonicalPackSummary = {
 			status: "CANDIDATE" | "SELECTED" | "REJECTED";
 		}>;
 	}>;
+};
+
+type CanonicalPackHistoryEntry = {
+	pack_version: number;
+	status: "NOT_STARTED" | "GENERATING" | "READY" | "APPROVED" | "FAILED";
+	is_active: boolean;
+	generated_shots: number;
+	generated_candidates: number;
+	selected_shots: number;
+	has_front_anchor: boolean;
+	last_updated_at: string | null;
 };
 
 const FRONT_SHOT_CODE = "frontal_closeup";
@@ -127,16 +152,24 @@ export default function ModelDetailPage() {
 	const [canonicalModelId, setCanonicalModelId] = useState(canonicalProviderModelDefaults.nano_banana_2);
 	const [canonicalCandidatesPerShot, setCanonicalCandidatesPerShot] = useState("1");
 	const [canonicalSummary, setCanonicalSummary] = useState<CanonicalPackSummary | null>(null);
+	const [canonicalPackHistory, setCanonicalPackHistory] = useState<CanonicalPackHistoryEntry[]>([]);
+	const [selectedCanonicalPackVersion, setSelectedCanonicalPackVersion] = useState<number | null>(null);
 	const [selectedCanonicalByShot, setSelectedCanonicalByShot] = useState<Record<string, string>>({});
 	const [previewIndex, setPreviewIndex] = useState<number | null>(null);
 	const [generatingCanonical, setGeneratingCanonical] = useState(false);
 	const [approvingFrontCanonical, setApprovingFrontCanonical] = useState(false);
 	const [approvingCanonical, setApprovingCanonical] = useState(false);
+	const [stoppingCanonical, setStoppingCanonical] = useState(false);
+	const [regeneratingCanonicalCandidateId, setRegeneratingCanonicalCandidateId] = useState<string | null>(null);
+	const [uploadingCanonicalCandidateId, setUploadingCanonicalCandidateId] = useState<string | null>(null);
+	const [pendingCanonicalUploadTarget, setPendingCanonicalUploadTarget] = useState<{ shotCode: string; candidateId: string } | null>(null);
 	const [canonicalBusy, setCanonicalBusy] = useState(false);
 	const [canonicalInfo, setCanonicalInfo] = useState<string | null>(null);
 	const [photoImportSnapshot, setPhotoImportSnapshot] = useState<ModelPhotoImportSnapshot | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [saving, setSaving] = useState(false);
+	const canonicalUploadInputRef = useRef<HTMLInputElement | null>(null);
+	const canonicalSummaryRef = useRef<CanonicalPackSummary | null>(null);
 
 	useEffect(() => {
 		setCanonicalModelId(canonicalProviderModelDefaults[canonicalProvider]);
@@ -146,6 +179,10 @@ export default function ModelDetailPage() {
 		if (model && segmentIndex >= 0) setSegmentTitle(segmentIndex, model.name);
 		return () => (segmentIndex >= 0 ? setSegmentTitle(segmentIndex, null) : undefined);
 	}, [model, segmentIndex, setSegmentTitle]);
+
+	useEffect(() => {
+		canonicalSummaryRef.current = canonicalSummary;
+	}, [canonicalSummary]);
 
 	const statusTone = useMemo(() => {
 		if (!model) return "neutral" as const;
@@ -158,18 +195,27 @@ export default function ModelDetailPage() {
 		async (packVersion?: number, mergeSelection = true) => {
 			const suffix = typeof packVersion === "number" && packVersion > 0 ? `?pack_version=${packVersion}` : "";
 			const summary = await apiRequest<CanonicalPackSummary | null>(`/api/models/${modelId}/workflow/canonical-pack${suffix}`);
-			setCanonicalSummary(summary);
+			const stabilizedSummary = stabilizeCanonicalSummaryPreviewUrls(canonicalSummaryRef.current, summary);
+			canonicalSummaryRef.current = stabilizedSummary;
+			setCanonicalSummary(stabilizedSummary);
+			setSelectedCanonicalPackVersion(stabilizedSummary?.pack_version && stabilizedSummary.pack_version > 0 ? stabilizedSummary.pack_version : null);
 			setSelectedCanonicalByShot(current => {
-				if (summary == null || !Array.isArray(summary.shots)) {
+				if (stabilizedSummary == null || !Array.isArray(stabilizedSummary.shots)) {
 					return mergeSelection ? current : {};
 				}
-				const recommended = buildSelectionMap(summary);
+				const recommended = buildSelectionMap(stabilizedSummary);
 				return mergeSelection ? { ...recommended, ...current } : recommended;
 			});
-			return summary;
+			return stabilizedSummary;
 		},
 		[modelId]
 	);
+
+	const refreshCanonicalPackHistory = useCallback(async () => {
+		const payload = await apiRequest<{ packs: CanonicalPackHistoryEntry[] }>(`/api/models/${modelId}/workflow/canonical-pack/history`);
+		setCanonicalPackHistory(payload.packs ?? []);
+		return payload.packs ?? [];
+	}, [modelId]);
 
 	const load = useCallback(async () => {
 		setError(null);
@@ -257,15 +303,17 @@ export default function ModelDetailPage() {
 			setSavedSocialDraft(cloneForState(nextSocialDraft));
 
 			try {
-				await refreshCanonicalSummary(undefined, false);
+				await refreshCanonicalPackHistory();
+				await refreshCanonicalSummary(selectedCanonicalPackVersion ?? undefined, false);
 			} catch {
 				setCanonicalSummary(null);
+				setCanonicalPackHistory([]);
 				setSelectedCanonicalByShot({});
 			}
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "We couldn't load this Model. Please refresh and try again.");
 		}
-	}, [modelId, refreshCanonicalSummary]);
+	}, [modelId, refreshCanonicalPackHistory, refreshCanonicalSummary, selectedCanonicalPackVersion]);
 
 	useEffect(() => {
 		void load();
@@ -451,7 +499,7 @@ export default function ModelDetailPage() {
 		}
 	}
 
-	async function generateCanonicalReferences(input: { mode: "front_only" | "remaining" | "full"; packVersion?: number }) {
+	async function generateCanonicalReferences(input: { mode: "front_only" | "remaining" | "full"; packVersion?: number; resume?: boolean }) {
 		const photoImportIssue = getPhotoImportAnalysisIssue(photoImportSnapshot);
 		const frontGenerationBlockReason =
 			photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING"
@@ -469,7 +517,17 @@ export default function ModelDetailPage() {
 		setCanonicalBusy(true);
 		setError(null);
 		setCanonicalInfo(
-			input.mode === "front_only" ? "Generating front look options..." : input.mode === "remaining" ? "Generating the remaining reference looks..." : "Starting reference generation..."
+			input.resume
+				? input.mode === "remaining"
+					? `Resuming the remaining reference looks from set v${input.packVersion}...`
+					: input.mode === "front_only"
+						? `Resuming the front look in set v${input.packVersion}...`
+						: `Resuming reference generation in set v${input.packVersion}...`
+				: input.mode === "front_only"
+					? "Generating front look options..."
+					: input.mode === "remaining"
+						? "Generating the remaining reference looks..."
+						: "Starting reference generation..."
 		);
 
 		try {
@@ -485,7 +543,7 @@ export default function ModelDetailPage() {
 					pack_version: input.packVersion
 				})
 			});
-			setCanonicalInfo(`Generation started (set v${started.pack_version}).`);
+			setCanonicalInfo(input.resume ? `Resuming set v${started.pack_version}.` : `Generation started (set v${started.pack_version}).`);
 
 			let finalStatus: CanonicalPackSummary["status"] = "GENERATING";
 			for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -506,13 +564,22 @@ export default function ModelDetailPage() {
 
 			if (finalStatus === "READY" || finalStatus === "APPROVED") {
 				setCanonicalInfo(
-					input.mode === "front_only" ? "Front look ready. Approve one front option, then generate the remaining looks." : "Generation complete. Review and approve one option per angle."
+					input.mode === "front_only"
+						? "Front look ready. Approve one front option, then generate the remaining looks."
+						: input.resume
+							? "Resume complete. Review the new angles and keep going from the current set."
+							: "Generation complete. Review and approve one option per angle."
 				);
 			} else if (finalStatus === "FAILED") {
 				// Try to get the actual error from the latest summary
 				try {
 					const failSummary = await refreshCanonicalSummary(started.pack_version);
-					const failMessage = failSummary?.error ? `Generation failed: ${failSummary.error}` : "Generation failed. Check image engine settings and try again.";
+					const failMessage =
+						failSummary?.generation?.resume_available && failSummary.error
+							? failSummary.error
+							: failSummary?.error
+								? `Generation failed: ${failSummary.error}`
+								: "Generation failed. Check image engine settings and try again.";
 					setCanonicalInfo(failMessage);
 					setError(failMessage);
 				} catch {
@@ -537,6 +604,20 @@ export default function ModelDetailPage() {
 		await generateCanonicalReferences({ mode: "front_only" });
 	}
 
+	async function resumeCanonicalReferences() {
+		if (!canonicalSummary || canonicalSummary.pack_version <= 0) {
+			setError("Refresh the current Reference Set first.");
+			return;
+		}
+
+		const resumeMode = canonicalSummary.generation?.mode ?? (frontShotApproved ? "remaining" : "front_only");
+		await generateCanonicalReferences({
+			mode: resumeMode,
+			packVersion: canonicalSummary.pack_version,
+			resume: true
+		});
+	}
+
 	async function generateRemainingCanonicalReferences() {
 		if (!canonicalSummary || canonicalSummary.pack_version <= 0) {
 			setError("Generate and approve a front look option first.");
@@ -553,6 +634,120 @@ export default function ModelDetailPage() {
 			mode: "remaining",
 			packVersion: canonicalSummary.pack_version
 		});
+	}
+
+	async function selectCanonicalPack(packVersion: number) {
+		setError(null);
+		setCanonicalInfo(`Loading set v${packVersion}...`);
+		try {
+			await refreshCanonicalSummary(packVersion, false);
+			setSelectedCanonicalPackVersion(packVersion);
+			setCanonicalInfo(`Viewing set v${packVersion}.`);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "We couldn't load that Reference Set.");
+		}
+	}
+
+	async function stopCanonicalGeneration() {
+		setStoppingCanonical(true);
+		setCanonicalBusy(true);
+		setError(null);
+		try {
+			const stopped = await apiRequest<{ pack_version: number; status: "READY" | "FAILED" }>(`/api/models/${modelId}/workflow/canonical-pack/stop`, {
+				method: "POST"
+			});
+			await refreshCanonicalPackHistory();
+			await refreshCanonicalSummary(stopped.pack_version, false);
+			setCanonicalInfo(`Generation stopped for set v${stopped.pack_version}. You can resume from the current progress.`);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "We couldn't stop generation right now.");
+		} finally {
+			setStoppingCanonical(false);
+			setCanonicalBusy(false);
+			setGeneratingCanonical(false);
+		}
+	}
+
+	async function regenerateCanonicalShot(shotCode: string, candidateId: string) {
+		if (!canonicalSummary || canonicalSummary.pack_version <= 0) {
+			setError("Open a Reference Set before regenerating an angle.");
+			return;
+		}
+
+		setRegeneratingCanonicalCandidateId(candidateId);
+		setCanonicalBusy(true);
+		setError(null);
+		setCanonicalInfo(`Replacing ${formatShotLabel(shotCode)} in set v${canonicalSummary.pack_version}...`);
+		try {
+			const provider = canonicalSummary.generation?.provider ?? canonicalProvider;
+			const providerModelId = canonicalSummary.generation?.provider_model_id ?? canonicalModelId ?? undefined;
+			const generationMode = canonicalSummary.generation?.mode ?? (shotCode === FRONT_SHOT_CODE ? "front_only" : frontShotApproved ? "remaining" : "full");
+
+			const started = await apiRequest<{ job_id: string; pack_version: number }>(`/api/models/${modelId}/workflow/canonical-pack/generate`, {
+				method: "POST",
+				body: JSON.stringify({
+					provider,
+					model_id: providerModelId,
+					pack_template: "balanced_8",
+					candidates_per_shot: 1,
+					style: "strict_studio",
+					generation_mode: generationMode,
+					pack_version: canonicalSummary.pack_version,
+					shot_codes: [shotCode],
+					candidate_id: candidateId,
+					regenerate_existing: true
+				})
+			});
+
+			await refreshCanonicalPackHistory();
+			await refreshCanonicalSummary(started.pack_version, true);
+			setCanonicalInfo(`Replacing ${formatShotLabel(shotCode)} in set v${started.pack_version}.`);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "We couldn't regenerate this angle.");
+		} finally {
+			setRegeneratingCanonicalCandidateId(null);
+			setCanonicalBusy(false);
+		}
+	}
+
+	function promptCanonicalUpload(shotCode: string, candidateId: string) {
+		setPendingCanonicalUploadTarget({ shotCode, candidateId });
+		canonicalUploadInputRef.current?.click();
+	}
+
+	async function handleCanonicalUploadChange(event: React.ChangeEvent<HTMLInputElement>) {
+		const file = event.target.files?.[0];
+		const uploadTarget = pendingCanonicalUploadTarget;
+		event.target.value = "";
+		if (!file || !uploadTarget || !canonicalSummary || canonicalSummary.pack_version <= 0) {
+			setPendingCanonicalUploadTarget(null);
+			return;
+		}
+
+		setUploadingCanonicalCandidateId(uploadTarget.candidateId);
+		setCanonicalBusy(true);
+		setError(null);
+		try {
+			const imageDataUrl = await readFileAsDataUrl(file);
+			await apiRequest<{ candidate_id: string }>(`/api/models/${modelId}/workflow/canonical-pack/upload`, {
+				method: "POST",
+				body: JSON.stringify({
+					pack_version: canonicalSummary.pack_version,
+					shot_code: uploadTarget.shotCode,
+					candidate_id: uploadTarget.candidateId,
+					image_data_url: imageDataUrl
+				})
+			});
+			await refreshCanonicalPackHistory();
+			await refreshCanonicalSummary(canonicalSummary.pack_version, true);
+			setCanonicalInfo(`Updated ${formatShotLabel(uploadTarget.shotCode)} in set v${canonicalSummary.pack_version}.`);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "We couldn't upload that image.");
+		} finally {
+			setPendingCanonicalUploadTarget(null);
+			setUploadingCanonicalCandidateId(null);
+			setCanonicalBusy(false);
+		}
 	}
 
 	async function approveFrontCanonicalCandidate() {
@@ -736,6 +931,13 @@ export default function ModelDetailPage() {
 	}, [canonicalSummary]);
 
 	const canonicalStatus = canonicalSummary?.status ?? model?.canonical_pack_status ?? "NOT_STARTED";
+	const canonicalResumeAvailable = Boolean(canonicalSummary?.generation?.resume_available && canonicalSummary.pack_version > 0);
+	const canonicalResumeMode = canonicalSummary?.generation?.mode ?? (frontShotApproved ? "remaining" : "front_only");
+	const canonicalMissingShotCount = canonicalSummary?.generation?.missing_shot_codes?.length ?? 0;
+	const activeCanonicalPackEntry = useMemo(
+		() => canonicalPackHistory.find(pack => pack.pack_version === canonicalSummary?.pack_version) ?? null,
+		[canonicalPackHistory, canonicalSummary?.pack_version]
+	);
 	const metadataDirty = useMemo(
 		() => modelName.trim() !== savedModelName.trim() || modelDescription.trim() !== savedModelDescription.trim(),
 		[modelDescription, modelName, savedModelDescription, savedModelName]
@@ -764,19 +966,13 @@ export default function ModelDetailPage() {
 
 		return canonicalSummary.shots
 			.map(shot => {
-				const selectedCandidateId =
-					selectedCanonicalByShot[shot.shot_code] ??
-					shot.candidates.find(candidate => candidate.status === "SELECTED")?.id ??
-					shot.recommended_candidate_id ??
-					"";
+				const selectedCandidateId = selectedCanonicalByShot[shot.shot_code] ?? shot.candidates.find(candidate => candidate.status === "SELECTED")?.id ?? shot.recommended_candidate_id ?? "";
 				if (!selectedCandidateId) return null;
 
 				const selectedCandidate = shot.candidates.find(candidate => candidate.id === selectedCandidateId);
 				if (!selectedCandidate) return null;
 
-				const matchingReference = (model?.canonical_references ?? []).find(
-					reference => reference.pack_version === canonicalSummary.pack_version && reference.shot_code === shot.shot_code
-				);
+				const matchingReference = (model?.canonical_references ?? []).find(reference => reference.pack_version === canonicalSummary.pack_version && reference.shot_code === shot.shot_code);
 				const previewUri = resolveCandidatePreviewUri(selectedCandidate) ?? resolveAssetPreviewUri(matchingReference?.reference_image_url);
 
 				return {
@@ -907,7 +1103,7 @@ export default function ModelDetailPage() {
 			/>
 
 			{!model && !error ? <StateBlock title="Loading Model profile..." /> : null}
-			{error ? <StateBlock tone="error" title="Model update issue" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Model update issue" description={error} /> : null}
 
 			{model ? (
 				<>
@@ -928,13 +1124,7 @@ export default function ModelDetailPage() {
 							<Input value={modelName} onChange={event => setModelName(event.target.value)} minLength={2} maxLength={50} placeholder="Model name" />
 						</FormField>
 						<FormField label="Description">
-							<Textarea
-								value={modelDescription}
-								onChange={event => setModelDescription(event.target.value)}
-								rows={2}
-								maxLength={500}
-								placeholder="Describe the model's style and positioning..."
-							/>
+							<Textarea value={modelDescription} onChange={event => setModelDescription(event.target.value)} rows={2} maxLength={500} placeholder="Describe the model's style and positioning..." />
 						</FormField>
 					</div>
 					<div className="flex flex-wrap items-center justify-between gap-2">
@@ -1011,6 +1201,7 @@ export default function ModelDetailPage() {
 			/>
 
 			<FormShell title="Reference Studio" description="Imported photos and reference set curation are managed together here.">
+				<input ref={canonicalUploadInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={event => void handleCanonicalUploadChange(event)} />
 				{model ? (
 					<div className="mb-4 rounded-xl border border-border bg-card/75 p-3">
 						<ModelPhotoImporter
@@ -1036,7 +1227,7 @@ export default function ModelDetailPage() {
 						title={
 							photoImportSnapshot?.status === "UPLOADING" || photoImportSnapshot?.status === "ANALYZING"
 								? "Photo analysis is still running"
-								: photoImportIssue?.title ?? "Photo analysis needs attention"
+								: (photoImportIssue?.title ?? "Photo analysis needs attention")
 						}
 						description={frontGenerationBlockReason ?? photoImportIssue?.description ?? "Review the imported photos before generating."}
 					/>
@@ -1058,20 +1249,67 @@ export default function ModelDetailPage() {
 						<Input value={canonicalCandidatesPerShot} onChange={event => setCanonicalCandidatesPerShot(event.target.value)} inputMode="numeric" />
 					</FormField>
 					<div>
-						<Button className="w-full" type="button" onClick={() => void generateFrontCanonicalReferences()} disabled={canonicalBusy || Boolean(frontGenerationBlockReason)}>
-							{generatingCanonical ? "Generating..." : frontShot?.candidates.length ? "Regenerate Front Look" : "Generate Front Look"}
+						<Button
+							className="w-full"
+							type="button"
+							onClick={() => void (canonicalResumeAvailable && !frontShotApproved ? resumeCanonicalReferences() : generateFrontCanonicalReferences())}
+							disabled={canonicalBusy || Boolean(frontGenerationBlockReason)}>
+							{generatingCanonical
+								? "Generating..."
+								: canonicalResumeAvailable && !frontShotApproved
+									? "Resume Front Look"
+									: frontShot?.candidates.length
+										? "Regenerate Front Look"
+										: "Generate Front Look"}
 						</Button>
 					</div>
 				</div>
 
 				<div className="mb-2 flex flex-wrap items-center justify-between gap-2">
 					<p className="text-xs text-muted-foreground">
-						{totalCanonicalShots > 0
-							? `Selection progress: ${selectedCanonicalCount}/${totalCanonicalShots} angles picked`
-							: "Generate a set to start selecting one option per angle."}
+						{totalCanonicalShots > 0 ? `Selection progress: ${selectedCanonicalCount}/${totalCanonicalShots} angles picked` : "Generate a set to start selecting one option per angle."}
 					</p>
 					<Badge tone={canonicalStatus === "APPROVED" ? "success" : canonicalStatus === "FAILED" ? "danger" : "warning"}>{humanizeStatusLabel(canonicalStatus)}</Badge>
 				</div>
+
+				{canonicalPackHistory.length > 0 ? (
+					<div className="mb-3 grid gap-3 rounded-xl border border-border bg-card/55 p-3 md:grid-cols-[minmax(0,220px)_1fr]">
+						<FormField label="Pack Version">
+							<SelectField
+								value={String(selectedCanonicalPackVersion ?? canonicalSummary?.pack_version ?? canonicalPackHistory[0]?.pack_version ?? "")}
+								onChange={event => {
+									const next = Number(event.target.value || "0");
+									if (next > 0) {
+										void selectCanonicalPack(next);
+									}
+								}}>
+								{canonicalPackHistory.map(pack => (
+									<option key={pack.pack_version} value={pack.pack_version}>
+										{`Set v${pack.pack_version} · ${humanizeStatusLabel(pack.status)}`}
+									</option>
+								))}
+							</SelectField>
+						</FormField>
+						<div className="grid gap-2 sm:grid-cols-4">
+							<div className="rounded-lg border border-border/70 bg-card/80 p-2">
+								<p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Generated</p>
+								<p className="mt-1 text-sm font-medium">{activeCanonicalPackEntry ? `${activeCanonicalPackEntry.generated_shots} shots` : "--"}</p>
+							</div>
+							<div className="rounded-lg border border-border/70 bg-card/80 p-2">
+								<p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Candidates</p>
+								<p className="mt-1 text-sm font-medium">{activeCanonicalPackEntry?.generated_candidates ?? "--"}</p>
+							</div>
+							<div className="rounded-lg border border-border/70 bg-card/80 p-2">
+								<p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Front anchor</p>
+								<p className="mt-1 text-sm font-medium">{activeCanonicalPackEntry?.has_front_anchor ? "Approved" : "Not locked"}</p>
+							</div>
+							<div className="rounded-lg border border-border/70 bg-card/80 p-2">
+								<p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Active</p>
+								<p className="mt-1 text-sm font-medium">{activeCanonicalPackEntry?.is_active ? "Current pack" : "History"}</p>
+							</div>
+						</div>
+					</div>
+				) : null}
 
 				<div className="mb-4 flex flex-wrap items-center gap-2">
 					{canonicalSummary?.status === "READY" && frontShot && frontShot.candidates.length > 0 && !frontShotApproved ? (
@@ -1079,9 +1317,17 @@ export default function ModelDetailPage() {
 							{approvingFrontCanonical ? "Approving Front..." : "Approve Front Option"}
 						</Button>
 					) : null}
-					{frontShotApproved && canonicalSummary?.status === "READY" ? (
-						<Button type="button" variant="secondary" onClick={() => void generateRemainingCanonicalReferences()} disabled={canonicalBusy}>
-							{generatingCanonical ? "Generating..." : hasRemainingCandidates ? "Regenerate Remaining Looks" : "Generate Remaining Looks"}
+					{frontShotApproved && (canonicalSummary?.status === "READY" || canonicalResumeAvailable) ? (
+						<Button type="button" variant="secondary" onClick={() => void (canonicalResumeAvailable ? resumeCanonicalReferences() : generateRemainingCanonicalReferences())} disabled={canonicalBusy}>
+							{generatingCanonical
+								? "Generating..."
+								: canonicalResumeAvailable
+									? canonicalResumeMode === "remaining"
+										? "Resume Remaining Looks"
+										: "Resume Reference Set"
+									: hasRemainingCandidates
+										? "Regenerate Remaining Looks"
+										: "Generate Remaining Looks"}
 						</Button>
 					) : null}
 					{canonicalSummary?.status === "READY" ? (
@@ -1097,17 +1343,36 @@ export default function ModelDetailPage() {
 					<Button type="button" variant="ghost" onClick={() => void (canonicalSummary?.pack_version ? refreshCanonicalSummary(canonicalSummary.pack_version) : load())} disabled={canonicalBusy}>
 						Refresh
 					</Button>
+					{canonicalSummary?.status === "GENERATING" ? (
+						<Button type="button" variant="secondary" onClick={() => void stopCanonicalGeneration()} disabled={canonicalBusy}>
+							{stoppingCanonical ? "Stopping..." : "Stop Generation"}
+						</Button>
+					) : null}
 				</div>
 
 				{canonicalSummary?.status === "GENERATING" || generatingCanonical ? (
 					<StateBlock tone="neutral" title="Reference generation is running" description={canonicalInfo ?? "The gallery refreshes every few seconds while options are generated."} />
 				) : null}
 
-				{canonicalStatus === "FAILED" ? (
+				{canonicalSummary?.error && canonicalSummary?.status !== "GENERATING" ? (
 					<StateBlock
-						tone="error"
-						title="Reference set generation failed"
-						description={canonicalSummary?.error || canonicalInfo || "Something went wrong. Check image engine settings and try again."}
+						tone={canonicalResumeAvailable ? "warning" : canonicalStatus === "FAILED" ? "danger" : "warning"}
+						title={canonicalResumeAvailable ? "Reference generation paused" : canonicalStatus === "FAILED" ? "Reference set generation failed" : "Reference generation needs attention"}
+						description={
+							canonicalResumeAvailable ? (
+								<>
+									<p>{`${canonicalSummary.error}${canonicalMissingShotCount > 0 ? ` Missing ${canonicalMissingShotCount} angle${canonicalMissingShotCount === 1 ? "" : "s"}.` : ""}`}</p>
+									{canonicalSummary.error_request_id ? <p className="mt-2 font-mono text-[11px] opacity-80">{`Request ID: ${canonicalSummary.error_request_id}`}</p> : null}
+								</>
+							) : canonicalSummary.error_request_id ? (
+								<>
+									<p>{canonicalSummary.error || canonicalInfo || "Something went wrong. Check image engine settings and try again."}</p>
+									<p className="mt-2 font-mono text-[11px] opacity-80">{`Request ID: ${canonicalSummary.error_request_id}`}</p>
+								</>
+							) : (
+								canonicalSummary.error || canonicalInfo || "Something went wrong. Check image engine settings and try again."
+							)
+						}
 					/>
 				) : null}
 
@@ -1115,7 +1380,7 @@ export default function ModelDetailPage() {
 					<div className="mb-4 space-y-2 rounded-xl border border-border bg-card p-3">
 						<p className="text-xs font-subheader">{`Reference Set v${canonicalSummary.pack_version} (${humanizeStatusLabel(canonicalSummary.status)})`}</p>
 						{canonicalProgress ? (
-								<div className="rounded-md border border-border bg-card/75 p-2">
+							<div className="rounded-md border border-border bg-card/75 p-2">
 								<p className="text-[11px] text-muted-foreground">{`${canonicalProgress.completedShots}/${canonicalProgress.totalShots} angles ready · ${canonicalProgress.generatedCandidates} options ready`}</p>
 								<div className="mt-2 h-2 overflow-hidden rounded-full bg-muted/60">
 									<div className="h-full rounded-full bg-[var(--color-primary)] transition-all duration-500" style={{ width: `${Math.max(6, Math.min(100, canonicalProgress.ratio * 100))}%` }} />
@@ -1131,10 +1396,24 @@ export default function ModelDetailPage() {
 										{group.types.map(typeItem => {
 											const candidate = typeItem.candidate;
 											if (!candidate) {
-												return (
+												return canonicalSummary.status === "GENERATING" ? (
+													<div key={`${group.candidateIndex}-${typeItem.shotCode}`} className="rounded-md border border-border bg-card/85 p-3">
+														<p className="mb-2 text-[10px] font-medium text-muted-foreground">{formatShotLabel(typeItem.shotCode)}</p>
+														<SquareImageThumbnail
+															src={null}
+															alt={`${formatShotLabel(typeItem.shotCode)} generation pending`}
+															placeholder="Preview unavailable"
+															containerClassName="rounded-lg"
+															loading
+															loadingTitle="Rendering this angle"
+															loadingDescription={`Option ${group.candidateIndex} is still being generated for this shot.`}
+															loadingBadge={`Option ${group.candidateIndex}`}
+														/>
+													</div>
+												) : (
 													<div key={`${group.candidateIndex}-${typeItem.shotCode}`} className="rounded-md border border-dashed border-border bg-card/70 p-3 text-[11px] text-muted-foreground">
 														<p className="font-medium">{formatShotLabel(typeItem.shotCode)}</p>
-														<p className="mt-1">{canonicalSummary.status === "GENERATING" ? "Still generating this angle..." : "No image for this angle."}</p>
+														<p className="mt-1">No image for this angle.</p>
 													</div>
 												);
 											}
@@ -1142,42 +1421,94 @@ export default function ModelDetailPage() {
 											const selected = selectedCanonicalByShot[typeItem.shotCode] === candidate.id;
 											const score = Number(candidate.composite_score ?? 0);
 											const previewUri = resolveCandidatePreviewUri(candidate);
+											const statusBadges =
+												selected && typeItem.isRecommended
+													? [
+															<span key="selected-recommended" className={candidateStatusBadgeClassNames("recommended")}>
+																Selected + Recommended
+															</span>
+														]
+													: [
+															typeItem.isRecommended ? (
+																<span key="recommended" className={candidateStatusBadgeClassNames("recommended")}>
+																	Recommended
+																</span>
+															) : null,
+															selected ? (
+																<span key="selected" className={candidateStatusBadgeClassNames("selected")}>
+																	Selected
+																</span>
+															) : null
+														].filter(Boolean);
 
 											return (
-												<button
+												<div
 													key={candidate.id}
-													type="button"
-													onClick={() =>
-														setSelectedCanonicalByShot(current => ({
-															...current,
-															[typeItem.shotCode]: candidate.id
-														}))
-													}
-													className={`rounded-md border p-2 text-left transition ${
-									selected ? "border-[var(--color-primary)] bg-[color:color-mix(in_oklab,var(--color-primary),transparent_88%)]" : "border-border bg-card hover:border-[var(--color-primary)]"
+													className={`group rounded-md border p-2 text-left transition ${
+														selected
+															? "border-[color:color-mix(in_oklab,var(--color-primary),transparent_38%)] bg-[color:color-mix(in_oklab,var(--color-primary),transparent_92%)]"
+															: "border-border bg-card hover:border-[color:color-mix(in_oklab,var(--color-primary),transparent_58%)]"
 													}`}>
 													<p className="mb-1 text-[10px] font-medium text-muted-foreground">{formatShotLabel(typeItem.shotCode)}</p>
-													<SquareImageThumbnail
-														src={previewUri}
-														alt={`Option ${candidate.candidate_index} ${formatShotLabel(typeItem.shotCode)}`}
-														placeholder="Preview unavailable"
-														containerClassName="mb-1"
-														expandButton={{
-															"aria-label": "Expand image",
-															onExpand: () => {
-																const idx = previewCandidates.findIndex(item => item.id === candidate.id);
-																if (idx >= 0) setPreviewIndex(idx);
+													<div className="relative mb-1">
+														<button
+															type="button"
+															onClick={() =>
+																setSelectedCanonicalByShot(current => ({
+																	...current,
+																	[typeItem.shotCode]: candidate.id
+																}))
 															}
-														}}
-													/>
-													<div className="flex items-center justify-between gap-2">
-														<p className="text-[10px] text-muted-foreground">{`Score: ${score.toFixed(3)}`}</p>
-														<div className="flex items-center gap-1.5">
-															{typeItem.isRecommended ? <Badge tone="success">Recommended</Badge> : null}
-															{selected ? <Badge tone="warning">Selected</Badge> : null}
+															className="block w-full text-left">
+															<SquareImageThumbnail
+																src={previewUri}
+																alt={`Option ${candidate.candidate_index} ${formatShotLabel(typeItem.shotCode)}`}
+																placeholder="Preview unavailable"
+																expandButton={{
+																	"aria-label": "Expand image",
+																	onExpand: () => {
+																		const idx = previewCandidates.findIndex(item => item.id === candidate.id);
+																		if (idx >= 0) setPreviewIndex(idx);
+																	}
+																}}
+															/>
+														</button>
+														<div className="absolute left-2 top-2 z-20 flex items-center gap-1.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
+															<Button
+																type="button"
+																size="icon-sm"
+																variant="secondary"
+																aria-label={`Regenerate ${formatShotLabel(typeItem.shotCode)}`}
+																title="Regenerate"
+																className="h-8 w-8 rounded-full border-border/60 bg-card/88 text-foreground shadow-sm backdrop-blur-sm hover:bg-card"
+																onClick={event => {
+																	event.stopPropagation();
+																	void regenerateCanonicalShot(typeItem.shotCode, candidate.id);
+																}}
+																disabled={canonicalBusy}>
+																<RefreshCw className={`h-3.5 w-3.5 ${regeneratingCanonicalCandidateId === candidate.id ? "animate-spin" : ""}`} />
+															</Button>
+															<Button
+																type="button"
+																size="icon-sm"
+																variant="secondary"
+																aria-label={`Upload replacement for ${formatShotLabel(typeItem.shotCode)}`}
+																title="Upload fixed image"
+																className="h-8 w-8 rounded-full border-border/60 bg-card/88 text-foreground shadow-sm backdrop-blur-sm hover:bg-card"
+																onClick={event => {
+																	event.stopPropagation();
+																	promptCanonicalUpload(typeItem.shotCode, candidate.id);
+																}}
+																disabled={canonicalBusy}>
+																<Upload className={`h-3.5 w-3.5 ${uploadingCanonicalCandidateId === candidate.id ? "animate-pulse" : ""}`} />
+															</Button>
 														</div>
 													</div>
-												</button>
+													<div className="flex items-start justify-between gap-2">
+														<p className="text-[10px] text-muted-foreground">{`Score: ${score.toFixed(3)}`}</p>
+														<div className="flex max-w-[72%] flex-wrap justify-end gap-1">{statusBadges}</div>
+													</div>
+												</div>
 											);
 										})}
 									</div>
@@ -1198,11 +1529,7 @@ export default function ModelDetailPage() {
 										<Badge tone="warning">{`Option #${card.candidateIndex}`}</Badge>
 									</div>
 									{card.previewUri ? (
-										<SquareImageThumbnail
-											src={card.previewUri}
-											alt={`${formatShotLabel(card.shotCode)} selected reference`}
-											containerClassName="rounded-lg border-border"
-										/>
+										<SquareImageThumbnail src={card.previewUri} alt={`${formatShotLabel(card.shotCode)} selected reference`} containerClassName="rounded-lg border-border" />
 									) : (
 										<div className="rounded-lg border border-dashed border-border bg-card p-3 text-xs text-muted-foreground">Preview unavailable for this angle.</div>
 									)}
@@ -1306,9 +1633,7 @@ export default function ModelDetailPage() {
 													key={`candidate-modal-${candidateNumber}`}
 													type="button"
 													className={`w-full rounded-xl border px-3 py-2 text-left transition ${
-														isActive
-															? "border-primary/70 bg-primary/20 text-primary-foreground"
-															: "border-border/70 bg-muted/60 text-muted-foreground hover:border-primary/30 hover:bg-muted/70"
+														isActive ? "border-primary/70 bg-primary/20 text-primary-foreground" : "border-border/70 bg-muted/60 text-muted-foreground hover:border-primary/30 hover:bg-muted/70"
 													}`}
 													onClick={() => setPreviewByCandidateAndType(candidateNumber, activeShotCode ?? undefined)}>
 													<p className="text-xs font-semibold">{`Option #${candidateNumber}`}</p>
@@ -1359,9 +1684,7 @@ export default function ModelDetailPage() {
 													key={`type-modal-${item.id}`}
 													type="button"
 													className={`rounded-xl border p-1.5 text-left transition ${
-														isActive
-															? "border-primary/75 bg-primary/20 text-primary-foreground"
-															: "border-border/70 bg-muted/60 text-foreground hover:border-primary/35 hover:bg-muted/70"
+														isActive ? "border-primary/75 bg-primary/20 text-primary-foreground" : "border-border/70 bg-muted/60 text-foreground hover:border-primary/35 hover:bg-muted/70"
 													}`}
 													onClick={() => {
 														if (activeCandidateNumber == null) return;
@@ -1411,6 +1734,53 @@ function compactPathLabel(path: string, maxLength = 82): string {
 	return `${head}...${tail}`;
 }
 
+function stabilizeCanonicalSummaryPreviewUrls(previous: CanonicalPackSummary | null, next: CanonicalPackSummary | null): CanonicalPackSummary | null {
+	if (!previous || !next || previous.pack_version !== next.pack_version) {
+		return next;
+	}
+
+	const previousPreviewByCandidateId = new Map<string, { imageGcsUri: string; previewUrl: string }>();
+	const previousPreviewByAssetUri = new Map<string, string>();
+	for (const shot of previous.shots) {
+		for (const candidate of shot.candidates) {
+			const previewUrl = candidate.preview_image_url?.trim();
+			if (!previewUrl) continue;
+			previousPreviewByCandidateId.set(candidate.id, {
+				imageGcsUri: candidate.image_gcs_uri,
+				previewUrl
+			});
+			previousPreviewByAssetUri.set(candidate.image_gcs_uri, previewUrl);
+		}
+	}
+
+	return {
+		...next,
+		shots: next.shots.map(shot => ({
+			...shot,
+			candidates: shot.candidates.map(candidate => ({
+				...candidate,
+				preview_image_url: (() => {
+					const previousCandidatePreview = previousPreviewByCandidateId.get(candidate.id);
+					if (previousCandidatePreview && previousCandidatePreview.imageGcsUri === candidate.image_gcs_uri) {
+						return previousCandidatePreview.previewUrl;
+					}
+
+					return previousPreviewByAssetUri.get(candidate.image_gcs_uri) ?? candidate.preview_image_url ?? null;
+				})()
+			}))
+		}))
+	};
+}
+
+function candidateStatusBadgeClassNames(tone: "selected" | "recommended"): string {
+	return [
+		"inline-flex items-center rounded-sm border px-1.25 py-0.5 text-[8.5px] font-medium leading-none tracking-normal",
+		tone === "recommended"
+			? "border-[color:color-mix(in_oklab,var(--status-success-border),transparent_18%)] bg-[color:color-mix(in_oklab,var(--status-success-bg),white_18%)] text-[color:color-mix(in_oklab,var(--status-success),black_8%)]"
+			: "border-[color:color-mix(in_oklab,var(--foreground),transparent_86%)] bg-[color:color-mix(in_oklab,var(--accent),transparent_82%)] text-[color:color-mix(in_oklab,var(--foreground),transparent_22%)]"
+	].join(" ");
+}
+
 function buildSelectionMap(summary: CanonicalPackSummary | null): Record<string, string> {
 	if (summary == null || !Array.isArray(summary.shots)) return {};
 	const selected: Record<string, string> = {};
@@ -1435,4 +1805,13 @@ function resolveAssetPreviewUri(source: string | null | undefined): string | nul
 	if (normalized.startsWith("data:image/")) return normalized;
 	if (normalized.startsWith("http://") || normalized.startsWith("https://")) return normalized;
 	return null;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(reader.result as string);
+		reader.onerror = reject;
+		reader.readAsDataURL(file);
+	});
 }

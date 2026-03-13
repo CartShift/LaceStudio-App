@@ -124,7 +124,7 @@ export default function AuditPage() {
 			</FilterShell>
 
 			{loading ? <StateBlock title="Loading audit log..." /> : null}
-			{error ? <StateBlock tone="error" title="Audit loading failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Audit loading failed" description={error} /> : null}
 
 			<TableShell title="Audit Entries" description="Recent audit events." rows={rows} columns={columns} rowKey={row => row.id} emptyMessage="No audit events found." />
 		</div>

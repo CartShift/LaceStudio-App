@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  CAMPAIGN_VIDEO_DURATION_VALUES,
+  CAMPAIGN_VIDEO_SCOPE_VALUES,
+} from "@/lib/campaign-video";
 
 export const imageModelProviderSchema = z.enum(["gpu", "openai", "nano_banana_2", "zai_glm"]);
 
@@ -138,6 +142,16 @@ export const moderationControlsSchema = z.object({
   auto_flag_artifacts: z.boolean().default(true),
 });
 
+export const campaignVideoControlsSchema = z.object({
+  enabled: z.boolean().default(false),
+  generation_scope: z.enum(CAMPAIGN_VIDEO_SCOPE_VALUES).default("all_images"),
+  duration_seconds: z.union([
+    z.literal(CAMPAIGN_VIDEO_DURATION_VALUES[0]),
+    z.literal(CAMPAIGN_VIDEO_DURATION_VALUES[1]),
+  ]).default(8),
+  prompt_text: z.string().trim().max(500).optional(),
+});
+
 export const creativeControlsSchema = z.object({
   reference_board: referenceBoardSchema.default({
     items: [],
@@ -218,6 +232,12 @@ export const creativeControlsSchema = z.object({
     require_approval: true,
     quality_score_threshold: 82,
     auto_flag_artifacts: true,
+  }),
+  video: campaignVideoControlsSchema.default({
+    enabled: false,
+    generation_scope: "all_images",
+    duration_seconds: 8,
+    prompt_text: "",
   }),
 });
 

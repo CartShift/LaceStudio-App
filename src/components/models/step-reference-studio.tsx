@@ -223,7 +223,7 @@ export function StepReferenceStudio({
           </div>
         </div>
 
-        <div className="rounded-[1.55rem] border border-border/70 bg-[linear-gradient(150deg,color-mix(in_oklab,var(--card),white_18%),color-mix(in_oklab,var(--accent),transparent_72%))] p-4 shadow-[var(--shadow-soft)]">
+        <div className="rounded-3xl border border-border/70 bg-[linear-gradient(150deg,color-mix(in_oklab,var(--card),white_18%),color-mix(in_oklab,var(--accent),transparent_72%))] p-4 shadow-[var(--shadow-soft)]">
           <div className="flex items-start justify-between gap-3">
             <div>
               <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Current Anchor</p>
@@ -242,7 +242,7 @@ export function StepReferenceStudio({
           </div>
 
           {selectedFrontCandidate && selectedFrontPreview ? (
-            <div className="mt-4 rounded-[1.2rem] border border-border/70 bg-background/76 p-3">
+            <div className="mt-4 rounded-xl border border-border/70 bg-background/76 p-3">
               <SquareImageThumbnail src={selectedFrontPreview} alt="Front anchor preview" containerClassName="rounded-[1rem]" placeholder="Preview unavailable" />
               <div className="mt-3 flex items-center justify-between gap-2">
                 <div>
@@ -254,8 +254,27 @@ export function StepReferenceStudio({
                 <Badge tone={frontApproved ? "success" : "neutral"}>{Number(selectedFrontCandidate.composite_score ?? 0).toFixed(3)}</Badge>
               </div>
             </div>
+          ) : generating ? (
+            <div className="mt-4 rounded-xl border border-border/70 bg-background/76 p-3">
+              <SquareImageThumbnail
+                src={null}
+                alt="Generating front anchor"
+                containerClassName="rounded-[1rem]"
+                loading
+                loadingTitle="Generating front look"
+                loadingDescription="The first identity lock preview will appear here as soon as the render finishes."
+                loadingBadge="Front pass"
+              />
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold">Building the anchor</p>
+                  <p className="text-[11px] text-muted-foreground">Stay on this step. The front look is the face-preserving base for every other angle.</p>
+                </div>
+                <Badge tone="warning">Rendering</Badge>
+              </div>
+            </div>
           ) : (
-            <div className="mt-4 rounded-[1.2rem] border border-dashed border-border/70 bg-background/55 p-4 text-[11px] text-muted-foreground">
+            <div className="mt-4 rounded-xl border border-dashed border-border/70 bg-background/55 p-4 text-[11px] text-muted-foreground">
               No front anchor yet. Start with a frontal close-up and approve the result that best preserves your identity.
             </div>
           )}
@@ -298,10 +317,23 @@ export function StepReferenceStudio({
                 {group.types.map((typeItem) => {
                   const candidate = typeItem.candidate;
                   if (!candidate) {
-                    return (
+                    return summary.status === "GENERATING" ? (
+                      <div key={`${group.candidateIndex}-${typeItem.shotCode}`} className="rounded-2xl border border-border/70 bg-card/85 p-3">
+                        <p className="mb-2 text-xs font-subheader">{typeItem.shotCode.replaceAll("_", " ")}</p>
+                        <SquareImageThumbnail
+                          src={null}
+                          alt={`${typeItem.shotCode} generation pending`}
+                          containerClassName="rounded-xl"
+                          loading
+                          loadingTitle="Rendering this angle"
+                          loadingDescription={`Option ${group.candidateIndex} is still being generated for this shot.`}
+                          loadingBadge={`Option ${group.candidateIndex}`}
+                        />
+                      </div>
+                    ) : (
                       <div key={`${group.candidateIndex}-${typeItem.shotCode}`} className="rounded-2xl border border-dashed border-border bg-card p-3 text-[11px] text-muted-foreground">
                         <p className="font-medium">{typeItem.shotCode.replaceAll("_", " ")}</p>
-                        <p className="mt-1">{summary.status === "GENERATING" ? "This angle is still being created..." : "No image for this angle."}</p>
+                        <p className="mt-1">No image for this angle.</p>
                       </div>
                     );
                   }
@@ -555,7 +587,7 @@ function StudioStage({
   tone: "neutral" | "warning" | "success" | "danger";
 }) {
   return (
-    <div className="rounded-[1.3rem] border border-border/70 bg-card/80 p-3 shadow-[var(--shadow-soft)]">
+    <div className="rounded-2xl border border-border/70 bg-card/80 p-3 shadow-[var(--shadow-soft)]">
       <div className="flex items-center gap-2">
         <span className="inline-flex size-8 items-center justify-center rounded-full border border-border/70 bg-background/80 text-foreground">
           {icon}

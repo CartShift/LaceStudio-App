@@ -95,7 +95,7 @@ export default function SettingsPage() {
 			/>
 
 			{loading ? <StateBlock title="Loading settings…" /> : null}
-			{error ? <StateBlock tone="error" title="Settings error" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Settings error" description={error} /> : null}
 
 			<FormShell title="Publishing Policy" description="Toggle whether every scheduled post must pass admin approval.">
 				<div className="space-y-4">

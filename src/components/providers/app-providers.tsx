@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ThemeProvider } from "next-themes";
 import { useState } from "react";
 import { NoticeProvider } from "@/components/providers/notice-provider";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Toaster } from "@/components/ui/sonner";
 
 function makeQueryClient() {
 	return new QueryClient({
@@ -23,7 +25,10 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
 	return (
 		<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
 			<QueryClientProvider client={queryClient}>
-				<NoticeProvider>{children}</NoticeProvider>
+				<TooltipProvider>
+					<NoticeProvider>{children}</NoticeProvider>
+					<Toaster position="bottom-right" />
+				</TooltipProvider>
 			</QueryClientProvider>
 		</ThemeProvider>
 	);

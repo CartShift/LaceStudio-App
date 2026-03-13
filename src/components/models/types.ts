@@ -90,6 +90,7 @@ export type CanonicalPackSummary = {
   pack_version: number;
   status: "NOT_STARTED" | "GENERATING" | "READY" | "APPROVED" | "FAILED";
   error?: string | null;
+  error_request_id?: string | null;
   progress?: {
     completed_shots: number;
     total_shots: number;
@@ -99,10 +100,14 @@ export type CanonicalPackSummary = {
     mode?: "front_only" | "remaining" | "full";
     provider?: "openai" | "nano_banana_2" | "zai_glm" | "gpu";
     provider_model_id?: string;
+    candidates_per_shot?: number;
     started_at?: string;
     heartbeat_at?: string;
     failed_shots?: number;
     shot_codes?: string[];
+    resume_available?: boolean;
+    completed_shot_codes?: string[];
+    missing_shot_codes?: string[];
     current_shot_code?: string;
     current_shot_started_at?: string;
   };
@@ -158,7 +163,7 @@ export type ModelPhotoImportSnapshot = {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
-  analysis_provider: "zai_vision" | "gemini_fallback" | "heuristic" | null;
+  analysis_provider: "zai_vision" | "openai_vision" | "gemini_fallback" | "heuristic" | null;
   counts: {
     pending: number;
     accepted: number;

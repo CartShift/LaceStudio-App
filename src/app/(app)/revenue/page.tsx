@@ -192,7 +192,7 @@ export default function RevenuePage() {
 			/>
 
 			{loading ? <StateBlock title="Loading revenue data..." /> : null}
-			{error ? <StateBlock tone="error" title="Revenue operation failed" description={error} /> : null}
+			{error ? <StateBlock tone="danger" title="Revenue operation failed" description={error} /> : null}
 
 			<div className="grid gap-4 lg:grid-cols-2">
 				<FormShell title="Create Contract" description="Add a contract for a client.">

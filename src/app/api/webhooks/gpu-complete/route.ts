@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { buildCampaignVideoPrompt } from "@/lib/campaign-video";
 import { ApiError, ok } from "@/lib/http";
 import { prisma } from "@/lib/prisma";
 import { withRouteErrorHandling } from "@/lib/route-handler";
@@ -5,6 +7,7 @@ import { getEnv } from "@/lib/env";
 import { validateOrThrow } from "@/lib/request";
 import { gpuWebhookPayloadSchema } from "@/server/schemas/api";
 import { estimateGpuCost } from "@/server/services/gpu-budget";
+import { queueVideoJobsForAssets } from "@/server/services/video-generation.service";
 import { verifyHmacSha256 } from "@/server/services/webhook-signature";
 
 export async function POST(request: Request) {
@@ -44,7 +47,23 @@ export async function POST(request: Request) {
 
     const payload = validateOrThrow(gpuWebhookPayloadSchema, parsedBody);
 
-    const job = await prisma.generationJob.findUnique({ where: { id: payload.job_id } });
+    const job = await prisma.generationJob.findUnique({
+      where: { id: payload.job_id },
+      include: {
+        campaign: {
+          select: {
+            id: true,
+            created_by: true,
+            prompt_text: true,
+            model: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
     if (!job) {
       throw new ApiError(404, "NOT_FOUND", "We couldn't find this generation job. Refresh and try again.");
     }
@@ -64,7 +83,7 @@ export async function POST(request: Request) {
           },
         }),
         prisma.campaign.update({
-          where: { id: job.campaign_id },
+          where: { id: job.campaign.id },
           data: {
             status: "DRAFT",
             error_message: payload.error_message,
@@ -77,26 +96,39 @@ export async function POST(request: Request) {
 
     const settings = await prisma.systemSetting.findUnique({ where: { key: "gpu_cost_per_ms" } });
     const ratePerMs = Number(settings?.value ?? 0.0000005);
+    let createdAssetIds: string[] = [];
 
     await prisma.$transaction(async (tx) => {
-      let sequence = 1;
-      for (const item of payload.assets) {
-        await tx.asset.create({
-          data: {
-            campaign_id: job.campaign_id,
-            job_id: job.id,
-            status: "PENDING",
-            raw_gcs_uri: item.file_path,
-            seed: item.seed,
-            width: item.width,
-            height: item.height,
-            prompt_text: item.prompt_text,
-            generation_time_ms: item.generation_time_ms,
-            sequence_number: sequence,
-          },
-        });
+      const latestAsset = await tx.asset.findFirst({
+        where: { campaign_id: job.campaign.id },
+        orderBy: { sequence_number: "desc" },
+        select: { sequence_number: true },
+      });
+      let sequence = (latestAsset?.sequence_number ?? 0) + 1;
+      const persistedAssets = payload.assets.map((item) => {
+        const asset = {
+          id: randomUUID(),
+          campaign_id: job.campaign.id,
+          job_id: job.id,
+          status: "PENDING" as const,
+          raw_gcs_uri: item.file_path,
+          seed: item.seed,
+          width: item.width,
+          height: item.height,
+          prompt_text: item.prompt_text,
+          generation_time_ms: item.generation_time_ms,
+          sequence_number: sequence,
+        };
 
         sequence += 1;
+        return asset;
+      });
+      createdAssetIds = persistedAssets.map((asset) => asset.id);
+
+      if (persistedAssets.length > 0) {
+        await tx.asset.createMany({
+          data: persistedAssets,
+        });
       }
 
       await tx.generationJob.update({
@@ -112,10 +144,27 @@ export async function POST(request: Request) {
       });
 
       await tx.campaign.update({
-        where: { id: job.campaign_id },
+        where: { id: job.campaign.id },
         data: { status: "REVIEW" },
       });
     });
+
+    const videoPlan = readVideoGenerationPlan(job.payload);
+    if (videoPlan.enabled && videoPlan.planned_for_run) {
+      const promptText = buildCampaignVideoPrompt({
+        campaignPromptText: job.campaign.prompt_text,
+        motionPromptText: videoPlan.prompt_text,
+        modelName: job.campaign.model.name,
+      });
+
+      await queueVideoJobsForAssets({
+        assetIds: createdAssetIds,
+        userId: job.campaign.created_by,
+        promptText,
+        durationSeconds: videoPlan.duration_seconds,
+        allowPendingAssets: true,
+      });
+    }
 
     return ok({ status: "ok" });
   });
@@ -134,5 +183,39 @@ function parseWebhookTimestamp(value: string): number | null {
   const parsed = Date.parse(trimmed);
   if (!Number.isFinite(parsed)) return null;
   return parsed;
+}
+
+function readVideoGenerationPlan(payload: unknown): {
+  enabled: boolean;
+  duration_seconds: number;
+  prompt_text?: string;
+  planned_for_run: boolean;
+} {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return {
+      enabled: false,
+      duration_seconds: 8,
+      planned_for_run: false,
+    };
+  }
+
+  const candidate = "video_generation" in payload ? payload.video_generation : null;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return {
+      enabled: false,
+      duration_seconds: 8,
+      planned_for_run: false,
+    };
+  }
+
+  const plan = candidate as Record<string, unknown>;
+  const duration_seconds = Number(plan.duration_seconds);
+
+  return {
+    enabled: plan.enabled === true,
+    duration_seconds: Number.isFinite(duration_seconds) && duration_seconds >= 6 && duration_seconds <= 8 ? duration_seconds : 8,
+    prompt_text: typeof plan.prompt_text === "string" ? plan.prompt_text : undefined,
+    planned_for_run: plan.planned_for_run === true,
+  };
 }
 

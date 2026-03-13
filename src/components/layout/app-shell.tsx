@@ -2,23 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import {
-	BarChart3,
-	Bot,
-	ChevronDown,
-	Circle,
-	LayoutDashboard,
-	Menu,
-	Megaphone,
-	Monitor,
-	Send,
-	Settings2,
-	Shield,
-	Users,
-	Wallet,
-	X,
-	type LucideIcon
-} from "lucide-react";
+import { BarChart3, Bot, ChevronDown, Circle, LayoutDashboard, Menu, Megaphone, Monitor, Send, Settings2, Shield, Users, Wallet, X, type LucideIcon } from "lucide-react";
 import { Suspense, useEffect, useState } from "react";
 import { navSectionsForRole } from "@/components/layout/nav-config";
 import { RoleSwitcher } from "@/components/layout/role-switcher";
@@ -58,22 +42,10 @@ const NAV_ITEM_ICONS: Record<string, LucideIcon> = {
 	"/audit": Shield
 };
 
-function SidebarContent({
-	role,
-	showRoleSwitcher,
-	pathname,
-	sections,
-	collapsedSections,
-	setCollapsedSections,
-	headerAction,
-	onNavigate
-}: SidebarContentProps) {
+function SidebarContent({ role, showRoleSwitcher, pathname, sections, collapsedSections, setCollapsedSections, headerAction, onNavigate }: SidebarContentProps) {
 	return (
 		<>
-			<div
-				aria-hidden
-				className="pointer-events-none absolute inset-x-0 -top-20 h-40 bg-[radial-gradient(circle_at_20%_0%,color-mix(in_oklab,var(--primary),transparent_92%),transparent_70%)]"
-			/>
+			<div aria-hidden className="pointer-events-none absolute inset-x-0 -top-20 h-40 bg-[radial-gradient(circle_at_20%_0%,color-mix(in_oklab,var(--primary),transparent_92%),transparent_70%)]" />
 			<div
 				aria-hidden
 				className="pointer-events-none absolute inset-y-6 -right-8 w-24 rounded-full bg-[radial-gradient(circle,color-mix(in_oklab,var(--accent),transparent_72%)_0%,transparent_72%)] opacity-80 blur-2xl"
@@ -200,7 +172,7 @@ export function AppShell({ role, showRoleSwitcher = false, children }: AppShellP
 			<MeshRibbon />
 			<div className="mx-auto w-full max-w-[1680px] p-4 md:p-6">
 				<div className="sticky top-4 z-40 mb-4 md:hidden">
-					<div className="ds-panel flex items-center justify-between gap-3 rounded-[1.35rem] p-3">
+					<div className="ds-panel flex items-center justify-between gap-3 rounded-2xl p-3">
 						<div className="min-w-0">
 							<p className="font-display text-base font-bold tracking-tight">LaceStudio</p>
 							<p className="text-[11px] text-muted-foreground">Fashion campaign studio</p>
@@ -237,7 +209,7 @@ export function AppShell({ role, showRoleSwitcher = false, children }: AppShellP
 							"absolute inset-y-0 left-0 w-[min(88vw,320px)] p-3 transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)]",
 							mobileNavOpen ? "translate-x-0" : "-translate-x-full"
 						)}>
-						<div className="ds-panel relative flex h-full flex-col overflow-hidden rounded-[1.45rem] p-3.5">
+						<div className="ds-panel relative flex h-full flex-col overflow-hidden rounded-2xl p-3.5">
 							<SidebarContent
 								role={role}
 								showRoleSwitcher={showRoleSwitcher}
@@ -257,7 +229,7 @@ export function AppShell({ role, showRoleSwitcher = false, children }: AppShellP
 				</div>
 
 				<div className="grid min-w-0 items-start gap-6 md:grid-cols-[264px_minmax(0,1fr)] xl:gap-7">
-					<aside className="ds-panel relative max-md:hidden flex flex-col overflow-hidden rounded-[1.45rem] p-3.5 md:sticky md:top-6 md:h-[calc(100dvh-3rem)] md:max-h-[calc(100dvh-3rem)] md:self-start">
+					<aside className="ds-panel relative max-md:hidden flex flex-col overflow-hidden rounded-2xl p-3.5 md:sticky md:top-6 md:h-[calc(100dvh-3rem)] md:max-h-[calc(100dvh-3rem)] md:self-start">
 						<SidebarContent
 							role={role}
 							showRoleSwitcher={showRoleSwitcher}

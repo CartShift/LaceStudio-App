@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const apiRequestMock = vi.fn();
 const apiFormRequestMock = vi.fn();
 const setSegmentTitleMock = vi.fn();
+const routerPushMock = vi.fn();
+const notifyMock = vi.fn();
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "11111111-1111-1111-1111-111111111111" }),
   usePathname: () => "/campaigns/11111111-1111-1111-1111-111111111111",
+  useRouter: () => ({ push: routerPushMock }),
 }));
 
 vi.mock("next/image", () => ({
@@ -29,6 +32,10 @@ vi.mock("@/components/providers/breadcrumb-provider", () => ({
   useBreadcrumb: () => ({ segmentTitles: [], setSegmentTitle: setSegmentTitleMock }),
 }));
 
+vi.mock("@/components/providers/notice-provider", () => ({
+  useNotice: () => ({ notify: notifyMock }),
+}));
+
 vi.mock("@/lib/client-api", () => ({
   apiRequest: (...args: unknown[]) => apiRequestMock(...args),
   apiFormRequest: (...args: unknown[]) => apiFormRequestMock(...args),
@@ -45,6 +52,8 @@ describe("campaign detail anchor-first generation flow", () => {
     setSegmentTitleMock.mockReset();
     apiRequestMock.mockReset();
     apiFormRequestMock.mockReset();
+    routerPushMock.mockReset();
+    notifyMock.mockReset();
 
     let campaign = createCampaign({
       anchor_asset_id: null,
@@ -55,6 +64,15 @@ describe("campaign detail anchor-first generation flow", () => {
     apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111") {
         return campaign;
+      }
+
+      if (url === "/api/models?limit=100") {
+        return {
+          data: [
+            { id: "model-1", name: "Ava Prime", status: "ACTIVE" },
+            { id: "model-2", name: "Nova Lux", status: "ACTIVE" },
+          ],
+        };
       }
 
       if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111/anchor") {
@@ -125,6 +143,15 @@ describe("campaign detail anchor-first generation flow", () => {
         return campaign;
       }
 
+      if (url === "/api/models?limit=100") {
+        return {
+          data: [
+            { id: "model-1", name: "Ava Prime", status: "ACTIVE" },
+            { id: "model-2", name: "Nova Lux", status: "ACTIVE" },
+          ],
+        };
+      }
+
       if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111/generate") {
         return { job_id: "job-1", campaign_status: "GENERATING", payload: init?.body };
       }
@@ -138,8 +165,7 @@ describe("campaign detail anchor-first generation flow", () => {
 
     render(<CampaignDetailPage />);
 
-    const [anchorButton] = await screen.findAllByRole("button", { name: "Generate Anchor Shot" });
-    if (!anchorButton) throw new Error("Missing Generate Anchor Shot button");
+    const anchorButton = await screen.findByRole("button", { name: /Generate Anchor Shot/ });
     fireEvent.click(anchorButton);
 
     await waitFor(() => {
@@ -166,6 +192,70 @@ describe("campaign detail anchor-first generation flow", () => {
     const batchPayload = JSON.parse(String(generateCalls[1]?.[1]?.body ?? "{}"));
     expect(batchPayload.generation_mode).toBe("batch");
     expect(batchPayload.anchor_asset_id).toBe("asset-1");
+  }, 15_000);
+
+  it("includes matching video settings in the generation payload when motion is enabled", async () => {
+    apiRequestMock.mockReset();
+
+    const campaign = createCampaign({
+      anchor_asset_id: "asset-1",
+      image_model_provider: "openai",
+      batch_size: 5,
+    });
+
+    apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111") {
+        return campaign;
+      }
+
+      if (url === "/api/models?limit=100") {
+        return {
+          data: [
+            { id: "model-1", name: "Ava Prime", status: "ACTIVE" },
+            { id: "model-2", name: "Nova Lux", status: "ACTIVE" },
+          ],
+        };
+      }
+
+      if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111/generate") {
+        return { job_id: "job-1", campaign_status: "GENERATING", payload: init?.body, video_generation_planned: true };
+      }
+
+      if (url === "/api/campaigns/11111111-1111-1111-1111-111111111111/creative-controls") {
+        return campaign;
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    });
+
+    render(<CampaignDetailPage />);
+
+    const motionToggle = await screen.findByRole("switch");
+    fireEvent.click(motionToggle);
+
+    const everyShotButton = await screen.findByText("Every shot");
+    fireEvent.click(everyShotButton);
+
+    const quickDurationButton = await screen.findByText("6 sec");
+    fireEvent.click(quickDurationButton);
+
+    const batchButton = await screen.findByRole("button", { name: /Generate Campaign Shots/ });
+    fireEvent.click(batchButton);
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "/api/campaigns/11111111-1111-1111-1111-111111111111/generate",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    const generateCalls = apiRequestMock.mock.calls.filter(call => call[0] === "/api/campaigns/11111111-1111-1111-1111-111111111111/generate");
+    const batchPayload = JSON.parse(String(generateCalls[0]?.[1]?.body ?? "{}"));
+    expect(batchPayload.creative_controls_override.video).toMatchObject({
+      enabled: true,
+      generation_scope: "all_images",
+      duration_seconds: 6,
+    });
   }, 15_000);
 
   it("opens the asset preview as a dialog and closes it with Escape", async () => {
@@ -226,6 +316,7 @@ function createCampaign(overrides?: Partial<CampaignFixture>): CampaignFixture {
       },
       expression: { preset: "neutral", smile_intensity: 0.2 },
       outfit: { micro_adjustment: { hem_length: 0 } },
+      video: { enabled: false, generation_scope: "all_images", duration_seconds: 8, prompt_text: "" },
     },
     assets: [
       {

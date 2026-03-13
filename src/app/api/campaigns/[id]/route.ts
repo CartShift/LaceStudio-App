@@ -52,7 +52,31 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       throw new ApiError(404, "NOT_FOUND", "We couldn't find this campaign. Please refresh and try again.");
     }
 
-    return ok(campaign);
+    const linkedCampaigns = campaign.campaign_group_id
+      ? await prisma.campaign.findMany({
+          where: {
+            campaign_group_id: campaign.campaign_group_id,
+          },
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            source_campaign_id: true,
+            model: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+          orderBy: [{ name: "asc" }],
+        })
+      : [];
+
+    return ok({
+      ...campaign,
+      linked_campaigns: linkedCampaigns,
+    });
   });
 }
 
