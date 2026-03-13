@@ -1,0 +1,853 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  CLIENT
+}
+
+enum ModelStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum CanonicalPackStatus {
+  NOT_STARTED
+  GENERATING
+  READY
+  APPROVED
+  FAILED
+}
+
+enum ModelReferenceCandidateStatus {
+  CANDIDATE
+  SELECTED
+  REJECTED
+}
+
+enum ModelSourceReferenceStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum CampaignStatus {
+  DRAFT
+  GENERATING
+  REVIEW
+  APPROVED
+  REJECTED
+  SCHEDULED
+  PUBLISHED
+  FAILED
+}
+
+enum GenerationJobStatus {
+  DISPATCHED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  TIMED_OUT
+}
+
+enum AssetStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum VariantType {
+  feed_1x1
+  feed_4x5
+  story_9x16
+  master
+}
+
+enum PostType {
+  feed
+  story
+  reel
+}
+
+enum PublishingStatus {
+  PENDING_APPROVAL
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  RETRY
+  FAILED
+  REJECTED
+  CANCELLED
+}
+
+enum PlatformType {
+  instagram
+}
+
+enum InstagramProfileConnectionStatus {
+  DISCONNECTED
+  PENDING
+  CONNECTED
+  ERROR
+  EXPIRED
+}
+
+enum PostingPlanStatus {
+  RECOMMENDED
+  SCHEDULED
+  SKIPPED
+  PUBLISHED
+  CANCELLED
+}
+
+enum ImageModelProvider {
+  gpu
+  openai
+  nano_banana_2
+  zai_glm
+}
+
+enum ContractType {
+  RETAINER
+  RETAINER_PLUS_BONUS
+}
+
+enum RevenueEntryType {
+  RETAINER
+  BONUS
+  ADJUSTMENT
+}
+
+model User {
+  id                 String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email              String                   @unique @db.VarChar(255)
+  role               UserRole                 @default(OPERATOR)
+  display_name       String                   @db.VarChar(100)
+  created_at         DateTime                 @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime                 @default(now()) @updatedAt @db.Timestamptz(6)
+  ai_models          AiModel[]                @relation("UserCreatedModels")
+  campaigns          Campaign[]               @relation("UserCreatedCampaigns")
+  presets            Preset[]                 @relation("UserCreatedPresets")
+  uploaded_versions  ModelVersion[]           @relation("VersionUploader")
+  uploaded_source_references ModelSourceReference[] @relation("ModelSourceReferenceUploader")
+  pose_packs         PosePack[]               @relation("PosePackCreator")
+  publishing_queue   PublishingQueue[]        @relation("PublishingCreator")
+  hashtag_presets    HashtagPreset[]          @relation("HashtagCreator")
+  audit_log          AuditLog[]               @relation("AuditActor")
+  system_settings    SystemSetting[]          @relation("SystemSettingUpdater")
+  clients_created    Client[]                 @relation("ClientCreator")
+  brand_profiles     BrandProfile[]           @relation("BrandCreator")
+  revenue_contracts  RevenueContract[]        @relation("RevenueContractCreator")
+  instagram_profiles InstagramProfile[]       @relation("InstagramProfileCreator")
+  posting_strategies PostingStrategy[]        @relation("PostingStrategyCreator")
+  posting_plan_items PostingPlanItem[]        @relation("PostingPlanCreator")
+
+  @@map("users")
+}
+
+model AiModel {
+  id                       String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                     String                   @unique @db.VarChar(50)
+  description              String?
+  status                   ModelStatus              @default(DRAFT)
+  body_profile             Json?
+  face_profile             Json?
+  imperfection_fingerprint Json?
+  personality_profile      Json?
+  social_tracks_profile    Json?
+  onboarding_state         Json?
+  canonical_pack_status    CanonicalPackStatus      @default(NOT_STARTED)
+  active_canonical_pack_version Int                 @default(0)
+  active_version_id        String?                  @db.Uuid
+  created_by               String                   @db.Uuid
+  created_at               DateTime                 @default(now()) @db.Timestamptz(6)
+  updated_at               DateTime                 @default(now()) @updatedAt @db.Timestamptz(6)
+  creator                  User                     @relation("UserCreatedModels", fields: [created_by], references: [id])
+  model_versions           ModelVersion[]
+  canonical_references     CanonicalReference[]
+  reference_candidates     ModelReferenceCandidate[]
+  source_references        ModelSourceReference[]
+  campaigns                Campaign[]
+  prompt_embeddings        PromptEmbedding[]
+  pose_pack_models         PosePackModel[]
+  client_model_assignments ClientModelAssignment[]
+  instagram_profile        InstagramProfile?
+
+  @@index([status], map: "idx_ai_models_status")
+  @@index([created_by], map: "idx_ai_models_created_by")
+  @@map("ai_models")
+}
+
+model ModelVersion {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  model_id        String    @db.Uuid
+  version         Int
+  lora_gcs_uri    String
+  lora_strength   Decimal   @default(0.8) @db.Decimal(3, 2)
+  file_size_bytes BigInt?
+  is_active       Boolean   @default(false)
+  notes           String?
+  uploaded_by     String    @db.Uuid
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  model           AiModel   @relation(fields: [model_id], references: [id])
+  uploader        User      @relation("VersionUploader", fields: [uploaded_by], references: [id])
+
+  @@unique([model_id, version])
+  @@index([model_id], map: "idx_model_versions_model_id")
+  @@map("model_versions")
+}
+
+model CanonicalReference {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  model_id            String   @db.Uuid
+  pack_version        Int      @default(1)
+  shot_code           String   @db.VarChar(40)
+  source_candidate_id String?  @db.Uuid
+  seed                Int
+  prompt_text         String
+  reference_image_url String
+  notes               String?
+  sort_order          Int      @default(0)
+  created_at          DateTime @default(now()) @db.Timestamptz(6)
+  model               AiModel  @relation(fields: [model_id], references: [id])
+
+  @@index([model_id], map: "idx_canonical_refs_model_id")
+  @@index([model_id, pack_version], map: "idx_canonical_refs_model_pack")
+  @@map("canonical_references")
+}
+
+model ModelReferenceCandidate {
+  id                String                        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  model_id          String                        @db.Uuid
+  pack_version      Int
+  shot_code         String                        @db.VarChar(40)
+  candidate_index   Int
+  seed              Int
+  prompt_text       String
+  image_gcs_uri     String
+  provider          ImageModelProvider
+  provider_model_id String?                       @db.VarChar(120)
+  realism_score     Decimal?                      @db.Decimal(5, 4)
+  clarity_score     Decimal?                      @db.Decimal(5, 4)
+  consistency_score Decimal?                      @db.Decimal(5, 4)
+  composite_score   Decimal?                      @db.Decimal(5, 4)
+  qa_notes          String?
+  status            ModelReferenceCandidateStatus @default(CANDIDATE)
+  created_at        DateTime                      @default(now()) @db.Timestamptz(6)
+  model             AiModel                       @relation(fields: [model_id], references: [id])
+
+  @@index([model_id, pack_version, shot_code], map: "idx_model_ref_candidates_model_pack_shot")
+  @@index([model_id, status], map: "idx_model_ref_candidates_model_status")
+  @@map("model_reference_candidates")
+}
+
+model ModelSourceReference {
+  id               String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  model_id         String                     @db.Uuid
+  uploaded_by      String                     @db.Uuid
+  image_gcs_uri    String
+  file_name        String?                    @db.VarChar(255)
+  mime_type        String                     @db.VarChar(80)
+  byte_size        Int
+  status           ModelSourceReferenceStatus @default(PENDING)
+  rejection_reason String?
+  sort_order       Int                        @default(0)
+  created_at       DateTime                   @default(now()) @db.Timestamptz(6)
+  model            AiModel                    @relation(fields: [model_id], references: [id])
+  uploader         User                       @relation("ModelSourceReferenceUploader", fields: [uploaded_by], references: [id])
+
+  @@index([model_id, status, created_at], map: "idx_model_source_refs_model_status_created")
+  @@index([model_id, sort_order], map: "idx_model_source_refs_model_sort")
+  @@map("model_source_references")
+}
+
+model Preset {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name               String          @db.VarChar(100)
+  mood_tag           String?         @db.VarChar(50)
+  current_version_id String?         @db.Uuid
+  created_by         String          @db.Uuid
+  created_at         DateTime        @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime        @default(now()) @updatedAt @db.Timestamptz(6)
+  creator            User            @relation("UserCreatedPresets", fields: [created_by], references: [id])
+  preset_versions    PresetVersion[]
+
+  @@index([created_by], map: "idx_presets_created_by")
+  @@map("presets")
+}
+
+model PresetVersion {
+  id                String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  preset_id         String     @db.Uuid
+  version           Int
+  lighting_profile  Json
+  lens_profile      Json
+  color_palette     Json
+  grading_curve     Json
+  camera_simulation Json?
+  prompt_fragment   String?
+  created_at        DateTime   @default(now()) @db.Timestamptz(6)
+  preset            Preset     @relation(fields: [preset_id], references: [id])
+  campaigns         Campaign[]
+
+  @@unique([preset_id, version])
+  @@map("preset_versions")
+}
+
+model PosePack {
+  id            String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String          @db.VarChar(100)
+  description   String?
+  manifest      Json
+  compatibility String          @default("all") @db.VarChar(10)
+  created_by    String          @db.Uuid
+  created_at    DateTime        @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime        @default(now()) @updatedAt @db.Timestamptz(6)
+  creator       User            @relation("PosePackCreator", fields: [created_by], references: [id])
+  pose_models   PosePackModel[]
+  campaigns     Campaign[]
+
+  @@map("pose_packs")
+}
+
+model PosePackModel {
+  pose_pack_id String  @db.Uuid
+  model_id     String  @db.Uuid
+  pose_pack    PosePack @relation(fields: [pose_pack_id], references: [id])
+  model        AiModel  @relation(fields: [model_id], references: [id])
+
+  @@id([pose_pack_id, model_id])
+  @@map("pose_pack_models")
+}
+
+model Campaign {
+  id                      String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                    String           @db.VarChar(200)
+  model_id                String           @db.Uuid
+  preset_version_id       String           @db.Uuid
+  pose_pack_id            String?          @db.Uuid
+  image_model_provider    ImageModelProvider @default(zai_glm)
+  image_model_id          String?          @db.VarChar(120)
+  creative_controls       Json?
+  reference_board_version Int              @default(1)
+  anchor_asset_id         String?          @db.Uuid
+  product_asset_url       String?
+  status                  CampaignStatus   @default(DRAFT)
+  batch_size              Int
+  resolution_width        Int              @default(1024)
+  resolution_height       Int              @default(1024)
+  upscale                 Boolean          @default(true)
+  prompt_text             String?
+  negative_prompt         String?
+  custom_prompt_additions String?
+  base_seed               Int?
+  error_message           String?
+  created_by              String           @db.Uuid
+  created_at              DateTime         @default(now()) @db.Timestamptz(6)
+  updated_at              DateTime         @default(now()) @updatedAt @db.Timestamptz(6)
+  model                   AiModel          @relation(fields: [model_id], references: [id])
+  preset_version          PresetVersion    @relation(fields: [preset_version_id], references: [id])
+  pose_pack               PosePack?        @relation(fields: [pose_pack_id], references: [id])
+  creator                 User             @relation("UserCreatedCampaigns", fields: [created_by], references: [id])
+  generation_jobs         GenerationJob[]
+  assets                  Asset[]
+  prompt_embeddings       PromptEmbedding[]
+  reference_versions      CampaignReferenceVersion[]
+  refinement_states       AssetRefinementState[]
+
+  @@index([model_id], map: "idx_campaigns_model_id")
+  @@index([status], map: "idx_campaigns_status")
+  @@index([created_by], map: "idx_campaigns_created_by")
+  @@index([preset_version_id], map: "idx_campaigns_preset_version_id")
+  @@index([created_at(sort: Desc)], map: "idx_campaigns_created_at")
+  @@map("campaigns")
+}
+
+model GenerationJob {
+  id                 String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaign_id        String              @db.Uuid
+  status             GenerationJobStatus @default(DISPATCHED)
+  gpu_provider       String?             @db.VarChar(50)
+  gpu_type           String?             @db.VarChar(50)
+  payload            Json
+  response_payload   Json?
+  generation_time_ms Int?
+  estimated_cost_usd Decimal?            @db.Decimal(10, 4)
+  retry_count        Int                 @default(0)
+  error_message      String?
+  dispatched_at      DateTime            @default(now()) @db.Timestamptz(6)
+  completed_at       DateTime?           @db.Timestamptz(6)
+  campaign           Campaign            @relation(fields: [campaign_id], references: [id])
+  assets             Asset[]
+
+  @@index([campaign_id], map: "idx_gen_jobs_campaign_id")
+  @@index([status], map: "idx_gen_jobs_status")
+  @@map("generation_jobs")
+}
+
+model Asset {
+  id                 String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaign_id        String           @db.Uuid
+  job_id             String           @db.Uuid
+  status             AssetStatus      @default(PENDING)
+  raw_gcs_uri        String
+  approved_gcs_uri   String?
+  seed               Int
+  width              Int
+  height             Int
+  file_size_bytes    BigInt?
+  prompt_text        String
+  generation_time_ms Int?
+  sequence_number    Int
+  is_favorite        Boolean          @default(false)
+  quality_score      Decimal?         @db.Decimal(5, 2)
+  moderation_notes   String?
+  issue_tags         String[]         @default([])
+  artifacts_flagged  Boolean          @default(false)
+  identity_drift_score Decimal?       @db.Decimal(5, 4)
+  refinement_index   Int              @default(0)
+  refinement_history Json?
+  created_at         DateTime         @default(now()) @db.Timestamptz(6)
+  reviewed_at        DateTime?        @db.Timestamptz(6)
+  campaign           Campaign         @relation(fields: [campaign_id], references: [id])
+  job                GenerationJob    @relation(fields: [job_id], references: [id])
+  variants           AssetVariant[]
+  prompt_embedding   PromptEmbedding?
+  publishing_queue   PublishingQueue[]
+  posting_plan_items PostingPlanItem[]
+  refinement_states  AssetRefinementState[]
+
+  @@index([campaign_id], map: "idx_assets_campaign_id")
+  @@index([job_id], map: "idx_assets_job_id")
+  @@index([status], map: "idx_assets_status")
+  @@map("assets")
+}
+
+model CampaignReferenceVersion {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaign_id String   @db.Uuid
+  version     Int
+  label       String   @db.VarChar(120)
+  references  Json
+  created_by  String?  @db.Uuid
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  campaign    Campaign @relation(fields: [campaign_id], references: [id])
+
+  @@unique([campaign_id, version])
+  @@index([campaign_id], map: "idx_campaign_reference_versions_campaign_id")
+  @@map("campaign_reference_versions")
+}
+
+model AssetRefinementState {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaign_id     String   @db.Uuid
+  asset_id        String   @db.Uuid
+  state_index     Int
+  label           String?  @db.VarChar(120)
+  controls_patch  Json
+  prompt_override String?
+  created_by      String?  @db.Uuid
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  campaign        Campaign @relation(fields: [campaign_id], references: [id])
+  asset           Asset    @relation(fields: [asset_id], references: [id])
+
+  @@unique([asset_id, state_index])
+  @@index([campaign_id], map: "idx_asset_refinement_states_campaign_id")
+  @@index([asset_id], map: "idx_asset_refinement_states_asset_id")
+  @@map("asset_refinement_states")
+}
+
+model AssetVariant {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  asset_id        String      @db.Uuid
+  format_type     VariantType
+  gcs_uri         String
+  width           Int
+  height          Int
+  file_size_bytes BigInt?
+  created_at      DateTime    @default(now()) @db.Timestamptz(6)
+  asset           Asset       @relation(fields: [asset_id], references: [id])
+
+  @@unique([asset_id, format_type])
+  @@index([asset_id], map: "idx_asset_variants_asset_id")
+  @@map("asset_variants")
+}
+
+model PromptEmbedding {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  asset_id        String   @unique @db.Uuid
+  campaign_id     String   @db.Uuid
+  model_id        String   @db.Uuid
+  prompt_text     String
+  embedding       Unsupported("double precision[]")
+  embedding_model String   @default("text-embedding-3-small") @db.VarChar(100)
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  asset           Asset    @relation(fields: [asset_id], references: [id])
+  campaign        Campaign @relation(fields: [campaign_id], references: [id])
+  model           AiModel  @relation(fields: [model_id], references: [id])
+
+  @@index([model_id], map: "idx_prompt_embeddings_model_id")
+  @@index([campaign_id], map: "idx_prompt_embeddings_campaign_id")
+  @@map("prompt_embeddings")
+}
+
+model HashtagPreset {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String          @db.VarChar(100)
+  hashtags       String[]
+  created_by     String          @db.Uuid
+  created_at     DateTime        @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime        @default(now()) @updatedAt @db.Timestamptz(6)
+  creator        User            @relation("HashtagCreator", fields: [created_by], references: [id])
+  publishing_set PublishingQueue[]
+
+  @@map("hashtag_presets")
+}
+
+model PublishingQueue {
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  asset_id          String            @db.Uuid
+  profile_id        String?           @db.Uuid
+  plan_item_id      String?           @db.Uuid
+  variant_type      VariantType
+  platform          PlatformType      @default(instagram)
+  post_type         PostType
+  pillar_key        String?           @db.VarChar(80)
+  caption           String
+  hashtag_preset_id String?           @db.Uuid
+  status            PublishingStatus  @default(SCHEDULED)
+  scheduled_at      DateTime          @db.Timestamptz(6)
+  slot_start        DateTime?         @db.Timestamptz(6)
+  published_at      DateTime?         @db.Timestamptz(6)
+  ig_media_id       String?           @db.VarChar(100)
+  ig_container_id   String?           @db.VarChar(100)
+  retry_count       Int               @default(0)
+  retry_after       DateTime?         @db.Timestamptz(6)
+  rejection_reason  String?
+  error_message     String?
+  strategy_snapshot Json?
+  created_by        String            @db.Uuid
+  created_at        DateTime          @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime          @default(now()) @updatedAt @db.Timestamptz(6)
+  asset             Asset             @relation(fields: [asset_id], references: [id])
+  profile           InstagramProfile? @relation(fields: [profile_id], references: [id])
+  plan_item         PostingPlanItem?  @relation(fields: [plan_item_id], references: [id])
+  hashtag_preset    HashtagPreset?    @relation(fields: [hashtag_preset_id], references: [id])
+  creator           User              @relation("PublishingCreator", fields: [created_by], references: [id])
+  publishing_logs   PublishingLog[]
+  analytics         AnalyticsSnapshot[]
+
+  @@index([status, scheduled_at], map: "idx_pub_queue_status_scheduled")
+  @@index([asset_id], map: "idx_pub_queue_asset_id")
+  @@index([created_by], map: "idx_pub_queue_created_by")
+  @@index([profile_id, scheduled_at], map: "idx_pub_queue_profile_scheduled")
+  @@index([plan_item_id], map: "idx_pub_queue_plan_item_id")
+  @@map("publishing_queue")
+}
+
+model PublishingLog {
+  id                  String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  publishing_queue_id String          @db.Uuid
+  action              String          @db.VarChar(50)
+  request_payload     Json?
+  response_payload    Json?
+  http_status         Int?
+  error_message       String?
+  created_at          DateTime        @default(now()) @db.Timestamptz(6)
+  queue               PublishingQueue @relation(fields: [publishing_queue_id], references: [id])
+
+  @@index([publishing_queue_id], map: "idx_pub_logs_queue_id")
+  @@map("publishing_logs")
+}
+
+model AnalyticsSnapshot {
+  id                  String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  publishing_queue_id String          @db.Uuid
+  ig_media_id         String          @db.VarChar(100)
+  impressions         Int             @default(0)
+  reach               Int             @default(0)
+  likes_count         Int             @default(0)
+  comments_count      Int             @default(0)
+  saves_count         Int             @default(0)
+  shares_count        Int             @default(0)
+  engagement_total    Int             @default(0)
+  engagement_rate     Decimal?        @db.Decimal(8, 4)
+  fetched_at          DateTime        @default(now()) @db.Timestamptz(6)
+  queue               PublishingQueue @relation(fields: [publishing_queue_id], references: [id])
+
+  @@index([publishing_queue_id], map: "idx_analytics_pub_queue_id")
+  @@index([fetched_at(sort: Desc)], map: "idx_analytics_fetched_at")
+  @@map("analytics_snapshots")
+}
+
+model AuditLog {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String?  @db.Uuid
+  action      String   @db.VarChar(100)
+  entity_type String   @db.VarChar(50)
+  entity_id   String   @db.Uuid
+  old_value   Json?
+  new_value   Json?
+  ip_address  String?  @db.Inet
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  actor       User?    @relation("AuditActor", fields: [user_id], references: [id])
+
+  @@index([entity_type, entity_id], map: "idx_audit_entity")
+  @@index([created_at(sort: Desc)], map: "idx_audit_created_at")
+  @@map("audit_log")
+}
+
+model SystemSetting {
+  key        String   @id @db.VarChar(100)
+  value      Json
+  updated_by String?  @db.Uuid
+  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+  updater    User?    @relation("SystemSettingUpdater", fields: [updated_by], references: [id])
+
+  @@map("system_settings")
+}
+
+model InstagramProfile {
+  id                   String                           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  model_id             String                           @unique @db.Uuid
+  handle               String?                          @db.VarChar(80)
+  display_name         String?                          @db.VarChar(120)
+  timezone             String                           @default("UTC") @db.VarChar(64)
+  connection_status    InstagramProfileConnectionStatus @default(DISCONNECTED)
+  graph_user_id        String?                          @db.VarChar(120)
+  token_expires_at     DateTime?                        @db.Timestamptz(6)
+  publish_enabled      Boolean                          @default(true)
+  last_analytics_sync_at DateTime?                      @db.Timestamptz(6)
+  profile_metadata     Json?
+  oauth_state          String?                          @db.VarChar(120)
+  oauth_state_expires_at DateTime?                      @db.Timestamptz(6)
+  created_by           String                           @db.Uuid
+  created_at           DateTime                         @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime                         @default(now()) @updatedAt @db.Timestamptz(6)
+  model                AiModel                          @relation(fields: [model_id], references: [id])
+  creator              User                             @relation("InstagramProfileCreator", fields: [created_by], references: [id])
+  auth                 InstagramProfileAuth?
+  strategies           PostingStrategy[]
+  publishing_queue     PublishingQueue[]
+  plan_items           PostingPlanItem[]
+
+  @@index([connection_status], map: "idx_instagram_profiles_connection_status")
+  @@index([created_by], map: "idx_instagram_profiles_created_by")
+  @@map("instagram_profiles")
+}
+
+model InstagramProfileAuth {
+  profile_id                String           @id @db.Uuid
+  access_token_encrypted    String
+  refresh_token_encrypted   String?
+  token_type                String?          @db.VarChar(40)
+  scopes                    String[]         @default([])
+  last_refreshed_at         DateTime?        @db.Timestamptz(6)
+  refresh_requested_at      DateTime?        @db.Timestamptz(6)
+  last_error                String?
+  created_at                DateTime         @default(now()) @db.Timestamptz(6)
+  updated_at                DateTime         @default(now()) @updatedAt @db.Timestamptz(6)
+  profile                   InstagramProfile @relation(fields: [profile_id], references: [id])
+
+  @@map("instagram_profile_auth")
+}
+
+model PostingStrategy {
+  id                String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  profile_id        String             @unique @db.Uuid
+  timezone          String             @default("UTC") @db.VarChar(64)
+  weekly_post_target Int               @default(5)
+  cooldown_hours    Int                @default(18)
+  min_ready_assets  Int                @default(3)
+  auto_queue_enabled Boolean           @default(false)
+  notes             String?
+  created_by        String             @db.Uuid
+  created_at        DateTime           @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime           @default(now()) @updatedAt @db.Timestamptz(6)
+  profile           InstagramProfile   @relation(fields: [profile_id], references: [id])
+  creator           User               @relation("PostingStrategyCreator", fields: [created_by], references: [id])
+  pillars           StrategyPillar[]
+  slot_templates    StrategySlotTemplate[]
+  plan_items        PostingPlanItem[]
+
+  @@index([created_by], map: "idx_posting_strategies_created_by")
+  @@map("posting_strategies")
+}
+
+model StrategyPillar {
+  id                  String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  strategy_id         String          @db.Uuid
+  key                 String          @db.VarChar(80)
+  name                String          @db.VarChar(120)
+  description         String?
+  target_share_percent Int
+  active              Boolean         @default(true)
+  priority            Int             @default(0)
+  supported_post_types PostType[]     @default([feed])
+  created_at          DateTime        @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime        @default(now()) @updatedAt @db.Timestamptz(6)
+  strategy            PostingStrategy @relation(fields: [strategy_id], references: [id])
+  slot_templates      StrategySlotTemplate[]
+  plan_items          PostingPlanItem[]
+
+  @@unique([strategy_id, key])
+  @@index([strategy_id, priority], map: "idx_strategy_pillars_strategy_priority")
+  @@map("strategy_pillars")
+}
+
+model StrategySlotTemplate {
+  id                  String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  strategy_id         String          @db.Uuid
+  pillar_id           String?         @db.Uuid
+  label               String          @db.VarChar(120)
+  weekday             Int
+  local_time          String          @db.VarChar(8)
+  daypart             String          @db.VarChar(40)
+  post_type           PostType
+  variant_type        VariantType
+  priority            Int             @default(0)
+  active              Boolean         @default(true)
+  created_at          DateTime        @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime        @default(now()) @updatedAt @db.Timestamptz(6)
+  strategy            PostingStrategy @relation(fields: [strategy_id], references: [id])
+  pillar              StrategyPillar? @relation(fields: [pillar_id], references: [id])
+
+  @@index([strategy_id, weekday, local_time], map: "idx_slot_templates_strategy_weekday_time")
+  @@index([pillar_id], map: "idx_slot_templates_pillar_id")
+  @@map("strategy_slot_templates")
+}
+
+model PostingPlanItem {
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  profile_id        String            @db.Uuid
+  strategy_id       String?           @db.Uuid
+  pillar_id         String?           @db.Uuid
+  asset_id          String?           @db.Uuid
+  status            PostingPlanStatus @default(RECOMMENDED)
+  slot_start        DateTime          @db.Timestamptz(6)
+  slot_end          DateTime?         @db.Timestamptz(6)
+  pillar_key        String?           @db.VarChar(80)
+  post_type         PostType
+  variant_type      VariantType
+  rationale         String?
+  confidence        Decimal?          @db.Decimal(5, 4)
+  caption_suggestion String?
+  strategy_snapshot Json?
+  autopilot_metadata Json?
+  decided_at        DateTime?         @db.Timestamptz(6)
+  created_by        String?           @db.Uuid
+  created_at        DateTime          @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime          @default(now()) @updatedAt @db.Timestamptz(6)
+  profile           InstagramProfile  @relation(fields: [profile_id], references: [id])
+  strategy          PostingStrategy?  @relation(fields: [strategy_id], references: [id])
+  pillar            StrategyPillar?   @relation(fields: [pillar_id], references: [id])
+  asset             Asset?            @relation(fields: [asset_id], references: [id])
+  creator           User?             @relation("PostingPlanCreator", fields: [created_by], references: [id])
+  queue_items       PublishingQueue[]
+
+  @@unique([profile_id, slot_start, post_type])
+  @@index([profile_id, status, slot_start], map: "idx_plan_items_profile_status_slot")
+  @@index([pillar_id], map: "idx_plan_items_pillar_id")
+  @@index([asset_id], map: "idx_plan_items_asset_id")
+  @@map("posting_plan_items")
+}
+
+model Client {
+  id            String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String                  @db.VarChar(120)
+  status        String                  @default("active") @db.VarChar(20)
+  notes         String?
+  created_by    String                  @db.Uuid
+  created_at    DateTime                @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime                @default(now()) @updatedAt @db.Timestamptz(6)
+  creator       User                    @relation("ClientCreator", fields: [created_by], references: [id])
+  brand_profiles BrandProfile[]
+  assignments   ClientModelAssignment[]
+  revenue_contracts RevenueContract[]
+
+  @@map("clients")
+}
+
+model BrandProfile {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  client_id       String   @db.Uuid
+  name            String   @db.VarChar(120)
+  visual_direction Json?
+  voice_notes      String?
+  created_by       String   @db.Uuid
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+  client           Client   @relation(fields: [client_id], references: [id])
+  creator          User     @relation("BrandCreator", fields: [created_by], references: [id])
+
+  @@map("brand_profiles")
+}
+
+model ClientModelAssignment {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  client_id   String   @db.Uuid
+  model_id    String   @db.Uuid
+  starts_at   DateTime @default(now()) @db.Timestamptz(6)
+  ends_at     DateTime? @db.Timestamptz(6)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  client      Client   @relation(fields: [client_id], references: [id])
+  model       AiModel  @relation(fields: [model_id], references: [id])
+
+  @@unique([client_id, model_id])
+  @@map("client_model_assignments")
+}
+
+model RevenueContract {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  client_id         String                @db.Uuid
+  contract_type     ContractType          @default(RETAINER_PLUS_BONUS)
+  monthly_retainer_usd Decimal            @db.Decimal(10, 2)
+  starts_at         DateTime              @db.Timestamptz(6)
+  ends_at           DateTime?             @db.Timestamptz(6)
+  created_by        String                @db.Uuid
+  created_at        DateTime              @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime              @default(now()) @updatedAt @db.Timestamptz(6)
+  client            Client                @relation(fields: [client_id], references: [id])
+  creator           User                  @relation("RevenueContractCreator", fields: [created_by], references: [id])
+  entries           RevenueEntry[]
+  bonus_rules       PerformanceBonusRule[]
+
+  @@map("revenue_contracts")
+}
+
+model PerformanceBonusRule {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contract_id        String          @db.Uuid
+  metric             String          @db.VarChar(80)
+  threshold          Decimal         @db.Decimal(10, 4)
+  bonus_amount_usd   Decimal         @db.Decimal(10, 2)
+  created_at         DateTime        @default(now()) @db.Timestamptz(6)
+  contract           RevenueContract @relation(fields: [contract_id], references: [id])
+
+  @@map("performance_bonus_rules")
+}
+
+model RevenueEntry {
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contract_id       String            @db.Uuid
+  type              RevenueEntryType
+  amount_usd        Decimal           @db.Decimal(10, 2)
+  reference_month   DateTime          @db.Timestamptz(6)
+  notes             String?
+  created_at        DateTime          @default(now()) @db.Timestamptz(6)
+  contract          RevenueContract   @relation(fields: [contract_id], references: [id])
+
+  @@index([contract_id], map: "idx_revenue_entries_contract_id")
+  @@index([reference_month], map: "idx_revenue_entries_reference_month")
+  @@index([contract_id, reference_month], map: "idx_revenue_entries_contract_month")
+  @@map("revenue_entries")
+}

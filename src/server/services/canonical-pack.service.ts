@@ -1,0 +1,1711 @@
+import { randomInt, randomUUID } from "node:crypto";
+import type { ImageModelProvider } from "@/server/schemas/creative";
+import { ApiError } from "@/lib/http";
+import { log } from "@/lib/logger";
+import { prisma } from "@/lib/prisma";
+import { withRetry } from "@/lib/retry";
+import { sleep } from "@/lib/utils";
+import { getEnv } from "@/lib/env";
+import { getImageProvider } from "@/server/providers";
+import { createDefaultCreativeControls } from "@/server/services/creative-controls";
+import { scoreCanonicalCandidate } from "@/server/services/canonical-qa.service";
+import { buildCanonicalShotPlan } from "@/server/services/canonical-shot-plan";
+import { REQUIRED_CANONICAL_SHOT_CODES, buildModelCapabilityFlags, deriveModelStatusForWorkflow } from "@/server/services/model-workflow.service";
+import { createSignedReadUrlForGcsUri, uploadImageFromUriToModelBucket } from "@/server/services/storage/gcs-storage";
+
+const CANONICAL_SHOT_DELAY_MS = 2_500;
+const CANONICAL_RATE_LIMIT_DELAY_MS = 5_000;
+const CANONICAL_SHOT_MAX_ATTEMPTS = 3;
+const CANONICAL_SHOT_TIMEOUT_MS = 180_000;
+const CANONICAL_RETRY_BASE_DELAY_MS = 1_200;
+const CANONICAL_UPLOAD_MAX_ATTEMPTS = 3;
+const CANONICAL_UPLOAD_BASE_DELAY_MS = 800;
+const CANONICAL_JOB_STALE_MS = 20 * 60 * 1000;
+const CANONICAL_ERROR_PREVIEW_LIMIT = 6;
+const MAX_CANONICAL_CONDITIONING_REFERENCES = 10;
+const CANONICAL_REFERENCE_SIGNED_URL_TTL_SECONDS = 60 * 60;
+const CANONICAL_REFERENCE_RESOLVE_CONCURRENCY = 6;
+const FRONT_CANONICAL_SHOT_CODE = "frontal_closeup";
+
+type CanonicalGenerationMode = "front_only" | "remaining" | "full";
+type CanonicalShotCode = (typeof REQUIRED_CANONICAL_SHOT_CODES)[number];
+
+type CanonicalGenerationState = {
+	job_id?: string;
+	pack_version?: number;
+	provider?: ImageModelProvider;
+	provider_model_id?: string;
+	generation_mode?: CanonicalGenerationMode;
+	status?: "GENERATING" | "READY" | "FAILED";
+	started_at?: string;
+	heartbeat_at?: string;
+	completed_at?: string;
+	completed_shots?: number;
+	total_shots?: number;
+	failed_shots?: number;
+	shot_codes?: CanonicalShotCode[];
+};
+
+export async function uploadCandidateReference(input: { modelId: string; initiatedBy: string; shotCode: string; imageDataUrl: string; candidateIndex?: number; packVersion?: number }) {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			name: true,
+			body_profile: true,
+			face_profile: true,
+			canonical_pack_status: true,
+			active_canonical_pack_version: true,
+			onboarding_state: true
+		}
+	});
+
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	let packVersion = input.packVersion ?? model.active_canonical_pack_version;
+	if (packVersion <= 0) {
+		packVersion = 1;
+	}
+
+	const nowIso = new Date().toISOString();
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const generationState = readCanonicalGenerationState(onboardingState);
+
+	// Manual uploads can recover packs that were never started or previously failed.
+	if (model.canonical_pack_status === "NOT_STARTED" || model.canonical_pack_status === "FAILED") {
+		await prisma.aiModel.update({
+			where: { id: input.modelId },
+			data: {
+				canonical_pack_status: "READY",
+				onboarding_state: {
+					...onboardingState,
+					canonical_pack_error: null,
+					canonical_pack_generation: {
+						...generationState,
+						status: "READY",
+						pack_version: packVersion,
+						heartbeat_at: nowIso,
+						completed_at: nowIso
+					}
+				}
+			}
+		});
+	}
+
+	// Auto-increment candidate index if not provided
+	let candidateIndex = input.candidateIndex;
+	if (!candidateIndex) {
+		const aggregate = await prisma.modelReferenceCandidate.aggregate({
+			where: { model_id: input.modelId, pack_version: packVersion, shot_code: input.shotCode },
+			_max: { candidate_index: true }
+		});
+		candidateIndex = (aggregate._max.candidate_index ?? 0) + 1;
+	}
+
+	const destinationPath = `${input.modelId}/canonical/v${packVersion}/${input.shotCode}/manual-candidate-${candidateIndex}-${Date.now()}.png`;
+
+	const gcsUri = await withRetry({
+		maxAttempts: CANONICAL_UPLOAD_MAX_ATTEMPTS,
+		baseDelayMs: CANONICAL_UPLOAD_BASE_DELAY_MS,
+		jitterMs: 400,
+		shouldRetry: ({ error }) => (error ? isRetryableCanonicalError(error) : false),
+		run: () =>
+			uploadImageFromUriToModelBucket({
+				sourceUri: input.imageDataUrl,
+				destinationPath
+			})
+	});
+
+	const shotPlan = buildCanonicalShotPlan({
+		modelName: model.name,
+		bodyProfile: asRecord(model.body_profile),
+		faceProfile: asRecord(model.face_profile)
+	});
+
+	const shotPrompt = shotPlan.find(s => s.shot_code === input.shotCode)?.prompt ?? "Manual upload canonical candidate";
+
+	const score = await safeScoreCanonicalCandidate({
+		imageUrl: input.imageDataUrl,
+		shotCode: input.shotCode,
+		shotPrompt
+	});
+
+	const candidate = await prisma.modelReferenceCandidate.create({
+		data: {
+			model_id: input.modelId,
+			pack_version: packVersion,
+			shot_code: input.shotCode,
+			candidate_index: candidateIndex,
+			seed: randomInt(10_000, 999_999), // Just a dummy seed for manual uploads
+			prompt_text: shotPrompt,
+			image_gcs_uri: gcsUri,
+			provider: "openai", // Treat manual config as openai/gpu basically
+			provider_model_id: "manual-upload",
+			realism_score: score.realism_score,
+			clarity_score: score.clarity_score,
+			consistency_score: score.consistency_score,
+			composite_score: score.composite_score,
+			qa_notes: "Uploaded manually. " + (score.qa_notes ?? ""),
+			status: "CANDIDATE"
+		}
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "canonical_candidate_uploaded",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.initiatedBy,
+		metadata: {
+			pack_version: packVersion,
+			shot_code: input.shotCode,
+			candidate_id: candidate.id
+		}
+	});
+
+	return candidate;
+}
+
+export async function startCanonicalPackGeneration(input: {
+	modelId: string;
+	initiatedBy: string;
+	provider: ImageModelProvider;
+	providerModelId?: string;
+	candidatesPerShot: number;
+	generationMode?: CanonicalGenerationMode;
+	packVersion?: number;
+	awaitCompletion?: boolean;
+}): Promise<{ job_id: string; pack_version: number }> {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		include: {
+			canonical_references: {
+				where: {
+					pack_version: {
+						gt: 0
+					}
+				},
+				orderBy: [{ pack_version: "desc" }, { sort_order: "asc" }]
+			},
+			source_references: {
+				where: {
+					status: "ACCEPTED"
+				},
+				orderBy: [{ sort_order: "asc" }, { created_at: "asc" }]
+			},
+			model_versions: {
+				where: { is_active: true },
+				take: 1
+			}
+		}
+	});
+
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	if (input.provider === "gpu" && model.model_versions.length === 0) {
+		throw new ApiError(400, "VALIDATION_ERROR", "This Model has no active version for GPU image creation. Use another Image Engine or activate a version.");
+	}
+
+	const generationMode = input.generationMode ?? "front_only";
+	const shotCodes = resolveShotCodesForGenerationMode(generationMode);
+	const requestedCandidatesPerShot = Math.max(1, Math.min(5, Math.trunc(input.candidatesPerShot || 1)));
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const activeGenerationState = readCanonicalGenerationState(onboardingState);
+	const staleFromState = model.canonical_pack_status === "GENERATING" ? isCanonicalGenerationStateStale(activeGenerationState) : false;
+	const staleFromModelUpdatedAt = model.canonical_pack_status === "GENERATING" && !activeGenerationState ? Date.now() - new Date(model.updated_at).getTime() > CANONICAL_JOB_STALE_MS : false;
+	const staleGeneration = staleFromState || staleFromModelUpdatedAt;
+
+	if (model.canonical_pack_status === "GENERATING" && !staleGeneration) {
+		const existingJobId = activeGenerationState?.job_id;
+		const existingPackVersion = activeGenerationState?.pack_version;
+		if (existingJobId && existingPackVersion) {
+			log({
+				level: "info",
+				service: "api",
+				action: "canonical_pack_generation_reused",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: {
+					job_id: existingJobId,
+					pack_version: existingPackVersion,
+					generation_mode: activeGenerationState.generation_mode
+				}
+			});
+
+			return {
+				job_id: existingJobId,
+				pack_version: existingPackVersion
+			};
+		}
+
+		throw new ApiError(
+			409,
+			"CONFLICT",
+			existingPackVersion ? `Reference Set creation is already running for set v${existingPackVersion}. Wait for it to finish, then try again.` : "Reference Set creation is already running for this Model. Please wait for it to finish.",
+			{
+				active_job_id: activeGenerationState?.job_id,
+				pack_version: existingPackVersion
+			}
+		);
+	}
+
+	const maxCandidatePack = await prisma.modelReferenceCandidate.aggregate({
+		where: { model_id: input.modelId },
+		_max: { pack_version: true }
+	});
+	let selectedFrontCandidateUri: string | undefined;
+	let packVersion = Math.max(model.active_canonical_pack_version, maxCandidatePack._max.pack_version ?? 0) + 1;
+
+	if (generationMode === "remaining") {
+		packVersion = input.packVersion ?? 0;
+		if (packVersion <= 0) {
+			throw new ApiError(400, "VALIDATION_ERROR", "A valid set version is required before creating remaining looks. Refresh and try again.");
+		}
+
+		const selectedFrontCandidate = await prisma.modelReferenceCandidate.findFirst({
+			where: {
+				model_id: input.modelId,
+				pack_version: packVersion,
+				shot_code: FRONT_CANONICAL_SHOT_CODE,
+				status: "SELECTED"
+			},
+			select: {
+				image_gcs_uri: true
+			}
+		});
+
+		if (!selectedFrontCandidate?.image_gcs_uri) {
+			throw new ApiError(400, "VALIDATION_ERROR", "Front look approval is required before creating remaining looks. Approve a front look option and try again.");
+		}
+
+		selectedFrontCandidateUri = selectedFrontCandidate.image_gcs_uri;
+	}
+
+	const jobId = randomUUID();
+	const nowIso = new Date().toISOString();
+	const generationPayload: CanonicalGenerationState = {
+		...activeGenerationState,
+		job_id: jobId,
+		pack_version: packVersion,
+		provider: input.provider,
+		provider_model_id: input.providerModelId?.trim() || undefined,
+		generation_mode: generationMode,
+		status: "GENERATING",
+		started_at: nowIso,
+		heartbeat_at: nowIso,
+		completed_at: undefined,
+		completed_shots: 0,
+		total_shots: shotCodes.length,
+		failed_shots: 0,
+		shot_codes: shotCodes
+	};
+	const onboardingStateForGeneration = {
+		...onboardingState,
+		canonical_pack_error: null,
+		canonical_pack_generation: generationPayload
+	};
+
+	if (model.canonical_pack_status === "GENERATING" && staleGeneration) {
+		await prisma.aiModel.update({
+			where: { id: input.modelId },
+			data: {
+				canonical_pack_status: "GENERATING",
+				onboarding_state: onboardingStateForGeneration
+			}
+		});
+	} else {
+		const lock = await prisma.aiModel.updateMany({
+			where: {
+				id: input.modelId,
+				canonical_pack_status: {
+					not: "GENERATING"
+				}
+			},
+			data: {
+				canonical_pack_status: "GENERATING",
+				onboarding_state: onboardingStateForGeneration
+			}
+		});
+
+		if (lock.count === 0) {
+			throw new ApiError(409, "CONFLICT", "Reference Set creation is already running for this Model. Please wait for it to finish.");
+		}
+	}
+
+	log({
+		level: "info",
+		service: "api",
+		action: "canonical_pack_generation_started",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.initiatedBy,
+		metadata: {
+			pack_version: packVersion,
+			provider: input.provider,
+			candidates_per_shot: requestedCandidatesPerShot,
+			generation_mode: generationMode,
+			job_id: jobId,
+			stale_takeover: model.canonical_pack_status === "GENERATING" && staleGeneration
+		}
+	});
+
+	const conditioningReferenceUrls = buildCanonicalConditioningReferences({
+		canonicalReferences: selectedFrontCandidateUri
+			? [selectedFrontCandidateUri, ...model.canonical_references.map(item => item.reference_image_url)]
+			: model.canonical_references.map(item => item.reference_image_url),
+		sourceReferences: (model.source_references ?? []).map(item => item.image_gcs_uri)
+	});
+
+	const generationRequest = {
+		...input,
+		candidatesPerShot: requestedCandidatesPerShot,
+		providerModelId: input.providerModelId?.trim() || undefined,
+		packVersion,
+		jobId,
+		modelName: model.name,
+		bodyProfile: asRecord(model.body_profile),
+		faceProfile: asRecord(model.face_profile),
+		referenceUrls: conditioningReferenceUrls,
+		shotCodes,
+		generationMode
+	};
+
+	if (input.awaitCompletion) {
+		await generateCanonicalPackInternal(generationRequest);
+	} else {
+		// Fire-and-persist generation asynchronously to keep API responsive.
+		void generateCanonicalPackInternal(generationRequest);
+	}
+
+	return {
+		job_id: jobId,
+		pack_version: packVersion
+	};
+}
+
+async function generateCanonicalPackInternal(input: {
+	modelId: string;
+	initiatedBy: string;
+	provider: ImageModelProvider;
+	providerModelId?: string;
+	candidatesPerShot: number;
+	packVersion: number;
+	jobId: string;
+	modelName: string;
+	bodyProfile: Record<string, unknown> | null;
+	faceProfile: Record<string, unknown> | null;
+	referenceUrls: string[];
+	shotCodes: CanonicalShotCode[];
+	generationMode: CanonicalGenerationMode;
+}) {
+	let completedShots = 0;
+	let totalShots: number = input.shotCodes.length;
+
+	try {
+		const isCurrentJob = await ensureCanonicalJobStillCurrent(input.modelId, input.jobId);
+		if (!isCurrentJob) {
+			log({
+				level: "warn",
+				service: "api",
+				action: "canonical_pack_generation_superseded",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: { job_id: input.jobId, pack_version: input.packVersion }
+			});
+			return;
+		}
+
+		const env = getEnv();
+		const fullShotPlan = buildCanonicalShotPlan({
+			modelName: input.modelName,
+			bodyProfile: input.bodyProfile,
+			faceProfile: input.faceProfile
+		});
+		const shotPlanByCode = new Map(fullShotPlan.map(shot => [shot.shot_code, shot] as const));
+		const shotPlan = input.shotCodes.flatMap(shotCode => {
+			const shot = shotPlanByCode.get(shotCode);
+			return shot ? [shot] : [];
+		});
+		totalShots = shotPlan.length;
+		if (totalShots === 0) {
+			throw new ApiError(400, "VALIDATION_ERROR", "This generation mode has no available reference angles. Choose a different mode and try again.");
+		}
+		const preferredProviderModelId = resolveProviderModelId(input.provider, env, input.providerModelId);
+		const resolvedReferenceUrls = await resolveCanonicalConditioningReferenceUrls(input.referenceUrls);
+		if (input.referenceUrls.length > 0 && resolvedReferenceUrls.length === 0) {
+			log({
+				level: "warn",
+				service: "api",
+				action: "canonical_reference_resolution_empty",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: {
+					provided_reference_count: input.referenceUrls.length,
+					resolved_reference_count: resolvedReferenceUrls.length,
+					mode: "text_only_fallback"
+				}
+			});
+		}
+		const shotErrors: string[] = [];
+
+		await updateCanonicalGenerationState({
+			modelId: input.modelId,
+			jobId: input.jobId,
+			packVersion: input.packVersion,
+			generationMode: input.generationMode,
+			shotCodes: input.shotCodes,
+			status: "GENERATING",
+			provider: input.provider,
+			providerModelId: preferredProviderModelId,
+			completedShots,
+			totalShots,
+			failedShots: 0,
+			error: null
+		});
+
+		for (let shotIndex = 0; shotIndex < shotPlan.length; shotIndex += 1) {
+			const shot = shotPlan[shotIndex]!;
+
+			// Rate-limit delay between shots (skip for first shot)
+			if (shotIndex > 0) {
+				await sleep(CANONICAL_SHOT_DELAY_MS);
+			}
+
+			const stillCurrent = await ensureCanonicalJobStillCurrent(input.modelId, input.jobId);
+			if (!stillCurrent) {
+				log({
+					level: "warn",
+					service: "api",
+					action: "canonical_pack_generation_superseded",
+					entity_type: "ai_model",
+					entity_id: input.modelId,
+					user_id: input.initiatedBy,
+					metadata: {
+						shot_code: shot.shot_code,
+						job_id: input.jobId,
+						pack_version: input.packVersion
+					}
+				});
+				return;
+			}
+
+			try {
+				const seedBase = randomInt(10_000, 999_999);
+				const seeds = Array.from({ length: input.candidatesPerShot }, (_, index) => seedBase + index * 37);
+				const response = await withRetry({
+					maxAttempts: CANONICAL_SHOT_MAX_ATTEMPTS,
+					baseDelayMs: CANONICAL_RETRY_BASE_DELAY_MS,
+					jitterMs: 400,
+					shouldRetry: ({ error }) => (error ? isRetryableCanonicalError(error) : false),
+					onRetry: ({ nextAttempt, maxAttempts, delayMs, error }) => {
+						log({
+							level: "warn",
+							service: "api",
+							action: "canonical_shot_retry_scheduled",
+							entity_type: "ai_model",
+							entity_id: input.modelId,
+							user_id: input.initiatedBy,
+							error: error instanceof Error ? error.message : String(error),
+							metadata: {
+								pack_version: input.packVersion,
+								shot_code: shot.shot_code,
+								attempt: nextAttempt,
+								max_attempts: maxAttempts,
+								retry_in_ms: Math.round(delayMs)
+							}
+						});
+					},
+					run: () =>
+						withTimeout(
+							generateShotWithFallback({
+								provider: input.provider,
+								env,
+								requestedModelId: input.providerModelId,
+								jobId: `${input.jobId}_${shot.shot_code}`,
+								prompt: shot.prompt,
+								seeds,
+								outputPathPrefix: `${input.modelId}/canonical/v${input.packVersion}/${shot.shot_code}/`,
+								references: resolvedReferenceUrls
+							}),
+							CANONICAL_SHOT_TIMEOUT_MS,
+							`Shot ${shot.shot_code} timed out`
+						)
+				});
+
+				const assets = (response.assets ?? []).slice(0, input.candidatesPerShot);
+				if (assets.length === 0) {
+					throw new ApiError(502, "INTERNAL_ERROR", "The Image Engine returned no images. Try again or switch Image Engines.");
+				}
+
+				let candidateIndex = await nextCandidateIndexForShot(input.modelId, input.packVersion, shot.shot_code);
+				let persistedCandidates = 0;
+
+				for (const asset of assets) {
+					const assignedCandidateIndex = candidateIndex;
+					candidateIndex += 1;
+
+					try {
+						const destinationPath = `${input.modelId}/canonical/v${input.packVersion}/${shot.shot_code}/candidate-${assignedCandidateIndex}-${Date.now()}.png`;
+						let gcsUri = asset.uri;
+
+						try {
+							gcsUri = await withRetry({
+								maxAttempts: CANONICAL_UPLOAD_MAX_ATTEMPTS,
+								baseDelayMs: CANONICAL_UPLOAD_BASE_DELAY_MS,
+								jitterMs: 400,
+								shouldRetry: ({ error }) => (error ? isRetryableCanonicalError(error) : false),
+								run: () =>
+									uploadImageFromUriToModelBucket({
+										sourceUri: asset.uri,
+										destinationPath
+									})
+							});
+						} catch (uploadError) {
+							if (process.env.NODE_ENV === "production") {
+								throw uploadError;
+							}
+
+							log({
+								level: "warn",
+								service: "api",
+								action: "canonical_candidate_upload_fallback",
+								entity_type: "ai_model",
+								entity_id: input.modelId,
+								user_id: input.initiatedBy,
+								error: uploadError instanceof Error ? uploadError.message : "Unknown GCS upload failure",
+								metadata: {
+									pack_version: input.packVersion,
+									shot_code: shot.shot_code,
+									destination_path: destinationPath,
+									fallback: "source_uri"
+								}
+							});
+						}
+
+						const score = await safeScoreCanonicalCandidate({
+							imageUrl: asset.uri,
+							shotCode: shot.shot_code,
+							shotPrompt: shot.prompt
+						});
+
+						await prisma.modelReferenceCandidate.create({
+							data: {
+								model_id: input.modelId,
+								pack_version: input.packVersion,
+								shot_code: shot.shot_code,
+								candidate_index: assignedCandidateIndex,
+								seed: asset.seed,
+								prompt_text: shot.prompt,
+								image_gcs_uri: gcsUri,
+								provider: response.provider,
+								provider_model_id: response.provider_model_id,
+								realism_score: score.realism_score,
+								clarity_score: score.clarity_score,
+								consistency_score: score.consistency_score,
+								composite_score: score.composite_score,
+								qa_notes: score.qa_notes,
+								status: "CANDIDATE"
+							}
+						});
+
+						persistedCandidates += 1;
+					} catch (candidateError) {
+						log({
+							level: "warn",
+							service: "api",
+							action: "canonical_candidate_persist_failed",
+							entity_type: "ai_model",
+							entity_id: input.modelId,
+							user_id: input.initiatedBy,
+							error: candidateError instanceof Error ? candidateError.message : "Unknown candidate persist failure",
+							metadata: {
+								pack_version: input.packVersion,
+								shot_code: shot.shot_code,
+								candidate_index: assignedCandidateIndex
+							}
+						});
+					}
+				}
+
+				if (persistedCandidates === 0) {
+					throw new ApiError(502, "INTERNAL_ERROR", "No options were saved for this angle. Try again.");
+				}
+
+				completedShots += 1;
+			} catch (shotError) {
+				const shotMsg = shotError instanceof Error ? shotError.message : "Unknown shot error";
+				shotErrors.push(`Shot ${shot.shot_code}: ${shotMsg}`);
+				log({
+					level: "warn",
+					service: "api",
+					action: "canonical_shot_failed",
+					entity_type: "ai_model",
+					entity_id: input.modelId,
+					user_id: input.initiatedBy,
+					error: shotMsg,
+					metadata: {
+						shot_code: shot.shot_code,
+						pack_version: input.packVersion,
+						shot_index: shotIndex
+					}
+				});
+
+				// If we hit a rate limit, add extra delay before next shot
+				if (isRateLimitErrorMessage(shotMsg)) {
+					await sleep(CANONICAL_RATE_LIMIT_DELAY_MS);
+				}
+			}
+
+			const updateError = buildCanonicalFailureMessage({
+				completedShots,
+				totalShots,
+				shotErrors
+			});
+
+			await updateCanonicalGenerationState({
+				modelId: input.modelId,
+				jobId: input.jobId,
+				packVersion: input.packVersion,
+				generationMode: input.generationMode,
+				shotCodes: input.shotCodes,
+				status: "GENERATING",
+				provider: input.provider,
+				providerModelId: preferredProviderModelId,
+				completedShots,
+				totalShots,
+				failedShots: shotErrors.length,
+				error: updateError
+			});
+		}
+
+		if (completedShots === 0) {
+			throw new ApiError(502, "INTERNAL_ERROR", "Reference Set creation failed for every angle. Try again or switch Image Engines.");
+		}
+
+		const finalError = buildCanonicalFailureMessage({
+			completedShots,
+			totalShots,
+			shotErrors
+		});
+		const persisted = await updateCanonicalGenerationState({
+			modelId: input.modelId,
+			jobId: input.jobId,
+			packVersion: input.packVersion,
+			generationMode: input.generationMode,
+			shotCodes: input.shotCodes,
+			status: "READY",
+			provider: input.provider,
+			providerModelId: preferredProviderModelId,
+			completedShots,
+			totalShots,
+			failedShots: shotErrors.length,
+			error: finalError
+		});
+
+		if (!persisted) {
+			log({
+				level: "warn",
+				service: "api",
+				action: "canonical_pack_generation_superseded",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: {
+					pack_version: input.packVersion,
+					job_id: input.jobId,
+					stage: "complete"
+				}
+			});
+			return;
+		}
+
+		log({
+			level: "info",
+			service: "api",
+			action: "canonical_pack_generation_completed",
+			entity_type: "ai_model",
+			entity_id: input.modelId,
+			user_id: input.initiatedBy,
+			metadata: {
+				pack_version: input.packVersion,
+				job_id: input.jobId,
+				completed_shots: completedShots,
+				total_shots: shotPlan.length,
+				generation_mode: input.generationMode,
+				errors: shotErrors.length > 0 ? shotErrors : undefined
+			}
+		});
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : "Unknown canonical generation error";
+		const persisted = await updateCanonicalGenerationState({
+			modelId: input.modelId,
+			jobId: input.jobId,
+			packVersion: input.packVersion,
+			generationMode: input.generationMode,
+			shotCodes: input.shotCodes,
+			status: "FAILED",
+			provider: input.provider,
+			providerModelId: input.providerModelId,
+			completedShots,
+			totalShots,
+			failedShots: Math.max(totalShots - completedShots, 1),
+			error: errorMessage
+		});
+
+		if (!persisted) {
+			log({
+				level: "warn",
+				service: "api",
+				action: "canonical_pack_generation_superseded",
+				entity_type: "ai_model",
+				entity_id: input.modelId,
+				user_id: input.initiatedBy,
+				metadata: {
+					pack_version: input.packVersion,
+					job_id: input.jobId,
+					stage: "failed"
+				}
+			});
+			return;
+		}
+
+		log({
+			level: "error",
+			service: "api",
+			action: "canonical_pack_generation_failed",
+			entity_type: "ai_model",
+			entity_id: input.modelId,
+			user_id: input.initiatedBy,
+			error: errorMessage,
+			metadata: {
+				pack_version: input.packVersion,
+				job_id: input.jobId,
+				generation_mode: input.generationMode
+			}
+		});
+	}
+}
+
+export async function getCanonicalPackSummary(input: { modelId: string; packVersion?: number }) {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			canonical_pack_status: true,
+			active_canonical_pack_version: true,
+			onboarding_state: true
+		}
+	});
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const generationState = readCanonicalGenerationState(onboardingState);
+	let effectiveStatus = model.canonical_pack_status;
+	let effectiveError = typeof onboardingState.canonical_pack_error === "string" ? onboardingState.canonical_pack_error : null;
+	let effectiveGenerationState = generationState;
+	const staleGeneration = effectiveStatus === "GENERATING" && isCanonicalGenerationStateStale(generationState);
+
+	if (staleGeneration) {
+		const nowIso = new Date().toISOString();
+		const staleError = `Canonical generation timed out after ${Math.round(CANONICAL_JOB_STALE_MS / 60_000)} minutes without heartbeat. Retry generation.`;
+		const failedGenerationState: CanonicalGenerationState = {
+			...generationState,
+			status: "FAILED",
+			heartbeat_at: nowIso,
+			completed_at: nowIso,
+			failed_shots: Math.max(generationState?.failed_shots ?? 0, 1)
+		};
+
+		const staleTakeover = await prisma.aiModel.updateMany({
+			where: {
+				id: input.modelId,
+				canonical_pack_status: "GENERATING"
+			},
+			data: {
+				canonical_pack_status: "FAILED",
+				onboarding_state: {
+					...onboardingState,
+					canonical_pack_error: staleError,
+					canonical_pack_generation: failedGenerationState
+				}
+			}
+		});
+
+		if (staleTakeover.count > 0) {
+			effectiveStatus = "FAILED";
+			effectiveError = staleError;
+			effectiveGenerationState = failedGenerationState;
+		}
+	}
+
+	const latestCandidatePack = await latestPackVersion(input.modelId);
+	const packVersion = inferPackVersion({
+		requestedPackVersion: input.packVersion,
+		activePackVersion: model.active_canonical_pack_version,
+		latestCandidatePackVersion: latestCandidatePack,
+		generationPackVersion: effectiveGenerationState?.pack_version
+	});
+
+	if (!packVersion || packVersion <= 0) {
+		return {
+			pack_version: 0,
+			status: effectiveStatus,
+			error: effectiveError,
+			shots: REQUIRED_CANONICAL_SHOT_CODES.map(shot => ({
+				shot_code: shot,
+				recommended_candidate_id: undefined,
+				candidates: []
+			}))
+		};
+	}
+
+	const candidates = await prisma.modelReferenceCandidate.findMany({
+		where: {
+			model_id: input.modelId,
+			pack_version: packVersion
+		},
+		orderBy: [{ shot_code: "asc" }, { composite_score: "desc" }, { candidate_index: "asc" }]
+	});
+
+	// D1 fix: resolve signed URLs for unique GCS URIs only (avoids N+1 GCS calls)
+	const uniqueUris = [...new Set(candidates.map(c => c.image_gcs_uri))];
+	const resolvedUrlMap = new Map<string, string | null>();
+	await mapWithConcurrency(uniqueUris, 12, async uri => {
+		resolvedUrlMap.set(uri, await resolveCandidatePreviewUrl(uri));
+	});
+	const candidatesWithPreview = candidates.map(candidate => ({
+		...candidate,
+		preview_image_url: resolvedUrlMap.get(candidate.image_gcs_uri) ?? null
+	}));
+
+	const grouped = REQUIRED_CANONICAL_SHOT_CODES.map(shotCode => {
+		const shotCandidates = candidatesWithPreview.filter(item => item.shot_code === shotCode);
+		const recommended = [...shotCandidates].sort((a, b) => Number(b.composite_score ?? 0) - Number(a.composite_score ?? 0))[0];
+
+		return {
+			shot_code: shotCode,
+			recommended_candidate_id: recommended?.id,
+			candidates: shotCandidates
+		};
+	});
+	const completedShots = grouped.filter(shot => shot.candidates.length > 0).length;
+	const totalShots = REQUIRED_CANONICAL_SHOT_CODES.length;
+	const generationProgressMatchesPack = effectiveGenerationState?.pack_version === packVersion;
+	const completedFromState = generationProgressMatchesPack ? effectiveGenerationState?.completed_shots : undefined;
+	const totalFromState = generationProgressMatchesPack ? effectiveGenerationState?.total_shots : undefined;
+
+	return {
+		pack_version: packVersion,
+		status: effectiveStatus,
+		error: effectiveError,
+		progress: {
+			completed_shots: Math.max(completedShots, completedFromState ?? 0),
+			total_shots: totalFromState && totalFromState > 0 ? totalFromState : totalShots,
+			generated_candidates: candidatesWithPreview.length
+		},
+		shots: grouped
+	};
+}
+
+export async function approveCanonicalPack(input: { modelId: string; packVersion: number; selections: Array<{ shot_code: string; candidate_id: string }>; approvedBy: string }) {
+	validateSelectionShape(input.selections);
+
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			id: true,
+			status: true,
+			body_profile: true,
+			face_profile: true
+		}
+	});
+
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const candidates = await prisma.modelReferenceCandidate.findMany({
+		where: {
+			model_id: input.modelId,
+			pack_version: input.packVersion
+		}
+	});
+
+	for (const selection of input.selections) {
+		const candidate = candidates.find(item => item.id === selection.candidate_id);
+		if (!candidate) {
+			throw new ApiError(400, "VALIDATION_ERROR", "One selected option is not valid for this Reference Set. Refresh and choose an option again.");
+		}
+
+		if (candidate.shot_code !== selection.shot_code) {
+			throw new ApiError(400, "VALIDATION_ERROR", "A selected option does not match its angle. Refresh and choose one option for each angle.");
+		}
+	}
+
+	const selectedIds = new Set(input.selections.map(item => item.candidate_id));
+	const selectedCandidates = candidates.filter(item => selectedIds.has(item.id));
+	const selectedCanonicalCount = selectedCandidates.length;
+
+	await prisma.$transaction(async tx => {
+		await tx.modelReferenceCandidate.updateMany({
+			where: {
+				model_id: input.modelId,
+				pack_version: input.packVersion
+			},
+			data: {
+				status: "REJECTED"
+			}
+		});
+
+		await tx.modelReferenceCandidate.updateMany({
+			where: {
+				id: {
+					in: Array.from(selectedIds)
+				}
+			},
+			data: {
+				status: "SELECTED"
+			}
+		});
+
+		await tx.canonicalReference.deleteMany({
+			where: {
+				model_id: input.modelId,
+				pack_version: input.packVersion
+			}
+		});
+
+		await tx.canonicalReference.createMany({
+			data: input.selections.map((selection, index) => {
+				const candidate = selectedCandidates.find(item => item.id === selection.candidate_id);
+				if (!candidate) {
+					throw new ApiError(400, "VALIDATION_ERROR", "One selected option could not be found. Refresh and choose your options again.");
+				}
+
+				return {
+					model_id: input.modelId,
+					pack_version: input.packVersion,
+					shot_code: selection.shot_code,
+					source_candidate_id: selection.candidate_id,
+					seed: candidate.seed,
+					prompt_text: candidate.prompt_text,
+					reference_image_url: candidate.image_gcs_uri,
+					notes: candidate.qa_notes,
+					sort_order: index
+				};
+			})
+		});
+
+		const nextStatus = deriveModelStatusForWorkflow(
+			{
+				...model,
+				canonical_pack_status: "APPROVED",
+				active_canonical_pack_version: input.packVersion
+			},
+			selectedCanonicalCount
+		);
+
+		await tx.aiModel.update({
+			where: { id: input.modelId },
+			data: {
+				canonical_pack_status: "APPROVED",
+				active_canonical_pack_version: input.packVersion,
+				status: nextStatus
+			}
+		});
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "canonical_pack_approved",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.approvedBy,
+		metadata: {
+			pack_version: input.packVersion,
+			selected_count: selectedCanonicalCount
+		}
+	});
+}
+
+export async function approveCanonicalFrontCandidate(input: { modelId: string; packVersion: number; candidateId: string; approvedBy: string }) {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			id: true,
+			onboarding_state: true
+		}
+	});
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const selectedCandidate = await prisma.modelReferenceCandidate.findFirst({
+		where: {
+			id: input.candidateId,
+			model_id: input.modelId,
+			pack_version: input.packVersion
+		},
+		select: {
+			id: true,
+			seed: true,
+			prompt_text: true,
+			image_gcs_uri: true,
+			qa_notes: true,
+			shot_code: true
+		}
+	});
+	if (!selectedCandidate) {
+		throw new ApiError(400, "VALIDATION_ERROR", "The selected front look option is not valid for this Reference Set. Refresh and choose a front option again.");
+	}
+	if (selectedCandidate.shot_code !== FRONT_CANONICAL_SHOT_CODE) {
+		throw new ApiError(400, "VALIDATION_ERROR", "Front approval only works with the frontal closeup angle. Select a front look option and try again.");
+	}
+
+	await prisma.$transaction(async tx => {
+		await tx.modelReferenceCandidate.updateMany({
+			where: {
+				model_id: input.modelId,
+				pack_version: input.packVersion,
+				shot_code: FRONT_CANONICAL_SHOT_CODE
+			},
+			data: {
+				status: "REJECTED"
+			}
+		});
+
+		await tx.modelReferenceCandidate.update({
+			where: { id: selectedCandidate.id },
+			data: {
+				status: "SELECTED"
+			}
+		});
+
+		await tx.canonicalReference.deleteMany({
+			where: {
+				model_id: input.modelId,
+				pack_version: input.packVersion,
+				shot_code: FRONT_CANONICAL_SHOT_CODE
+			}
+		});
+
+		await tx.canonicalReference.create({
+			data: {
+				model_id: input.modelId,
+				pack_version: input.packVersion,
+				shot_code: FRONT_CANONICAL_SHOT_CODE,
+				source_candidate_id: selectedCandidate.id,
+				seed: selectedCandidate.seed,
+				prompt_text: selectedCandidate.prompt_text,
+				reference_image_url: selectedCandidate.image_gcs_uri,
+				notes: selectedCandidate.qa_notes,
+				sort_order: 0
+			}
+		});
+
+		const onboardingState = asRecord(model.onboarding_state) ?? {};
+		await tx.aiModel.update({
+			where: { id: input.modelId },
+			data: {
+				canonical_pack_status: "READY",
+				onboarding_state: {
+					...onboardingState,
+					canonical_pack_error: null,
+					canonical_pack_front_approved_at: new Date().toISOString()
+				}
+			}
+		});
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "canonical_pack_front_approved",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.approvedBy,
+		metadata: {
+			pack_version: input.packVersion,
+			candidate_id: input.candidateId
+		}
+	});
+}
+
+export async function finalizeWorkflowModel(input: { modelId: string; finalizedBy: string }) {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		include: {
+			model_versions: {
+				where: { is_active: true },
+				take: 1
+			}
+		}
+	});
+	if (!model) {
+		throw new ApiError(404, "NOT_FOUND", "We couldn't find this model. Please refresh and try again.");
+	}
+
+	const selectedCanonicalCount = await prisma.canonicalReference.count({
+		where: {
+			model_id: input.modelId,
+			pack_version: model.active_canonical_pack_version
+		}
+	});
+	const acceptedImportedReferenceCount = await prisma.modelSourceReference.count({
+		where: {
+			model_id: input.modelId,
+			status: "ACCEPTED"
+		}
+	});
+
+	const nextStatus = deriveModelStatusForWorkflow(model, selectedCanonicalCount, acceptedImportedReferenceCount);
+
+	const updated = await prisma.aiModel.update({
+		where: { id: input.modelId },
+		data: {
+			status: nextStatus
+		},
+		include: {
+			model_versions: {
+				where: { is_active: true },
+				take: 1
+			}
+		}
+	});
+
+	log({
+		level: "info",
+		service: "api",
+		action: "model_workflow_finalized",
+		entity_type: "ai_model",
+		entity_id: input.modelId,
+		user_id: input.finalizedBy,
+		metadata: {
+			status: updated.status,
+			canonical_pack_status: updated.canonical_pack_status,
+			active_pack_version: updated.active_canonical_pack_version
+		}
+	});
+
+	return {
+		model: updated,
+		capabilities: buildModelCapabilityFlags(updated.model_versions.length > 0)
+	};
+}
+
+async function latestPackVersion(modelId: string): Promise<number> {
+	const aggregate = await prisma.modelReferenceCandidate.aggregate({
+		where: {
+			model_id: modelId
+		},
+		_max: {
+			pack_version: true
+		}
+	});
+
+	return aggregate._max.pack_version ?? 0;
+}
+
+async function nextCandidateIndexForShot(modelId: string, packVersion: number, shotCode: string): Promise<number> {
+	const aggregate = await prisma.modelReferenceCandidate.aggregate({
+		where: {
+			model_id: modelId,
+			pack_version: packVersion,
+			shot_code: shotCode
+		},
+		_max: {
+			candidate_index: true
+		}
+	});
+
+	return (aggregate._max.candidate_index ?? 0) + 1;
+}
+
+async function safeScoreCanonicalCandidate(input: { imageUrl: string; shotCode: string; shotPrompt: string }) {
+	try {
+		return await withTimeout(scoreCanonicalCandidate(input), 60_000, `Scoring timed out for ${input.shotCode}`);
+	} catch (error) {
+		log({
+			level: "warn",
+			service: "api",
+			action: "canonical_candidate_score_fallback",
+			error: error instanceof Error ? error.message : "Unknown scoring failure",
+			metadata: {
+				shot_code: input.shotCode
+			}
+		});
+
+		return {
+			realism_score: 0.8,
+			clarity_score: 0.8,
+			consistency_score: 0.8,
+			composite_score: 0.8,
+			qa_notes: "Scoring fallback applied after QA service timeout/failure.",
+			source: "heuristic" as const
+		};
+	}
+}
+
+function inferPackVersion(input: { requestedPackVersion?: number; activePackVersion: number; latestCandidatePackVersion: number; generationPackVersion?: number }): number {
+	if (input.requestedPackVersion && input.requestedPackVersion > 0) {
+		return input.requestedPackVersion;
+	}
+
+	const inferred = Math.max(input.activePackVersion, input.latestCandidatePackVersion, input.generationPackVersion ?? 0);
+	return inferred > 0 ? inferred : 0;
+}
+
+function buildCanonicalFailureMessage(input: { completedShots: number; totalShots: number; shotErrors: string[] }): string | null {
+	if (input.shotErrors.length === 0) return null;
+
+	const preview = input.shotErrors.slice(0, CANONICAL_ERROR_PREVIEW_LIMIT);
+	const suffix = input.shotErrors.length > preview.length ? `; +${input.shotErrors.length - preview.length} more` : "";
+	return `${input.completedShots}/${input.totalShots} shots completed. Failures: ${preview.join("; ")}${suffix}`;
+}
+
+async function ensureCanonicalJobStillCurrent(modelId: string, jobId: string): Promise<boolean> {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: modelId },
+		select: {
+			onboarding_state: true
+		}
+	});
+	if (!model) return false;
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const generationState = readCanonicalGenerationState(onboardingState);
+	if (!generationState?.job_id) return true;
+	return generationState.job_id === jobId;
+}
+
+async function updateCanonicalGenerationState(input: {
+	modelId: string;
+	jobId: string;
+	packVersion: number;
+	generationMode: CanonicalGenerationMode;
+	shotCodes: CanonicalShotCode[];
+	status: "GENERATING" | "READY" | "FAILED";
+	provider: ImageModelProvider;
+	providerModelId?: string;
+	completedShots: number;
+	totalShots: number;
+	failedShots: number;
+	error: string | null;
+}): Promise<boolean> {
+	const model = await prisma.aiModel.findUnique({
+		where: { id: input.modelId },
+		select: {
+			onboarding_state: true
+		}
+	});
+	if (!model) return false;
+
+	const onboardingState = asRecord(model.onboarding_state) ?? {};
+	const existingGeneration = readCanonicalGenerationState(onboardingState);
+	if (existingGeneration?.job_id && existingGeneration.job_id !== input.jobId) {
+		return false;
+	}
+
+	const nowIso = new Date().toISOString();
+	const nextGeneration: CanonicalGenerationState = {
+		...existingGeneration,
+		job_id: input.jobId,
+		pack_version: input.packVersion,
+		provider: input.provider,
+		provider_model_id: input.providerModelId?.trim() || existingGeneration?.provider_model_id,
+		generation_mode: input.generationMode,
+		status: input.status,
+		started_at: existingGeneration?.started_at ?? nowIso,
+		heartbeat_at: nowIso,
+		completed_at: input.status === "GENERATING" ? undefined : nowIso,
+		completed_shots: input.completedShots,
+		total_shots: input.totalShots,
+		failed_shots: input.failedShots,
+		shot_codes: input.shotCodes
+	};
+
+	await prisma.aiModel.update({
+		where: { id: input.modelId },
+		data: {
+			canonical_pack_status: input.status,
+			onboarding_state: {
+				...onboardingState,
+				canonical_pack_error: input.error,
+				canonical_pack_generation: nextGeneration
+			}
+		}
+	});
+
+	return true;
+}
+
+function readCanonicalGenerationState(onboardingState: Record<string, unknown>): CanonicalGenerationState | null {
+	const raw = asRecord(onboardingState.canonical_pack_generation);
+	if (!raw) return null;
+
+	return {
+		job_id: readOptionalString(raw.job_id),
+		pack_version: readOptionalPositiveInt(raw.pack_version),
+		provider: asImageModelProvider(raw.provider),
+		provider_model_id: readOptionalString(raw.provider_model_id),
+		generation_mode: asCanonicalGenerationMode(raw.generation_mode),
+		status: readCanonicalStatus(raw.status),
+		started_at: readOptionalString(raw.started_at),
+		heartbeat_at: readOptionalString(raw.heartbeat_at),
+		completed_at: readOptionalString(raw.completed_at),
+		completed_shots: readOptionalNonNegativeInt(raw.completed_shots),
+		total_shots: readOptionalPositiveInt(raw.total_shots),
+		failed_shots: readOptionalNonNegativeInt(raw.failed_shots),
+		shot_codes: readCanonicalShotCodes(raw.shot_codes)
+	};
+}
+
+function isCanonicalGenerationStateStale(state: CanonicalGenerationState | null | undefined): boolean {
+	if (!state) return false;
+
+	const heartbeat = state.heartbeat_at ?? state.started_at;
+	if (!heartbeat) return false;
+
+	const heartbeatMs = Date.parse(heartbeat);
+	if (!Number.isFinite(heartbeatMs)) return false;
+
+	return Date.now() - heartbeatMs > CANONICAL_JOB_STALE_MS;
+}
+
+function asImageModelProvider(value: unknown): ImageModelProvider | undefined {
+	if (value === "gpu" || value === "openai" || value === "nano_banana_2" || value === "zai_glm") {
+		return value;
+	}
+	return undefined;
+}
+
+function asCanonicalGenerationMode(value: unknown): CanonicalGenerationMode | undefined {
+	if (value === "front_only" || value === "remaining" || value === "full") {
+		return value;
+	}
+	return undefined;
+}
+
+function readCanonicalShotCodes(value: unknown): CanonicalShotCode[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const parsed = value.map(item => (typeof item === "string" ? item : "")).filter((item): item is CanonicalShotCode => REQUIRED_CANONICAL_SHOT_CODES.includes(item as CanonicalShotCode));
+	return parsed.length > 0 ? Array.from(new Set(parsed)) : undefined;
+}
+
+function readCanonicalStatus(value: unknown): CanonicalGenerationState["status"] | undefined {
+	if (value === "GENERATING" || value === "READY" || value === "FAILED") {
+		return value;
+	}
+	return undefined;
+}
+
+function readOptionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function readOptionalPositiveInt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function readOptionalNonNegativeInt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function isRateLimitErrorMessage(message: string): boolean {
+	const lower = message.toLowerCase();
+	return lower.includes("429") || lower.includes("rate") || lower.includes("quota");
+}
+
+function isRetryableCanonicalError(error: unknown): boolean {
+	if (error instanceof ApiError) {
+		if (error.status === 429 || (error.status >= 500 && error.status <= 504)) {
+			return true;
+		}
+
+		const details = asRecord(error.details);
+		const detailStatus = details?.status;
+		if (typeof detailStatus === "number" && (detailStatus === 429 || (detailStatus >= 500 && detailStatus <= 504))) {
+			return true;
+		}
+	}
+
+	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+	return (
+		message.includes("429") ||
+		message.includes("rate") ||
+		message.includes("quota") ||
+		message.includes("timeout") ||
+		message.includes("timed out") ||
+		message.includes("temporar") ||
+		message.includes("econn") ||
+		message.includes("socket") ||
+		message.includes("network") ||
+		message.includes("fetch failed") ||
+		message.includes("503") ||
+		message.includes("502") ||
+		message.includes("504")
+	);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<T>((_, reject) => {
+				timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+			})
+		]);
+	} finally {
+		if (timeout) clearTimeout(timeout);
+	}
+}
+
+async function generateShotWithFallback(input: {
+	provider: ImageModelProvider;
+	env: ReturnType<typeof getEnv>;
+	requestedModelId?: string;
+	jobId: string;
+	prompt: string;
+	seeds: number[];
+	outputPathPrefix: string;
+	references: string[];
+}): Promise<{
+	provider: ImageModelProvider;
+	provider_model_id: string;
+	assets?: Array<{
+		uri: string;
+		seed: number;
+		width: number;
+		height: number;
+		generation_time_ms: number;
+	}>;
+}> {
+	const references = input.references.map((url, index) => ({
+		url,
+		source: "external_url" as const,
+		weight: index === 0 ? ("primary" as const) : ("secondary" as const),
+		title: `model_identity_reference_${index + 1}`
+	}));
+
+	const runGenerate = async (provider: ImageModelProvider) => {
+		const providerModelId = resolveProviderModelId(provider, input.env, provider === input.provider ? input.requestedModelId : undefined);
+		const result = await getImageProvider(provider).generate({
+			job_id: input.jobId,
+			model_provider: provider,
+			model_id: providerModelId,
+			prompt_text: input.prompt,
+			negative_prompt: "deformed anatomy, blurry face, low detail, watermark, stylized anime look, plastic skin",
+			width: 1024,
+			height: 1024,
+			batch_size: input.seeds.length,
+			seeds: input.seeds,
+			upscale: false,
+			output_path_prefix: input.outputPathPrefix,
+			model_config: {
+				base_model: providerModelId
+			},
+			creative_controls: createDefaultCreativeControls(),
+			references
+		});
+
+		return {
+			provider,
+			provider_model_id: providerModelId,
+			assets: result.assets
+		};
+	};
+
+	const providerOrder =
+		input.provider === "openai"
+			? (["openai", "nano_banana_2"] as const)
+			: input.provider === "zai_glm"
+				? (["zai_glm", "nano_banana_2"] as const)
+				: input.provider === "nano_banana_2"
+					? (["nano_banana_2"] as const)
+					: ([input.provider] as const);
+
+	let lastError: unknown;
+	for (const provider of providerOrder) {
+		try {
+			const generated = await runGenerate(provider);
+			if ((generated.assets ?? []).length === 0) {
+				throw new ApiError(502, "INTERNAL_ERROR", "The Image Engine returned no images. Try again or switch Image Engines.");
+			}
+
+			return generated;
+		} catch (error) {
+			lastError = error;
+			const hasFallback = provider !== providerOrder[providerOrder.length - 1];
+			if (!hasFallback) {
+				throw error;
+			}
+		}
+	}
+
+	if (lastError) {
+		throw lastError;
+	}
+	throw new ApiError(502, "INTERNAL_ERROR", "We couldn't create the Reference Set images. Please try again.");
+}
+
+function resolveProviderModelId(provider: ImageModelProvider, env: ReturnType<typeof getEnv>, requestedModelId?: string): string {
+	if (requestedModelId && requestedModelId.trim().length > 0) {
+		return requestedModelId.trim();
+	}
+
+	if (provider === "openai") return env.OPENAI_IMAGE_MODEL;
+	if (provider === "nano_banana_2") return env.NANO_BANANA_MODEL;
+	if (provider === "zai_glm") return env.ZAI_IMAGE_MODEL;
+	return "sdxl-1.0";
+}
+
+export function buildCanonicalConditioningReferences(input: { canonicalReferences: string[]; sourceReferences: string[] }): string[] {
+	const deduped: string[] = [];
+	const seen = new Set<string>();
+
+	// Prioritize freshly imported references, then fall back to older canonical images.
+	for (const url of [...input.sourceReferences, ...input.canonicalReferences]) {
+		const trimmed = url.trim();
+		if (!trimmed) continue;
+		const key = trimmed.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(trimmed);
+		if (deduped.length >= MAX_CANONICAL_CONDITIONING_REFERENCES) {
+			break;
+		}
+	}
+
+	return deduped;
+}
+
+function resolveShotCodesForGenerationMode(mode: CanonicalGenerationMode): CanonicalShotCode[] {
+	if (mode === "front_only") {
+		return [FRONT_CANONICAL_SHOT_CODE];
+	}
+
+	if (mode === "remaining") {
+		return REQUIRED_CANONICAL_SHOT_CODES.filter(shotCode => shotCode !== FRONT_CANONICAL_SHOT_CODE);
+	}
+
+	return [...REQUIRED_CANONICAL_SHOT_CODES];
+}
+
+async function resolveCanonicalConditioningReferenceUrls(referenceUrls: string[]): Promise<string[]> {
+	const resolved = await mapWithConcurrency(referenceUrls, CANONICAL_REFERENCE_RESOLVE_CONCURRENCY, async rawUrl => {
+		const url = rawUrl.trim();
+		if (!url) return null;
+		if (url.startsWith("data:image/")) return url;
+		if (isHttpUrl(url)) return url;
+
+		if (url.startsWith("gs://")) {
+			try {
+				return await createSignedReadUrlForGcsUri(url, CANONICAL_REFERENCE_SIGNED_URL_TTL_SECONDS);
+			} catch {
+				return null;
+			}
+		}
+
+		return null;
+	});
+
+	const deduped: string[] = [];
+	const seen = new Set<string>();
+	for (const value of resolved) {
+		if (!value) continue;
+		const key = value.trim().toLowerCase();
+		if (!key || seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(value);
+	}
+
+	return deduped;
+}
+
+function asRecord(input: unknown): Record<string, unknown> | null {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+	return input as Record<string, unknown>;
+}
+
+function isHttpUrl(value: string): boolean {
+	try {
+		const parsed = new URL(value);
+		return parsed.protocol === "http:" || parsed.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+function validateSelectionShape(selections: Array<{ shot_code: string; candidate_id: string }>) {
+	if (selections.length !== REQUIRED_CANONICAL_SHOT_CODES.length) {
+		throw new ApiError(400, "VALIDATION_ERROR", `You must choose all ${REQUIRED_CANONICAL_SHOT_CODES.length} required angles before approval. Select one option per angle and try again.`);
+	}
+
+	const uniqueShots = new Set(selections.map(item => item.shot_code));
+	if (uniqueShots.size !== REQUIRED_CANONICAL_SHOT_CODES.length) {
+		throw new ApiError(400, "VALIDATION_ERROR", "Each required angle must be selected exactly once. Review your selections and try again.");
+	}
+
+	for (const shot of REQUIRED_CANONICAL_SHOT_CODES) {
+		if (!uniqueShots.has(shot)) {
+			throw new ApiError(400, "VALIDATION_ERROR", `One required angle is missing from your selections (${shot}). Select all required angles and try again.`);
+		}
+	}
+}
+
+async function resolveCandidatePreviewUrl(uri: string): Promise<string | null> {
+	const value = uri.trim();
+	if (!value) return null;
+
+	if (value.startsWith("data:image/")) {
+		return value;
+	}
+
+	if (value.startsWith("http://") || value.startsWith("https://")) {
+		return value;
+	}
+
+	if (!value.startsWith("gs://")) {
+		return null;
+	}
+
+	try {
+		return await createSignedReadUrlForGcsUri(value, 3600);
+	} catch {
+		return null;
+	}
+}
+
+async function mapWithConcurrency<TInput, TOutput>(items: TInput[], maxConcurrency: number, mapper: (item: TInput, index: number) => Promise<TOutput>): Promise<TOutput[]> {
+	if (items.length === 0) return [];
+
+	const concurrency = Math.max(1, Math.min(maxConcurrency, items.length));
+	const results = new Array<TOutput>(items.length);
+	let cursor = 0;
+
+	async function worker(): Promise<void> {
+		while (cursor < items.length) {
+			const index = cursor;
+			cursor += 1;
+
+			const item = items[index];
+			if (item === undefined) continue;
+			results[index] = await mapper(item, index);
+		}
+	}
+
+	await Promise.all(Array.from({ length: concurrency }, () => worker()));
+	return results;
+}
+
